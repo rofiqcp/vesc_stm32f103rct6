@@ -235,7 +235,7 @@ static void reply_fw_version(motor_id_t id) {
     p[i++] = 0U; /* qml app */
     p[i++] = 0U; /* nrf flags */
 
-    const char fw[] = "hoverboard-vesc6-rtos-v8";
+    const char fw[] = "hoverboard-vesc6-rtos-v15";
     memcpy(&p[i], fw, sizeof(fw));
     i = (uint16_t)(i + sizeof(fw));
 
@@ -391,8 +391,8 @@ static void reply_sensor_info(motor_id_t id) {
     for (uint8_t k = 0U; k < 8U; k++) p[i++] = m->foc_hall_table[k];
     for (uint8_t k = 0U; k < 8U; k++) put_u16(p, &i, m->hall_angle_u16[k]);
 
-    /* V13 optional detect/current diagnostics. Legacy fields stay first. */
-    p[i++] = 13U;
+    /* V15 optional detect/current diagnostics. Legacy V13 fields stay first. */
+    p[i++] = 15U;
     put_i32(p, &i, scaled_i32(m->detect.drive_current_a, 1000.0f));
     put_i32(p, &i, scaled_i32(m->id_target, 1000.0f));
     put_i32(p, &i, scaled_i32(m->iq_target, 1000.0f));
@@ -406,6 +406,13 @@ static void reply_sensor_info(motor_id_t id) {
     p[i++] = m->pwm_enabled ? 1U : 0U;
     p[i++] = (m->pwm_tim->BDTR & TIM_BDTR_MOE) ? 1U : 0U;
     put_i32(p, &i, scaled_i32(m->current_scale, 1000000.0f));
+    /* V15 synchronized-enable and stock-board sampling state. */
+    p[i++] = m->pwm_enable_pending_events;
+    put_u16(p, &i, m->pwm_enable_blank_cycles);
+    put_u16(p, &i, (uint16_t)m->pwm_tim->CNT);
+    put_u16(p, &i, (uint16_t)DMA1_Channel1->CNDTR);
+    put_u16(p, &i, (uint16_t)TIM8->RCR);
+    put_u16(p, &i, (uint16_t)ADC_MOTOR_PHASE_OFFSET_TICKS);
     payload_end(i);
 }
 
@@ -431,9 +438,10 @@ static void reply_current_cal(void) {
     p[i++] = (ADC2->CR2 & ADC_CR2_ADON) ? 1U : 0U;
     p[i++] = ((DMA1_Channel1->CCR & DMA_CCR_EN) != 0U) ? 1U : 0U;
 
-    /* V12 detailed calibration diagnostics. Keep legacy fields first. */
+    /* V15 calibration diagnostics. Keep every V14 field in-place and only
+       append new timing/synchronized-enable fields at the end. */
     foc_cal_diag_t cd; foc_get_calibration_diag(&cd);
-    p[i++] = 14U; /* calibration diagnostic revision */
+    p[i++] = 15U; /* calibration diagnostic revision */
     put_u16(p, &i, cd.warn_mask);
     put_u16(p, &i, cd.fail_range_mask);
     put_u16(p, &i, cd.fail_noise_mask);
@@ -443,7 +451,7 @@ static void reply_current_cal(void) {
         put_u16(p, &i, cd.ch[k].max);
         put_u32(p, &i, cd.ch[k].variance_x100);
     }
-    /* Register snapshots make TIM2/ADC/DMA activity auditable from one txt. */
+    /* Register snapshots retain legacy TIM2 plus active TIM8/ADC/DMA timing for one-file audits. */
     put_u32(p, &i, RCC->CFGR);
     put_u32(p, &i, ADC1->CR1); put_u32(p, &i, ADC1->CR2); put_u32(p, &i, ADC1->SQR1); put_u32(p, &i, ADC1->SQR3);
     put_u32(p, &i, ADC2->CR1); put_u32(p, &i, ADC2->CR2); put_u32(p, &i, ADC2->SQR1); put_u32(p, &i, ADC2->SQR3);
@@ -469,6 +477,16 @@ static void reply_current_cal(void) {
     put_i32(p, &i, fs.trip_q15); put_i32(p, &i, fs.id_target_q15); put_i32(p, &i, fs.iq_target_q15);
     put_u16(p, &i, fs.ccr1); put_u16(p, &i, fs.ccr2); put_u16(p, &i, fs.ccr3);
     put_u16(p, &i, fs.tim_cnt); put_u16(p, &i, fs.dma_cndtr); put_u32(p, &i, fs.adc_isr_count);
+
+    /* V15 fault edge state and immutable ADC/PWM schedule metadata. */
+    put_u16(p, &i, fs.blank_cycles);
+    p[i++] = fs.pwm_enabled; p[i++] = fs.moe; p[i++] = fs.pending_events; p[i++] = fs.reserved;
+    put_u16(p, &i, (uint16_t)ADC_MOTOR_PHASE_OFFSET_TICKS);
+    put_u32(p, &i, FOC_ISR_EVENT_HZ);
+    put_u32(p, &i, FOC_ISR_SLOT_CYCLES);
+    put_u16(p, &i, (uint16_t)TIM8->RCR);
+    put_u16(p, &i, (uint16_t)TIM1->CNT);
+    put_u16(p, &i, (uint16_t)TIM8->CNT);
     payload_end(i);
 }
 
@@ -618,7 +636,7 @@ static void reply_unsupported_detect(uint8_t cmd) {
         default: break;
     }
     vesc_comm_send_payload(p, i);
-    send_print("F103 V8: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
+    send_print("F103 V15: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
 }
 
 static bool ensure_current_calibration_valid(uint32_t timeout_ms) {
@@ -658,7 +676,7 @@ static void blocking_thread(void *argument) {
                       vesc_config_set_mc_wire(m->id, &job.data[1],
                                               (uint16_t)(job.len - 1U), true);
             if (ok) reply_ack(COMM_SET_MCCONF);
-            else send_print("F103 V11: MCCONF rejected; motor must be OFF and VESC6 signature/layout valid.");
+            else send_print("F103 V15: MCCONF rejected; motor must be OFF and VESC6 signature/layout valid.");
         } else if (job.cmd == COMM_SET_APPCONF) {
             bool ok = false;
             if (job.len == (1U + VESC6_APPCONF_WIRE_SIZE)) {
@@ -670,7 +688,7 @@ static void blocking_thread(void *argument) {
                 ok = vesc_config_set_app_wire(app_wire, sizeof(app_wire), true);
             }
             if (ok) reply_ack(COMM_SET_APPCONF);
-            else send_print("F103 V11: APPCONF rejected; VESC6 signature/layout invalid.");
+            else send_print("F103 V15: APPCONF rejected; VESC6 signature/layout invalid.");
         } else if (job.cmd == COMM_DETECT_ENCODER) {
             float current = (job.len >= 5U) ? (float)get_i32_be(&job.data[1]) / 1000.0f : SENSOR_DETECT_CURRENT_A;
             bool cal_ok = ensure_current_calibration_valid(10000U);
@@ -697,7 +715,7 @@ static void blocking_thread(void *argument) {
             if (!ensure_current_calibration_valid(10000U)) {
                 result = -1;
             } else {
-                send_print("F103 V11: full VESC Detect All requires validated R/L/flux measurement; use Hall/Encoder detect meanwhile.");
+                send_print("F103 V15: full VESC Detect All requires validated R/L/flux measurement; use Hall/Encoder detect meanwhile.");
             }
             uint8_t p[3]; uint16_t i=0U; p[i++]=COMM_DETECT_APPLY_ALL_FOC; put_i16(p,&i,result);
             vesc_comm_send_payload(p,i);

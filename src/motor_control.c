@@ -77,6 +77,7 @@ static void motor_defaults(MotorRuntime *m, motor_id_t id) {
     m->dc_current_scale = (id == MOTOR_LEFT) ? LEFT_DC_CURRENT_A_PER_COUNT : RIGHT_DC_CURRENT_A_PER_COUNT;
 
     m->current_scale_q16 = (int32_t)((m->current_scale / FOC_CURRENT_Q_BASE_A) * 32768.0f * 65536.0f);
+    m->dc_current_scale_q16 = (int32_t)((m->dc_current_scale / FOC_CURRENT_Q_BASE_A) * 32768.0f * 65536.0f);
     m->current_kp_q16 = (int32_t)((m->current_kp * FOC_CURRENT_Q_BASE_A / FOC_VOLTAGE_Q_BASE_V) * 65536.0f);
     m->current_ki_dt_q16 = (int32_t)((m->current_ki * FOC_DT_S * FOC_CURRENT_Q_BASE_A / FOC_VOLTAGE_Q_BASE_V) * 65536.0f);
     m->duty_u_q15 = m->duty_v_q15 = m->duty_w_q15 = FOC_Q15_HALF;

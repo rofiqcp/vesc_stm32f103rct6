@@ -148,73 +148,31 @@ static void init_pwm_timer(TIM_HandleTypeDef *h, TIM_TypeDef *inst) {
 static void init_timers(void) {
     __HAL_RCC_TIM1_CLK_ENABLE();
     __HAL_RCC_TIM8_CLK_ENABLE();
-    __HAL_RCC_TIM2_CLK_ENABLE();
     __HAL_RCC_TIM4_CLK_ENABLE();
 
-    /* VESC dual-motor timing topology, ported to STM32F103 high density:
+    /* Stock hoverboard timing, following the proven EFeru hardware port:
      *
-     * TIM1 (RIGHT) : center-aligned physical master, TRGO = ENABLE
-     *      -> ITR0
-     * TIM8 (LEFT)  : center-aligned trigger slave, TRGO = UPDATE
-     *      -> ITR1
-     * TIM2         : free 16-bit upcounter reset by TIM8 update; CH2 PWM1
-     *                generates ADC1 external trigger and a tiny COM-sync IRQ.
+     *   TIM1 RIGHT : center-aligned master, TRGO = ENABLE
+     *   TIM8 LEFT  : gated from TIM1 ITR0, TRGO = UPDATE, RCR = 1
+     *   ADC1/ADC2  : dual regular simultaneous, trigger = TIM8 TRGO
      *
-     * TIM8 update occurs at V0 and V7, so ADC is sampled twice per switching
-     * period. The ADC ISR services exactly one motor per event using TIM1 DIR,
-     * like upstream mcpwm_foc on dual-motor hardware. */
+     * TIM8 starts ADC_MOTOR_PHASE_OFFSET_TICKS ahead of TIM1. The offset is
+     * exactly one phase-current conversion at the configured ADC divider, so
+     * the LEFT and RIGHT shunts are sampled in their valid low-side windows.
+     * RCR=1 yields one dual-ADC current frame per 16-kHz PWM period. */
     init_pwm_timer(&htim1, TIM1);
     init_pwm_timer(&htim8, TIM8);
 
-    /* Capture/compare preload control: duty triplets are latched coherently by
-       COM/update events. */
     TIM1->CR2 |= TIM_CR2_CCPC;
     TIM8->CR2 |= TIM_CR2_CCPC;
 
-    /* TIM1 is master. MMS=ENABLE makes its CEN signal the internal trigger. */
     TIM1->CR2 = (TIM1->CR2 & ~TIM_CR2_MMS) | TIM_TRGO_ENABLE;
-    TIM1->SMCR |= TIM_SMCR_MSM;
+    TIM1->SMCR &= ~TIM_SMCR_MSM;
 
-    /* On F103 high-density, TIM8 ITR0 = TIM1. Start TIM8 from TIM1 trigger and
-       export TIM8 update as TRGO. */
     TIM8->SMCR = (TIM8->SMCR & ~(TIM_SMCR_TS | TIM_SMCR_SMS)) |
-                 TIM_TS_ITR0 | TIM_SLAVEMODE_TRIGGER;
+                 TIM_TS_ITR0 | TIM_SLAVEMODE_GATED;
     TIM8->CR2 = (TIM8->CR2 & ~TIM_CR2_MMS) | TIM_TRGO_UPDATE;
-
-    htim2.Instance = TIM2;
-    htim2.Init.Prescaler = 0;
-    htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim2.Init.Period = 0xFFFFU;
-    htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-    htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler_Local();
-
-    TIM_OC_InitTypeDef oc = {0};
-    oc.OCMode = TIM_OCMODE_PWM1;
-    oc.Pulse = VESC_CURRENT_SAMP_OFFSET_TICKS / 2U;
-    oc.OCPolarity = TIM_OCPOLARITY_HIGH;
-    oc.OCFastMode = TIM_OCFAST_DISABLE;
-    if (HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_2) != HAL_OK) Error_Handler_Local();
-    TIM2->CCR2 = VESC_CURRENT_SAMP_OFFSET_TICKS / 2U;
-    TIM2->CCMR1 |= TIM_CCMR1_OC2PE;
-    TIM2->CR1 |= TIM_CR1_ARPE;
-    TIM2->CR2 |= TIM_CR2_CCPC;
-
-    /* Upstream explicitly enables the CC output because the compare event is
-       used as the ADC trigger source. No GPIO pin is needed for this internal
-       path. */
-    TIM2->CCER |= TIM_CCER_CC2E;
-
-    /* F103 high-density mapping: TIM2 ITR1 = TIM8. Reset TIM2 on each TIM8
-       V0/V7 update so CC2 occurs at a deterministic offset from the zero
-       vector. */
-    TIM2->SMCR = (TIM2->SMCR & ~(TIM_SMCR_TS | TIM_SMCR_SMS)) |
-                 TIM_TS_ITR1 | TIM_SLAVEMODE_RESET;
-
-    __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_CC2);
-    __HAL_TIM_ENABLE_IT(&htim2, TIM_IT_CC2);
-    HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0); /* no RTOS API in handler */
-    HAL_NVIC_EnableIRQ(TIM2_IRQn);
+    TIM8->RCR = 1U;
 
     htim4.Instance = TIM4;
     htim4.Init.Prescaler = 0;
@@ -260,10 +218,12 @@ static void init_adc_dma(void) {
     hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
     hadc1.Init.ContinuousConvMode = DISABLE;
     hadc1.Init.DiscontinuousConvMode = DISABLE;
-    hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_CC2;
+    hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T8_TRGO;
     hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
     hadc1.Init.NbrOfConversion = 6;
     if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler_Local();
+    /* STM32F103 high-density remap: ADC1 regular external trigger is TIM8 TRGO. */
+    __HAL_AFIO_REMAP_ADC1_ETRGREG_ENABLE();
 
     hadc2.Instance = ADC2;
     hadc2.Init.ScanConvMode = ADC_SCAN_ENABLE;
@@ -274,18 +234,22 @@ static void init_adc_dma(void) {
     hadc2.Init.NbrOfConversion = 6;
     if (HAL_ADC_Init(&hadc2) != HAL_OK) Error_Handler_Local();
 
-    /* ADC1 lower halfword, ADC2 upper halfword for each rank.
-       Six dual ranks are intentional: DMA HT now occurs after rank 3. The
-       first THREE ranks are all current channels, exactly matching the VESC
-       rule for using half-transfer as the earliest safe current-loop entry.
-       The slower DCLINK ranks complete after HT and the ISR consumes the last
-       completed value from the previous scan. */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_0,  ADC_REGULAR_RANK_1, ADC_SAMPLETIME_7CYCLES_5); /* LEFT U PA0 */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_13, ADC_REGULAR_RANK_1, ADC_SAMPLETIME_7CYCLES_5); /* LEFT V PC3 */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_14, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT U PC4 */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_15, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT V PC5 */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_10, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* LEFT DC PC0 */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT DC PC1 */
+    /* ADC1 is the low halfword and ADC2 the high halfword of every 32-bit DMA
+       word. Keep the first three dual ranks identical to the stock EFeru
+       hardware schedule. DMA half-transfer then fires immediately after all
+       six fast current channels are coherent:
+
+         rank 1: ADC1 PC1 RIGHT DC | ADC2 PC0 LEFT DC   (1.5 cycles)
+         rank 2: ADC1 PA0 LEFT  A  | ADC2 PC3 LEFT  B   (7.5 cycles)
+         rank 3: ADC1 PC4 RIGHT B  | ADC2 PC5 RIGHT C   (7.5 cycles)
+
+       Rank 4..6 are slow voltage/diagnostic conversions. */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_11, ADC_REGULAR_RANK_1, ADC_SAMPLETIME_1CYCLE_5); /* RIGHT DC PC1 */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_10, ADC_REGULAR_RANK_1, ADC_SAMPLETIME_1CYCLE_5); /* LEFT  DC PC0 */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_0,  ADC_REGULAR_RANK_2, ADC_SAMPLETIME_7CYCLES_5); /* LEFT  A  PA0 */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_13, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_7CYCLES_5); /* LEFT  B  PC3 */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_14, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT B  PC4 */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_15, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT C  PC5 */
     cfg_adc_channel(&hadc1, ADC_CHANNEL_12, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* DCLINK PC2 */
     cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* duplicate RIGHT DC */
     cfg_adc_channel(&hadc1, ADC_CHANNEL_12, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_28CYCLES_5); /* DCLINK duplicate */
@@ -325,11 +289,9 @@ void motor_hw_init(void) {
 void motor_hw_start_sampling(void) {
     memset((void *)g_adc_dual_dma, 0, sizeof(g_adc_dual_dma));
 
-    /* STM32F1 multimode rule: ADC2 regular conversion uses ADC_SOFTWARE_START
-       and has no independent external trigger. ST HAL permits the slave to be
-       enabled preliminarily with HAL_ADC_Start(); then the master multimode
-       start arms DMA and ADC1 TIM2_CC2 launches each simultaneous pair. This
-       explicit pre-enable also makes ADC2 liveness visible in diagnostics. */
+    /* STM32F1 dual-regular rule: ADC2 is armed as the slave; ADC1 is the
+       external-triggered master. TIM8 TRGO starts one simultaneous scan per
+       PWM period. */
     if (HAL_ADC_Start(&hadc2) != HAL_OK) {
         Error_Handler_Local();
     }
@@ -348,32 +310,56 @@ void motor_hw_start_sampling(void) {
     TIM1->BDTR &= ~TIM_BDTR_MOE;
     TIM8->BDTR &= ~TIM_BDTR_MOE;
     TIM1->CNT = 0U;
-    TIM8->CNT = TIM1->ARR; /* VESC dual-motor 180-degree counter phase */
-    TIM2->CNT = 0U;
-    TIM2->CCR2 = VESC_CURRENT_SAMP_OFFSET_TICKS / 2U;
-    TIM2->SR = 0U;
+    TIM8->CNT = (uint16_t)ADC_MOTOR_PHASE_OFFSET_TICKS;
+    TIM8->RCR = 1U;
+    TIM1->SR = 0U;
+    TIM8->SR = 0U;
 
-    /* Start the physical master and the sampling timer. TIM8 starts from the
-       TIM1 internal trigger because it is configured as a trigger slave. */
+    /* In gated mode TIM8 must have CEN set before the TIM1 master gate goes
+       high. TIM1 then starts both PWM timebases while the programmed counter
+       offset is preserved. */
+    TIM8->CR1 |= TIM_CR1_CEN;
     TIM1->CR1 |= TIM_CR1_CEN;
-    TIM2->CR1 |= TIM_CR1_CEN;
     __enable_irq();
 }
 
 void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled) {
+    if (m == NULL) return;
     if (enabled) {
-        if (!m->pwm_enabled) {
+        if (!m->pwm_enabled && m->pwm_enable_pending_events == 0U) {
+            /* Stage an exact zero-vector triplet first. MOE remains OFF until
+               the hard ADC schedule has observed enough timer update events
+               to guarantee the preload is active in hardware. */
             motor_hw_set_pwm_q15(m, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
             motor_hw_gate_global(true);
-            m->pwm_enable_blank_cycles = PWM_ENABLE_BLANK_CYCLES;
-            m->pwm_tim->BDTR |= TIM_BDTR_MOE;
-            m->pwm_enabled = true;
+            m->pwm_enable_blank_cycles = 0U;
+            m->pwm_enable_pending_events = PWM_ENABLE_PRELOAD_EVENTS;
+            m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
         }
     } else {
         m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
         m->pwm_enabled = false;
         m->pwm_enable_blank_cycles = 0U;
+        m->pwm_enable_pending_events = 0U;
     }
+}
+
+void motor_hw_service_pwm_enable_from_isr(MotorRuntime *m) {
+    if (m == NULL || m->pwm_enabled || m->pwm_enable_pending_events == 0U) return;
+    if (m->fault != MOTOR_FAULT_NONE) {
+        m->pwm_enable_pending_events = 0U;
+        m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
+        return;
+    }
+
+    /* Keep refreshing the preload while waiting. Every call corresponds to a
+       completed fast ADC frame, i.e. one complete 16-kHz PWM schedule. */
+    motor_hw_set_pwm_q15(m, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
+    if (--m->pwm_enable_pending_events != 0U) return;
+
+    m->pwm_enable_blank_cycles = PWM_ENABLE_BLANK_CYCLES;
+    m->pwm_tim->BDTR |= TIM_BDTR_MOE;
+    m->pwm_enabled = true;
 }
 
 void motor_hw_set_pwm_q15(MotorRuntime *m, uint16_t du_q15, uint16_t dv_q15, uint16_t dw_q15) {
@@ -518,5 +504,9 @@ void motor_hw_emergency_all_off(void) {
     TIM8->BDTR &= ~TIM_BDTR_MOE;
     g_motor_left.pwm_enabled = false;
     g_motor_right.pwm_enabled = false;
+    g_motor_left.pwm_enable_blank_cycles = 0U;
+    g_motor_right.pwm_enable_blank_cycles = 0U;
+    g_motor_left.pwm_enable_pending_events = 0U;
+    g_motor_right.pwm_enable_pending_events = 0U;
     motor_hw_gate_global(false);
 }

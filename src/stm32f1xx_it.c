@@ -30,9 +30,10 @@ void DMA1_Channel1_IRQHandler(void) {
         return;
     }
 
-    /* VESC-style fast path: phase-current ranks are first in the circular DMA
-       buffer, so half-transfer is the earliest deterministic current-loop
-       entry. This ISR never calls kernel, UART, formatted-output, flash, or blocking HAL code. */
+    /* Fast path: the first three dual ranks are all six stock-board current
+       channels (DC L/R, LEFT A/B, RIGHT B/C). Half-transfer is therefore the
+       earliest coherent entry for both 16-kHz current loops. No kernel/UART/
+       formatted-output/flash/blocking HAL calls are permitted here. */
     if ((isr & DMA_ISR_HTIF1) != 0U) {
         DMA1->IFCR = DMA_IFCR_CHTIF1;
         foc_adc_dma_isr(g_adc_dual_dma);
@@ -40,14 +41,9 @@ void DMA1_Channel1_IRQHandler(void) {
 }
 
 void TIM2_IRQHandler(void) {
-    /* Upstream mcpwm_foc uses the sampling timer CC2 interrupt only to generate
-       COM events for coherent TIM1/TIM8 compare preload transfer. Keep this
-       handler tiny and kernel-independent. */
-    if (((TIM2->SR & TIM_SR_CC2IF) != 0U) && ((TIM2->DIER & TIM_DIER_CC2IE) != 0U)) {
-        TIM1->EGR = TIM_EGR_COMG;
-        TIM8->EGR = TIM_EGR_COMG;
-        TIM2->SR &= ~TIM_SR_CC2IF;
-    }
+    /* V15 does not use TIM2 for ADC timing. Defensive clear only in case a
+       stale bootloader/debug configuration left a TIM2 flag pending. */
+    TIM2->SR = 0U;
 }
 
 void DMA1_Channel2_IRQHandler(void) {

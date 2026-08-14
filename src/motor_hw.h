@@ -15,6 +15,7 @@ extern volatile uint32_t g_adc_dual_dma[6];
 void motor_hw_init(void);
 void motor_hw_start_sampling(void);
 void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled);
+void motor_hw_service_pwm_enable_from_isr(MotorRuntime *m);
 void motor_hw_set_pwm_duty(MotorRuntime *m, float du, float dv, float dw);
 void motor_hw_set_pwm_q15(MotorRuntime *m, uint16_t du_q15, uint16_t dv_q15, uint16_t dw_q15);
 void motor_hw_gate_global(bool enable);

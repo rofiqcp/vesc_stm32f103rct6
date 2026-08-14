@@ -10,11 +10,16 @@
 #define PWM_MAX_DUTY                    0.90f
 #define PWM_MIN_DUTY_Q15                3277U
 #define PWM_MAX_DUTY_Q15                29491U
-/* VESC-style V0/V7 current sampling: TIM8 update resets TIM2 twice per
- * center-aligned PWM period. TIM2 CC2 therefore produces 2 ADC events/PWM;
- * each event services one motor according to TIM1 direction. */
-#define VESC_CURRENT_SAMP_OFFSET_TICKS  500UL
-#define FOC_SAMPLE_EVENTS_PER_PWM       2UL
+/* Stock EFeru hoverboard timing: one dual-ADC current frame per PWM period.
+ * ADC rank order is DC-link currents, LEFT phase pair, RIGHT phase pair. TIM8
+ * (LEFT) is advanced from TIM1 (RIGHT) by exactly one phase-current ADC
+ * conversion so the two phase pairs are sampled in their respective low-side
+ * measurement windows. We retain ADC /6 (10.67 MHz) to stay inside STM32F103
+ * limits, therefore 20 ADC clocks = 120 CPU timer ticks. */
+#define ADC_CLOCK_DIV                   6UL
+#define ADC_PHASE_CONV_CYCLES           20UL /* 7.5 sample + 12.5 conversion */
+#define ADC_MOTOR_PHASE_OFFSET_TICKS    (ADC_CLOCK_DIV * ADC_PHASE_CONV_CYCLES)
+#define FOC_SAMPLE_EVENTS_PER_PWM       1UL
 #define FOC_ISR_EVENT_HZ                (PWM_FREQUENCY_HZ * FOC_SAMPLE_EVENTS_PER_PWM)
 #define FOC_ISR_SLOT_CYCLES             (CPU_CLOCK_HZ / FOC_ISR_EVENT_HZ)
 #define FOC_DT_S                        (1.0f / (float)PWM_FREQUENCY_HZ)
@@ -84,6 +89,12 @@
 #define ADC_DRIVEN_CAL_MAX_DC_COUNTS    300U /* 6 A at 0.02 A/count */
 #define ADC_DRIVEN_CAL_DC_TRIP_SAMPLES  8U
 #define PWM_ENABLE_BLANK_CYCLES         8U
+/* EFeru uses I_DC_MAX=17 A for the stage-2 DC-link current chop on the stock
+ * board. Do not reuse the much lower 6 A driven-calibration sanity limit for
+ * normal PWM startup; that V14 coupling caused a false ABS_OVER_CURRENT during
+ * Hall detect before the current ramp had even begun. */
+#define PWM_STARTUP_DC_TRIP_A           17.0f
+#define PWM_ENABLE_PRELOAD_EVENTS       2U
 /* V14 validation policy:
  * - VESC upstream calibrates by averaging current offsets and does not reject
  *   a board merely because the raw ADC has modest PWM-synchronous noise.

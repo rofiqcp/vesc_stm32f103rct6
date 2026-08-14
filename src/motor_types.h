@@ -176,6 +176,10 @@ typedef struct MotorRuntime {
        active; phase-current PI/ABS fault starts after the analog front-end
        has settled. */
     volatile uint16_t pwm_enable_blank_cycles;
+    /* MOE is asserted only from the ADC/DMA ISR after the 50% preload has
+       crossed at least two hardware update boundaries. This prevents a stale
+       CCR triplet from being exposed for a partial PWM cycle on re-enable. */
+    volatile uint8_t pwm_enable_pending_events;
     volatile bool command_active;
     volatile bool timeout_active;
     volatile bool detect_force_angle;
@@ -258,6 +262,7 @@ typedef struct MotorRuntime {
     float vq_int;
 
     int32_t current_scale_q16;
+    int32_t dc_current_scale_q16;
     /* PI coefficients are Q16.16; current/voltage samples remain Q15.
        Q15 error * Q16 gain >> 16 gives a Q15 voltage contribution. */
     int32_t current_kp_q16;

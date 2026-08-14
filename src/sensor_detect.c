@@ -281,7 +281,7 @@ void sensor_detect_update_1khz(MotorRuntime *m, uint32_t now_ms) {
 
         /* Match the VESC Hall-detect temporary controller values. Keeping the
            fixed 16-kHz F103 PWM is intentional; changing f_zv at runtime would
-           also require rebuilding the ADC/TIM2 synchronization. */
+           also require rebuilding the ADC/TIM8 synchronization. */
         if (m->sensor_request_mode != SENSOR_MODE_ENCODER) {
             motor_set_current_pi_gains(m, 0.01f, 10.0f);
         }
@@ -302,6 +302,16 @@ void sensor_detect_update_1khz(MotorRuntime *m, uint32_t now_ms) {
         break;
 
     case SENSOR_DETECT_HALL_LOCK: {
+        /* Do not start the VESC 1-second Id ramp until the bridge has crossed
+           the synchronized preload handoff and all startup blanking samples.
+           Reset the ramp epoch while waiting so elapsed time cannot accumulate
+           behind a disabled bridge. */
+        if (!m->pwm_enabled || m->pwm_enable_pending_events > 0U ||
+            m->pwm_enable_blank_cycles > 0U) {
+            motor_set_foc_targets(m, 0.0f, 0.0f);
+            d->step_tick = now_ms;
+            return;
+        }
         /* VESC: 1000 iterations, 1 ms each, Id ramp 0 -> requested current. */
         uint32_t elapsed = (uint32_t)(now_ms - d->step_tick);
         if (elapsed > SENSOR_DETECT_CURRENT_RAMP_MS) elapsed = SENSOR_DETECT_CURRENT_RAMP_MS;
@@ -371,6 +381,12 @@ void sensor_detect_update_1khz(MotorRuntime *m, uint32_t now_ms) {
         break;
 
     case SENSOR_DETECT_ENCODER_LOCK0: {
+        if (!m->pwm_enabled || m->pwm_enable_pending_events > 0U ||
+            m->pwm_enable_blank_cycles > 0U) {
+            motor_set_foc_targets(m, 0.0f, 0.0f);
+            d->step_tick = now_ms;
+            return;
+        }
         /* AB has no index. Use the same gentle current ramp before sweeping a
            known electrical phase; this establishes a safe session reference. */
         uint32_t elapsed = (uint32_t)(now_ms - d->step_tick);

@@ -32,6 +32,11 @@ typedef struct {
     uint16_t tim_cnt;
     uint16_t dma_cndtr;
     uint32_t adc_isr_count;
+    uint16_t blank_cycles;
+    uint8_t pwm_enabled;
+    uint8_t moe;
+    uint8_t pending_events;
+    uint8_t reserved;
 } foc_fault_snapshot_t;
 
 bool foc_calibration_done(void);
