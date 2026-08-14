@@ -80,13 +80,13 @@ static void init_gpio(void) {
     /* LEFT shared sensor pins start in safe Hall-input mode. Runtime sensor
        selection can reconfigure PB6/PB7 to TIM4 encoder without reboot. */
     g.Mode = GPIO_MODE_IT_RISING_FALLING;
-    g.Pull = GPIO_PULLUP;
+    g.Pull = GPIO_NOPULL;
     g.Pin = LEFT_HALL_U_PIN | LEFT_HALL_V_PIN | LEFT_HALL_W_PIN;
     HAL_GPIO_Init(GPIOB, &g);
 
     /* Right Hall PC10/11/12 */
     g.Mode = GPIO_MODE_IT_RISING_FALLING;
-    g.Pull = GPIO_PULLUP;
+    g.Pull = GPIO_NOPULL;
     g.Pin = RIGHT_HALL_U_PIN | RIGHT_HALL_V_PIN | RIGHT_HALL_W_PIN;
     HAL_GPIO_Init(GPIOC, &g);
 
@@ -417,15 +417,21 @@ void motor_hw_gate_global(bool enable) {
 }
 
 uint8_t motor_hw_read_hall_raw(motor_id_t id) {
+    /* Stock hoverboard Hall inputs are active-low. This function is called
+       from the hard FOC path, so use one IDR snapshot per GPIO port rather
+       than three HAL_GPIO_ReadPin calls. */
+    uint32_t idr;
     uint8_t u, v, w;
     if (id == MOTOR_LEFT) {
-        u = HAL_GPIO_ReadPin(LEFT_HALL_U_PORT, LEFT_HALL_U_PIN) ? 1U : 0U;
-        v = HAL_GPIO_ReadPin(LEFT_HALL_V_PORT, LEFT_HALL_V_PIN) ? 1U : 0U;
-        w = HAL_GPIO_ReadPin(LEFT_HALL_W_PORT, LEFT_HALL_W_PIN) ? 1U : 0U;
+        idr = GPIOB->IDR;
+        u = (idr & LEFT_HALL_U_PIN) ? 0U : 1U;
+        v = (idr & LEFT_HALL_V_PIN) ? 0U : 1U;
+        w = (idr & LEFT_HALL_W_PIN) ? 0U : 1U;
     } else {
-        u = HAL_GPIO_ReadPin(RIGHT_HALL_U_PORT, RIGHT_HALL_U_PIN) ? 1U : 0U;
-        v = HAL_GPIO_ReadPin(RIGHT_HALL_V_PORT, RIGHT_HALL_V_PIN) ? 1U : 0U;
-        w = HAL_GPIO_ReadPin(RIGHT_HALL_W_PORT, RIGHT_HALL_W_PIN) ? 1U : 0U;
+        idr = GPIOC->IDR;
+        u = (idr & RIGHT_HALL_U_PIN) ? 0U : 1U;
+        v = (idr & RIGHT_HALL_V_PIN) ? 0U : 1U;
+        w = (idr & RIGHT_HALL_W_PIN) ? 0U : 1U;
     }
     return (uint8_t)(u | (v << 1) | (w << 2));
 }
@@ -468,7 +474,7 @@ void motor_hw_configure_sensor(MotorRuntime *m, uint8_t mode) {
     HAL_GPIO_DeInit(GPIOB, LEFT_HALL_U_PIN | LEFT_HALL_V_PIN | LEFT_HALL_W_PIN);
 
     GPIO_InitTypeDef g = {0};
-    g.Pull = GPIO_PULLUP;
+    g.Pull = GPIO_NOPULL;
 
     if (mode == SENSOR_MODE_ENCODER) {
         g.Mode = GPIO_MODE_INPUT;

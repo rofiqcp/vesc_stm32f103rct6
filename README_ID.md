@@ -1,6 +1,9 @@
-# V12 — VESC Timing / ADC-DMA Recovery for STM32F103RCT6
+# V13 — VESC Hall/Current Feedback Recovery for STM32F103RCT6
 
-V12 keeps the **known-working V8 VESC Tool transport frozen** and repairs the motor-side timing and data path to follow the current VESC FOC execution model as closely as practical on STM32F103RCT6 + STM32 HAL + CMSIS-RTOS2.
+> V13 preserves the proven V8 UART-DMA communication and V11 timer/ADC/DMA topology. It corrects hoverboard current-feedback polarity/phase mapping, Hall active-low acquisition, VESC-style Hall detection timing/timeout semantics, and false over-current faults while the bridge is off. See `V13_VESC_HALL_CURRENT_FIX.md`.
+
+
+V13 keeps the **known-working V8 VESC Tool transport frozen** and repairs the motor-side timing and data path to follow the current VESC FOC execution model as closely as practical on STM32F103RCT6 + STM32 HAL + CMSIS-RTOS2.
 
 ## Frozen communication path
 

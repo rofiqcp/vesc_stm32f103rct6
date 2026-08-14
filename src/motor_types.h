@@ -69,6 +69,8 @@ typedef struct {
     volatile int8_t sector;
     volatile uint8_t raw_state;
     volatile bool valid;
+    volatile uint16_t invalid_count;
+    volatile uint16_t sequence_error_count;
     volatile int32_t edge_count;
 } hall_state_t;
 
@@ -110,6 +112,7 @@ typedef struct {
     volatile bool busy;
     volatile bool success;
     volatile uint8_t result_mode;
+    volatile bool apply_result;
     volatile float drive_current_a;
     volatile uint32_t step_tick;
     volatile uint32_t sweep_index;
@@ -118,6 +121,25 @@ typedef struct {
     volatile int32_t encoder_start_count;
     volatile int32_t encoder_end_count;
     volatile uint8_t hall_valid_states;
+
+    /* Detection is a temporary motor-control transaction. Preserve everything
+       it changes so standard VESC COMM_DETECT_* can restore the previous
+       configuration after returning its result. */
+    uint8_t saved_sensor_mode;
+    uint8_t saved_sensor_request_mode;
+    float saved_current_kp;
+    float saved_current_ki;
+    uint32_t saved_timeout_ms;
+    float saved_timeout_brake_a;
+
+    /* Result lives separately from active runtime config. This is required by
+       VESC semantics: detect returns parameters; the Tool decides whether to
+       apply/write them afterwards. */
+    uint8_t result_hall_table[8];
+    float result_encoder_offset_deg;
+    float result_encoder_ratio;
+    bool result_encoder_inverted;
+
     int64_t hall_sin_sum[8];
     int64_t hall_cos_sum[8];
     uint32_t hall_samples[8];

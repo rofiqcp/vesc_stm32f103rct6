@@ -5,6 +5,7 @@
 #include "app_config.h"
 #include "debug_sample.h"
 #include <limits.h>
+#include <stddef.h>
 
 static volatile bool s_cal_done = false;
 static volatile bool s_cal_valid = false;
@@ -119,48 +120,81 @@ uint16_t motor_sensor_electrical_phase_u16(MotorRuntime *m) {
     return (uint16_t)((int32_t)base + (int32_t)advance + (int32_t)m->hall_offset_u16);
 }
 
-void motor_hall_edge_isr(MotorRuntime *m) {
+static void hall_update_raw_fast(MotorRuntime *m, uint8_t raw) {
     if (m == NULL || m->sensor_mode != SENSOR_MODE_HALL) return;
-    uint8_t raw = motor_hw_read_hall_raw(m->id);
-    int8_t sector = m->hall_table[raw & 7U];
-    m->hall.raw_state = raw;
-    if (sector < 0 || raw == 0U || raw == 7U) {
-        m->hall.valid = false;
+
+    hall_state_t *h = &m->hall;
+    raw &= 7U;
+    h->raw_state = raw;
+    int8_t sector = m->hall_table[raw];
+
+    /* Hall 000/111 or an unmapped table entry is not a usable rotor phase.
+       Keep a very short fast-loop validation counter rather than a millisecond
+       debounce, because phase information must not be delayed. */
+    if (raw == 0U || raw == 7U || sector < 0) {
+        if (h->invalid_count < UINT16_MAX) h->invalid_count++;
+        h->valid = false;
+        return;
+    }
+    h->invalid_count = 0U;
+
+    uint32_t now = DWT->CYCCNT;
+    int8_t old = h->sector;
+    if (old < 0) {
+        h->sector = sector;
+        h->direction = (h->direction == 0) ? 1 : h->direction;
+        h->base_phase_u16 = m->hall_angle_u16[raw];
+        h->edge_cycle = now;
+        h->phase_per_cycle_q16 = 0;
+        h->valid = true;
         return;
     }
 
-    uint32_t now = DWT->CYCCNT;
-    int8_t old = m->hall.sector;
-    int8_t dir = m->hall.direction;
-    bool valid_transition = false;
-
-    if (old >= 0 && sector != old) {
-        int8_t diff = (int8_t)(sector - old);
-        if (diff == 1 || diff == -5) { dir = 1; valid_transition = true; }
-        else if (diff == -1 || diff == 5) { dir = -1; valid_transition = true; }
+    /* Polling happens on every FOC update. Re-reading the same sector must
+       NOT refresh edge_cycle; otherwise interpolation speed collapses to zero. */
+    if (sector == old) {
+        h->valid = true;
+        return;
     }
 
-    if (valid_transition) {
-        uint32_t period = now - m->hall.edge_cycle;
-        if (period > 100U) {
-            m->hall.period_cycles = period;
-            int64_t step = (((int64_t)(65536 / 6)) << 16) / (int64_t)period;
-            m->hall.phase_per_cycle_q16 = (int32_t)(dir > 0 ? step : -step);
-        }
-        m->hall.edge_count += dir;
-    } else if (old < 0) {
-        m->hall.phase_per_cycle_q16 = 0;
+    int8_t diff = (int8_t)(sector - old);
+    int8_t dir = h->direction;
+    bool neighbor = false;
+    if (diff == 1 || diff == -5) { dir = 1; neighbor = true; }
+    else if (diff == -1 || diff == 5) { dir = -1; neighbor = true; }
+
+    if (!neighbor) {
+        if (h->sequence_error_count < UINT16_MAX) h->sequence_error_count++;
+        h->valid = false;
+        return;
     }
 
-    m->hall.direction = dir;
-    m->hall.sector = sector;
-    m->hall.base_phase_u16 = (uint16_t)((uint32_t)sector * (65536U / 6U));
-    m->hall.edge_cycle = now;
-    m->hall.valid = true;
+    h->sequence_error_count = 0U;
+    uint32_t period = now - h->edge_cycle;
+    if (period > 100U) {
+        h->period_cycles = period;
+        int64_t step = (((int64_t)(65536 / 6)) << 16) / (int64_t)period;
+        h->phase_per_cycle_q16 = (int32_t)(dir > 0 ? step : -step);
+    }
+    h->edge_count += dir;
+    h->direction = dir;
+    h->sector = sector;
+    h->base_phase_u16 = m->hall_angle_u16[raw];
+    h->edge_cycle = now;
+    h->valid = true;
+}
+
+void motor_hall_edge_isr(MotorRuntime *m) {
+    if (m == NULL || m->sensor_mode != SENSOR_MODE_HALL) return;
+    hall_update_raw_fast(m, motor_hw_read_hall_raw(m->id));
 }
 
 static inline int32_t adc_current_to_q15(uint16_t raw, int32_t offset, int32_t scale_q16) {
-    return (int32_t)(((int64_t)((int32_t)raw - offset) * (int64_t)scale_q16) >> 16);
+    /* Stock hoverboard analog front-end polarity (EFeru): phase/DC current is
+       offset - ADC. Using raw-offset turns the current PI into positive
+       feedback on this PCB and can produce the growl/current spike seen during
+       forced-angle detection. */
+    return (int32_t)(((int64_t)(offset - (int32_t)raw) * (int64_t)scale_q16) >> 16);
 }
 
 static inline void offset_track_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, uint16_t raw_dc) {
@@ -182,15 +216,43 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
     m->current_raw_v = raw_v;
     offset_track_isr(m, raw_u, raw_v, raw_dc);
 
-    int32_t ia = adc_current_to_q15(raw_u, m->current_offset_u_counts, m->current_scale_q16);
-    int32_t ib = adc_current_to_q15(raw_v, m->current_offset_v_counts, m->current_scale_q16);
-    int32_t ic = -(ia + ib);
+    int32_t ia, ib, ic;
+    if (m->id == MOTOR_LEFT) {
+        /* PCB LEFT shunts measure phase A and phase B. */
+        ia = adc_current_to_q15(raw_u, m->current_offset_u_counts, m->current_scale_q16);
+        ib = adc_current_to_q15(raw_v, m->current_offset_v_counts, m->current_scale_q16);
+        ic = -(ia + ib);
+    } else {
+        /* PCB RIGHT shunts are phase B (PC4) and phase C (PC5), not A/B.
+           Reconstruct A from Kirchhoff: ia + ib + ic = 0. */
+        ib = adc_current_to_q15(raw_u, m->current_offset_u_counts, m->current_scale_q16);
+        ic = adc_current_to_q15(raw_v, m->current_offset_v_counts, m->current_scale_q16);
+        ia = -(ib + ic);
+    }
 
     m->ia_q15 = ia; m->ib_q15 = ib; m->ic_q15 = ic;
     m->dc_current_raw = raw_dc; m->vbus_q15 = vbus_q15;
 
+    /* Hall GPIO is the fast source of truth. EXTI is only an optional early
+       timestamp hint; polling here ensures phase validity is not dependent on
+       an RTOS task or on edge-IRQ delivery. During forced-angle detection the
+       detector reads Hall separately and Hall validity must not gate SVPWM. */
+    if (m->sensor_mode == SENSOR_MODE_HALL && !m->detect_force_angle) {
+        hall_update_raw_fast(m, motor_hw_read_hall_raw(m->id));
+        if (m->pwm_enabled && m->command_active &&
+            (m->hall.invalid_count >= 32U || m->hall.sequence_error_count >= 4U)) {
+            motor_request_fault_from_isr(m, MOTOR_FAULT_HALL_INVALID);
+            return;
+        }
+    }
+
     int32_t trip = (m->abs_current_trip_q15 > 0) ? m->abs_current_trip_q15 : s_current_trip_q15;
-    if (iabs32(ia) > trip || iabs32(ib) > trip || iabs32(ic) > trip) {
+    /* With MOE already OFF an externally back-driven motor can generate
+       current through the bridge diodes. Latching ABS_OVER_CURRENT in that
+       state cannot protect the bridge and caused false 3-beep faults when the
+       wheel was rotated by hand. The hard software trip is meaningful while
+       this firmware is actively driving (MOE/pwm_enabled). */
+    if (m->pwm_enabled && (iabs32(ia) > trip || iabs32(ib) > trip || iabs32(ic) > trip)) {
         motor_request_fault_from_isr(m, MOTOR_FAULT_ABS_OVER_CURRENT); return;
     }
     if (m->pwm_enabled && vbus_q15 > s_vbus_max_q15) { motor_request_fault_from_isr(m, MOTOR_FAULT_OVER_VOLTAGE); return; }

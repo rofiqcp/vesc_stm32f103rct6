@@ -390,6 +390,22 @@ static void reply_sensor_info(motor_id_t id) {
     p[i++] = m->encoder.inverted ? 1U : 0U; put_u16(p, &i, m->encoder.elec_offset_u16);
     for (uint8_t k = 0U; k < 8U; k++) p[i++] = m->foc_hall_table[k];
     for (uint8_t k = 0U; k < 8U; k++) put_u16(p, &i, m->hall_angle_u16[k]);
+
+    /* V13 optional detect/current diagnostics. Legacy fields stay first. */
+    p[i++] = 13U;
+    put_i32(p, &i, scaled_i32(m->detect.drive_current_a, 1000.0f));
+    put_i32(p, &i, scaled_i32(m->id_target, 1000.0f));
+    put_i32(p, &i, scaled_i32(m->iq_target, 1000.0f));
+    put_u32(p, &i, m->detect.sweep_index);
+    for (uint8_t k = 0U; k < 8U; k++) put_u32(p, &i, m->detect.hall_samples[k]);
+    for (uint8_t k = 0U; k < 8U; k++) p[i++] = m->detect.result_hall_table[k];
+    put_u16(p, &i, m->current_raw_u); put_u16(p, &i, m->current_raw_v); put_u16(p, &i, m->dc_current_raw);
+    put_i32(p, &i, scaled_i32(m->ia, 1000.0f));
+    put_i32(p, &i, scaled_i32(m->ib, 1000.0f));
+    put_i32(p, &i, scaled_i32(m->ic, 1000.0f));
+    p[i++] = m->pwm_enabled ? 1U : 0U;
+    p[i++] = (m->pwm_tim->BDTR & TIM_BDTR_MOE) ? 1U : 0U;
+    put_i32(p, &i, scaled_i32(m->current_scale, 1000000.0f));
     payload_end(i);
 }
 
@@ -467,8 +483,13 @@ static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context
         motor_stop(motor_get(explicit_id));
     } else if ((sub == CUSTOM_SENSOR_SELECT || sub == CUSTOM_SENSOR_DETECT) && len >= 3U) {
         MotorRuntime *m = motor_get(explicit_id); uint8_t mode = data[2];
-        if (sub == CUSTOM_SENSOR_DETECT || mode == SENSOR_MODE_AUTO) (void)sensor_detect_request(m, mode);
-        else (void)motor_select_sensor_mode(m, mode);
+        if (sub == CUSTOM_SENSOR_DETECT || mode == SENSOR_MODE_AUTO) {
+            float current = SENSOR_DETECT_CURRENT_A;
+            if (len >= 7U) current = (float)get_i32_be(&data[3]) / 1000.0f;
+            (void)sensor_detect_request_current(m, mode, current);
+        } else {
+            (void)motor_select_sensor_mode(m, mode);
+        }
         reply_sensor_info(m->id);
     } else if (sub == CUSTOM_CURRENT_CAL) {
         if (len >= 2U && data[1] == 1U) {
@@ -549,16 +570,15 @@ static void reply_standard_detect(MotorRuntime *m, uint8_t command) {
     uint8_t *p = payload_begin(); if (p == NULL) return;
     uint16_t i = 0U; p[i++] = command;
     if (command == COMM_DETECT_HALL_FOC) {
-        bool ok = m->detect.success && m->sensor_mode == SENSOR_MODE_HALL;
-        for (uint8_t k = 0U; k < 8U; k++) p[i++] = ok ? m->foc_hall_table[k] : 255U;
+        bool ok = m->detect.success && m->detect.result_mode == SENSOR_MODE_HALL;
+        for (uint8_t k = 0U; k < 8U; k++) p[i++] = ok ? m->detect.result_hall_table[k] : 255U;
         p[i++] = ok ? 0U : 1U;
     } else if (command == COMM_DETECT_ENCODER) {
-        bool ok = m->detect.success && m->sensor_mode == SENSOR_MODE_ENCODER;
+        bool ok = m->detect.success && m->detect.result_mode == SENSOR_MODE_ENCODER;
         if (ok) {
-            float offset_deg = ((float)m->encoder.elec_offset_u16 * 360.0f) / 65536.0f;
-            put_i32(p, &i, scaled_i32(offset_deg, 1000000.0f));
-            put_i32(p, &i, scaled_i32((float)m->pole_pairs, 1000000.0f));
-            p[i++] = m->encoder.inverted ? 1U : 0U;
+            put_i32(p, &i, scaled_i32(m->detect.result_encoder_offset_deg, 1000000.0f));
+            put_i32(p, &i, scaled_i32(m->detect.result_encoder_ratio, 1000000.0f));
+            p[i++] = m->detect.result_encoder_inverted ? 1U : 0U;
         } else {
             put_i32(p, &i, 1001000000L); put_i32(p, &i, 0); p[i++] = 0U;
         }
@@ -637,13 +657,13 @@ static void blocking_thread(void *argument) {
         } else if (job.cmd == COMM_DETECT_ENCODER) {
             float current = (job.len >= 5U) ? (float)get_i32_be(&job.data[1]) / 1000.0f : SENSOR_DETECT_CURRENT_A;
             bool cal_ok = ensure_current_calibration_valid(10000U);
-            bool started = cal_ok && (m->id == MOTOR_LEFT) && sensor_detect_request_current(m, SENSOR_MODE_ENCODER, fabsf(current));
+            bool started = cal_ok && (m->id == MOTOR_LEFT) && sensor_detect_request_current_ex(m, SENSOR_MODE_ENCODER, fabsf(current), false);
             if (started) (void)wait_sensor_detect(m, 30000U);
             reply_standard_detect(m, COMM_DETECT_ENCODER);
         } else if (job.cmd == COMM_DETECT_HALL_FOC) {
             float current = (job.len >= 5U) ? (float)get_i32_be(&job.data[1]) / 1000.0f : SENSOR_DETECT_CURRENT_A;
             bool cal_ok = ensure_current_calibration_valid(10000U);
-            bool started = cal_ok && sensor_detect_request_current(m, SENSOR_MODE_HALL, fabsf(current));
+            bool started = cal_ok && sensor_detect_request_current_ex(m, SENSOR_MODE_HALL, fabsf(current), false);
             if (started) (void)wait_sensor_detect(m, 30000U);
             reply_standard_detect(m, COMM_DETECT_HALL_FOC);
         } else if (job.cmd == COMM_DETECT_APPLY_ALL_FOC) {

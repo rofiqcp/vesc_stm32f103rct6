@@ -32,6 +32,20 @@ void motor_set_foc_targets(MotorRuntime *m, float id_a, float iq_a) {
     m->iq_target_q15 = amp_to_current_q15(iq_a);
 }
 
+void motor_set_current_pi_gains(MotorRuntime *m, float kp, float ki) {
+    if (m == NULL) return;
+    if (!isfinite(kp) || kp < 0.000001f) kp = 0.000001f;
+    if (!isfinite(ki) || ki < 0.0f) ki = 0.0f;
+    m->current_kp = kp;
+    m->current_ki = ki;
+    m->current_kp_q16 = (int32_t)((kp * FOC_CURRENT_Q_BASE_A / FOC_VOLTAGE_Q_BASE_V) * 65536.0f);
+    m->current_ki_dt_q16 = (int32_t)((ki * FOC_DT_S * FOC_CURRENT_Q_BASE_A / FOC_VOLTAGE_Q_BASE_V) * 65536.0f);
+    /* A gain change is a control discontinuity. Reset only the fast current
+       integrators; outer-loop state is left to the caller. */
+    m->vd_int_q31 = 0; m->vq_int_q31 = 0;
+    m->vd_int_q15 = 0; m->vq_int_q15 = 0;
+}
+
 static void init_hall_defaults(MotorRuntime *m) {
     const int8_t table[8] = HALL_TABLE_DEFAULT;
     memcpy(m->hall_table, table, sizeof(table));
@@ -277,7 +291,7 @@ void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms) {
     m->vd_filter=lp(m->vd_filter,m->vd,FOC_CURRENT_FILTER_CONST); m->vq_filter=lp(m->vq_filter,m->vq,FOC_CURRENT_FILTER_CONST);
     m->duty_u=(float)m->duty_u_q15/32768.0f; m->duty_v=(float)m->duty_v_q15/32768.0f; m->duty_w=(float)m->duty_w_q15/32768.0f;
     float a=fabsf(m->duty_u-0.5f), b=fabsf(m->duty_v-0.5f), c=fabsf(m->duty_w-0.5f); m->duty_now=2.0f*fmaxf(a,fmaxf(b,c)); if(m->iq_target<0.0f)m->duty_now=-m->duty_now;
-    float dc=((float)((int32_t)m->dc_current_raw-m->dc_current_offset_counts))*m->dc_current_scale;
+    float dc=((float)(m->dc_current_offset_counts-(int32_t)m->dc_current_raw))*m->dc_current_scale;
     m->dc_current_a=dc; m->dc_current_filter=lp(m->dc_current_filter,dc,DC_CURRENT_FILTER_CONST); m->input_current=m->dc_current_filter;
     m->vbus_filter=lp(m->vbus_filter,m->vbus,VBUS_FILTER_CONST);
     float imag=sqrtf(m->id_filter*m->id_filter + m->iq_filter*m->iq_filter); m->motor_current=((m->vq_filter*m->iq_filter)>=0.0f)?imag:-imag;

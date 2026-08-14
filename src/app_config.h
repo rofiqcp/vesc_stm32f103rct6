@@ -60,10 +60,13 @@
  * A/count and V/count depend on shunt, op-amp and divider values. They must
  * match the PCB. Offset-to-zero calibration is automatic at every boot.
  */
-#define LEFT_CURRENT_A_PER_COUNT        0.0100f
-#define RIGHT_CURRENT_A_PER_COUNT       0.0100f
-#define LEFT_DC_CURRENT_A_PER_COUNT     0.0100f
-#define RIGHT_DC_CURRENT_A_PER_COUNT    0.0100f
+/* Stock EFeru hoverboard analog front-end baseline: A2BIT_CONV = 50,
+ * therefore 1 ADC count ~= 1/50 A = 0.020 A. Keep these board constants
+ * separate from MCCONF; verify with a current clamp on non-stock boards. */
+#define LEFT_CURRENT_A_PER_COUNT        0.0200f
+#define RIGHT_CURRENT_A_PER_COUNT       0.0200f
+#define LEFT_DC_CURRENT_A_PER_COUNT     0.0200f
+#define RIGHT_DC_CURRENT_A_PER_COUNT    0.0200f
 #define DCLINK_V_PER_COUNT              0.0200f
 
 /* VESC-style boot current-offset calibration. */
@@ -99,8 +102,10 @@
 #define LEFT_FOC_KI                     20.0f
 #define RIGHT_FOC_KP                    0.030f
 #define RIGHT_FOC_KI                    20.0f
-#define FOC_MAX_CURRENT_A               30.0f
-#define FOC_ABS_CURRENT_TRIP_A          45.0f
+/* Conservative stock-hoverboard commissioning defaults. VESC MCCONF can
+ * lower these further after current scaling is verified. */
+#define FOC_MAX_CURRENT_A               15.0f
+#define FOC_ABS_CURRENT_TRIP_A          25.0f
 #define FOC_MAX_VOLTAGE_MODULATION      0.80f
 #define VBUS_MIN_RUN_V                  8.0f
 #define VBUS_MAX_RUN_V                  55.0f
@@ -110,11 +115,15 @@
  * after current scaling has been verified with a bench supply/current clamp.
  */
 #define SENSOR_DETECT_CURRENT_A         1.5f
-#define SENSOR_DETECT_LOCK_MS           500U
-#define SENSOR_DETECT_STEP_MS           3U
+#define SENSOR_DETECT_MAX_CURRENT_A     2.0f
+/* Current VESC mcpwm_foc_hall_detect semantics: ramp Id 0->request over
+ * 1000 x 1 ms, then 3 forward + 3 reverse electrical sweeps at 1 degree
+ * per 5 ms. The F103 port implements the same sequence in its 1-kHz task. */
+#define SENSOR_DETECT_CURRENT_RAMP_MS   1000U
+#define SENSOR_DETECT_STEP_MS           5U
 #define SENSOR_DETECT_SWEEPS            3U
-#define SENSOR_DETECT_STEP_DEG          3U
-#define SENSOR_DETECT_SETTLE_MS         400U
+#define SENSOR_DETECT_STEP_DEG          1U
+#define SENSOR_DETECT_SETTLE_MS         500U
 #define SENSOR_DETECT_MIN_ENCODER_COUNTS 20
 #define SENSOR_DETECT_MAX_POLE_PAIRS    40U
 #define SENSOR_DETECT_HALL_MIN_SAMPLES  30U

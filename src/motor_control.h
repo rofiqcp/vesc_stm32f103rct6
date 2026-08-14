@@ -26,4 +26,5 @@ uint32_t motor_take_pending_fault_mask(void);
 
 bool motor_select_sensor_mode(MotorRuntime *m, uint8_t mode);
 void motor_set_foc_targets(MotorRuntime *m, float id_a, float iq_a);
+void motor_set_current_pi_gains(MotorRuntime *m, float kp, float ki);
 int32_t motor_encoder_extended_count(MotorRuntime *m);
