@@ -406,16 +406,26 @@ def _raw_handshake(link: Link, timeout: float = 1.0) -> tuple[bytes, list[bytes]
 
 
 def cmd_handshake(link: Link, args: argparse.Namespace) -> int:
-    raw,frames=_raw_handshake(link,args.timeout)
-    print("RX raw:", raw.hex(" ") if raw else "<no bytes>")
-    fw=next((p for p in frames if p and p[0]==COMM_FW_VERSION),None)
-    if fw is None:
-        print("FAIL: tidak ada frame COMM_FW_VERSION. Cek PB10/USART3_TX -> adapter RX, PB11/USART3_RX <- adapter TX, GND bersama, dan baud 115200.")
-        return 2
-    print("RX payload:", fw.hex(" "))
-    print(parse_fw_version(fw))
-    print("PASS: framing + CRC + COMM_FW_VERSION reply valid")
-    return 0
+    all_raw=bytearray()
+    for attempt in range(1, args.attempts + 1):
+        print(f"\n--- handshake attempt {attempt}/{args.attempts} ---")
+        raw,frames=_raw_handshake(link,args.timeout)
+        all_raw.extend(raw)
+        print("RX raw:", raw.hex(" ") if raw else "<no bytes>")
+        fw=next((p for p in frames if p and p[0]==COMM_FW_VERSION),None)
+        if fw is not None:
+            print("RX payload:", fw.hex(" "))
+            print(parse_fw_version(fw))
+            print("PASS: framing + CRC + COMM_FW_VERSION reply valid")
+            return 0
+        time.sleep(0.05)
+
+    if not all_raw:
+        print("FAIL/LEVEL-1: MCU mengirim 0 byte. Fokus ke boot, clock, USART3 IRQ, wiring PB10/PB11, GND, dan baud.")
+    else:
+        print("FAIL/LEVEL-2: ada byte dari MCU tetapi tidak terbentuk frame VESC valid. Fokus ke baud/clock, TXE/TC ISR, framing, atau CRC.")
+        print("ALL RX raw:", bytes(all_raw).hex(" "))
+    return 2
 
 
 def cmd_baud_scan(link: Link, args: argparse.Namespace) -> int:
@@ -832,15 +842,15 @@ def self_test() -> int:
     assert crc16(b"123456789")==0x31C3
     assert Link.standard_route(0,payload)==payload
     assert Link.standard_route(1,payload)==bytes((COMM_FORWARD_CAN,2))+payload
-    fw=(bytes((COMM_FW_VERSION,7,1))+b"STM32F103RC_DUAL_FOC\x00"+bytes(range(12))+
-        bytes((1,1,0,0,0,0,0,0))+b"F103_DUAL_FOC_RTOS2_V6\x00"+struct.pack(">I",0))
+    fw=(bytes((COMM_FW_VERSION,7,1))+b"F103RC_DUAL\x00"+bytes(range(12))+
+        bytes((0,1,0,0,0,0,0,0))+b"F103_RTOS2_V7\x00"+struct.pack(">I",0))
     fwd=parse_fw_version(fw)
-    assert fwd["major"]==7 and fwd["minor"]==1 and fwd["fw_name"].endswith("V6") and fwd["hw_crc"]==0
+    assert fwd["major"]==7 and fwd["minor"]==1 and fwd["fw_name"].endswith("V7") and fwd["hw_crc"]==0
     vals=[1.0,-2.0,3.25,4.0,5.0,6.0,7.0,8.0,16000.0]
     samp=bytes((COMM_SAMPLE_PRINT,))+be_i16(3)+b''.join(struct.pack(">f",x) for x in vals)+bytes((0,123))+be_i32(3)
     idx,row=parse_sample_packet(samp)
     assert idx==3 and abs(row['current1']+2.0)<1e-6 and row['index_full']==3
-    print("SELF-TEST PASS: CRC, framing, V6 FW parser, virtual-CAN routing, standard sample parser")
+    print("SELF-TEST PASS: CRC, framing, V7 FW parser, virtual-CAN routing, standard sample parser")
     return 0
 
 def add_live_args(p: argparse.ArgumentParser) -> None:
@@ -857,7 +867,7 @@ def main() -> int:
         p=sub.add_parser(name,help=help); add_live_args(p); p.set_defaults(func=func); return p
 
     sp("info",cmd_info,"read and fully parse VESC firmware version")
-    p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=1.0)
+    p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=0.5); p.add_argument("--attempts",type=int,default=5)
     p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake"); p.add_argument("--bauds",default="115200,230400,250000,460800,921600"); p.add_argument("--timeout",type=float,default=0.6)
     sp("comm-diag",cmd_comm_diag,"read firmware USART IRQ/ring diagnostics")
     sp("can-scan",cmd_can_scan,"verify virtual CAN RIGHT ID 2 + forwarded FW_VERSION")

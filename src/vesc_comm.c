@@ -98,6 +98,7 @@ static uint8_t s_tx_payload[VESC_PACKET_MAX_PAYLOAD];
 static uint8_t s_tx_frame[VESC_PACKET_BUFFER_SIZE];
 static comm_diag_t s_diag;
 static vesc_appdata_handler_t s_appdata_handler = NULL;
+static volatile bool s_motor_ready = false;
 
 static void process_payload(const uint8_t *data, uint16_t len);
 static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_id_t id);
@@ -203,7 +204,9 @@ static void reply_fw_version(motor_id_t id) {
     uint16_t i = 0U;
     p[i++] = COMM_FW_VERSION;
     p[i++] = 7U; p[i++] = 1U;
-    const char hw[] = "STM32F103RC_DUAL_FOC";
+    /* Keep the complete response inside the 65-byte envelope used by the
+     * current upstream COMM_FW_VERSION implementation. */
+    const char hw[] = "F103RC_DUAL";
     memcpy(&p[i], hw, sizeof(hw)); i = (uint16_t)(i + sizeof(hw));
 
     const uint32_t *uid = (const uint32_t *)0x1FFFF7E8UL;
@@ -214,7 +217,7 @@ static void reply_fw_version(motor_id_t id) {
     }
     if (id == MOTOR_RIGHT) p[i - 1U]++;
 
-    p[i++] = 1U; /* pairing done */
+    p[i++] = 0U; /* pairing_done: no NRF pairing subsystem in this port */
     p[i++] = 1U; /* test-version field */
     p[i++] = 0U; /* HW_TYPE_VESC */
     p[i++] = 0U; /* custom config count */
@@ -222,7 +225,7 @@ static void reply_fw_version(motor_id_t id) {
     p[i++] = 0U; /* HW QML excluded */
     p[i++] = 0U; /* APP QML excluded */
     p[i++] = 0U; /* NRF excluded */
-    const char fw[] = "F103_DUAL_FOC_RTOS2_V6";
+    const char fw[] = "F103_RTOS2_V7";
     memcpy(&p[i], fw, sizeof(fw)); i = (uint16_t)(i + sizeof(fw));
     put_u32(p, &i, 0U); /* reduced-port HW CRC */
     payload_end(i);
@@ -507,7 +510,7 @@ static void reply_unsupported_detect(uint8_t cmd) {
         default: break;
     }
     vesc_comm_send_payload(p, i);
-    send_print("F103 V6: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
+    send_print("F103 V7: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
 }
 
 static bool wait_sensor_detect(MotorRuntime *m, uint32_t timeout_ms) {
@@ -547,13 +550,43 @@ static void blocking_thread(void *argument) {
 
 static void unsupported_config_command(uint8_t cmd) {
     (void)cmd;
-    send_print("F103 V6: full VESC confgenerator MCCONF/APPCONF schema not present; config not acknowledged.");
+    send_print("F103 V7: full VESC confgenerator MCCONF/APPCONF schema not present; config not acknowledged.");
+}
+
+static bool command_requires_motor_ready(uint8_t cmd) {
+    switch (cmd) {
+        case COMM_SET_DUTY:
+        case COMM_SET_CURRENT:
+        case COMM_SET_CURRENT_BRAKE:
+        case COMM_SET_RPM:
+        case COMM_SET_POS:
+        case COMM_SET_HANDBRAKE:
+        case COMM_SET_CURRENT_REL:
+        case COMM_SAMPLE_PRINT:
+        case COMM_DETECT_MOTOR_PARAM:
+        case COMM_DETECT_MOTOR_R_L:
+        case COMM_DETECT_MOTOR_FLUX_LINKAGE:
+        case COMM_DETECT_ENCODER:
+        case COMM_DETECT_HALL_FOC:
+        case COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP:
+        case COMM_DETECT_APPLY_ALL_FOC:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_id_t id) {
     if (data == NULL || len == 0U) return;
     uint8_t cmd = data[0];
     MotorRuntime *m = motor_get(id);
+
+    /* COMM_FW_VERSION and the virtual-CAN FW_VERSION path must work even when
+     * ADC/PWM/FOC initialization has failed. Motor-driving and detection
+     * commands stay inhibited until motor_boot_thread completes. */
+    if (!s_motor_ready && command_requires_motor_ready(cmd)) {
+        return;
+    }
 
     if (is_blocking_command(cmd)) {
         (void)queue_blocking_job(data, len, id);
@@ -663,7 +696,6 @@ static void process_payload(const uint8_t *data, uint16_t len) {
 
 static void packet_process_thread(void *argument) {
     (void)argument;
-    vesc_packet_parser_init(&s_parser);
     vesc_comm_thread_id = osThreadGetId();
     for (;;) {
         uint32_t flags = osThreadFlagsWait(VESC_RX_AVAILABLE | VESC_TX_COMPLETE, osFlagsWaitAny, 10U);
@@ -696,6 +728,7 @@ static void vesc_comm_reply_diag(void) {
 }
 
 void vesc_comm_periodic_100hz(void) {
+    if (!s_motor_ready) return;
     /* In dual-motor mode a forwarded SET_DETECT can enable rotor/position
      * streaming for the virtual CAN motor as well. Replies stay in the inner
      * VESC command format, just like forwarded request/reply semantics. */
@@ -752,10 +785,11 @@ void vesc_comm_register_appdata_handler(vesc_appdata_handler_t handler) {
     s_appdata_handler = handler;
 }
 
-void vesc_comm_task_init(void) {
+bool vesc_comm_task_init(void) {
     memset((void *)&s_diag, 0, sizeof(s_diag));
     memset((void *)s_display_mode, 0, sizeof(s_display_mode));
-    vesc_uart_init();
+    s_motor_ready = false;
+    vesc_packet_parser_init(&s_parser);
 
     const osMutexAttr_t payload_attr = {.name = "VescPayload"};
     const osMutexAttr_t send_attr = {.name = "VescSend"};
@@ -765,8 +799,37 @@ void vesc_comm_task_init(void) {
     const osMessageQueueAttr_t blockq_attr = {.name = "VescBlockQ"};
     s_block_queue = osMessageQueueNew(BLOCK_QUEUE_DEPTH, sizeof(blocking_job_t), &blockq_attr);
 
-    const osThreadAttr_t packet_attr = {.name="packet_process_thread", .priority=osPriorityAboveNormal, .stack_size=1536U};
-    const osThreadAttr_t block_attr = {.name="blocking_thread", .priority=osPriorityAboveNormal, .stack_size=1536U};
-    (void)osThreadNew(packet_process_thread, NULL, &packet_attr);
-    (void)osThreadNew(blocking_thread, NULL, &block_attr);
+    if (s_payload_mutex == NULL || s_send_mutex == NULL || s_block_queue == NULL) {
+        return false;
+    }
+
+    const osThreadAttr_t packet_attr = {
+        .name="packet_process_thread", .priority=osPriorityNormal, .stack_size=1536U
+    };
+    const osThreadAttr_t block_attr = {
+        .name="blocking_thread", .priority=osPriorityNormal, .stack_size=1536U
+    };
+
+    osThreadId_t packet_tp = osThreadNew(packet_process_thread, NULL, &packet_attr);
+    osThreadId_t blocking_tp = osThreadNew(blocking_thread, NULL, &block_attr);
+    if (packet_tp == NULL || blocking_tp == NULL) {
+        return false;
+    }
+
+    /* Match app_uartcomm_start ordering conceptually: packet state/thread
+     * resources exist before the serial peripheral starts receiving bytes. */
+    if (!vesc_uart_init()) {
+        return false;
+    }
+
+    return true;
 }
+
+void vesc_comm_set_motor_ready(bool ready) {
+    s_motor_ready = ready;
+}
+
+bool vesc_comm_motor_ready(void) {
+    return s_motor_ready;
+}
+

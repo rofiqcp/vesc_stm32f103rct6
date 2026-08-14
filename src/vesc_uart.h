@@ -20,11 +20,11 @@ typedef struct {
     volatile uint32_t tx_complete_count;
 } vesc_uart_stats_t;
 
-/* Set by packet_process_thread. The USART ISR only signals this thread; it
- * never parses VESC packets in interrupt context. */
+/* Set by packet_process_thread. The USART ISR only moves bytes and signals
+ * this thread; VESC parsing never runs in interrupt context. */
 extern osThreadId_t vesc_comm_thread_id;
 
-void vesc_uart_init(void);
+bool vesc_uart_init(void);
 void vesc_uart_rx_isr_put(uint8_t byte);
 bool vesc_uart_rx_get(uint8_t *byte);
 bool vesc_uart_tx_isr_get(uint8_t *byte);

@@ -38,41 +38,47 @@ void DMA1_Channel1_IRQHandler(void) {
 }
 
 void USART3_IRQHandler(void) {
-    uint32_t sr = VESC_UART->SR;
+    /* Mirror the RX/TX servicing order in the upstream ChibiOS serial_lld.c
+     * serve_interrupt(): one SR snapshot, drain RX/error conditions in a loop,
+     * feed TXE from the output queue, then finish on TC. */
+    uint16_t cr1 = (uint16_t)VESC_UART->CR1;
+    uint16_t sr = (uint16_t)VESC_UART->SR;
 
-    /* RX: ISR only moves one byte into the software queue. Parsing, CRC and
-       command processing stay in packet_process_thread. */
-    if ((sr & USART_SR_RXNE) != 0U) {
+    if ((sr & USART_SR_LBD) != 0U) {
+        VESC_UART->SR = (uint16_t)~USART_SR_LBD;
+    }
+
+    while ((sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_NE |
+                  USART_SR_FE | USART_SR_PE)) != 0U) {
+        if ((sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) != 0U) {
+            vesc_uart_error_isr();
+        }
+
+        /* Important: upstream reads DR exactly once for this SR snapshot.
+         * A second SR->DR read here could consume the next byte after ORE. */
         uint8_t b = (uint8_t)VESC_UART->DR;
-        vesc_uart_rx_isr_put(b);
+        if ((sr & USART_SR_RXNE) != 0U) {
+            vesc_uart_rx_isr_put(b);
+        }
+        sr = (uint16_t)VESC_UART->SR;
     }
 
-    /* STM32F1 clears ORE/NE/FE/PE with an SR->DR read sequence. */
-    if ((sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) != 0U) {
-        volatile uint32_t dummy;
-        dummy = VESC_UART->SR;
-        dummy = VESC_UART->DR;
-        (void)dummy;
-        vesc_uart_error_isr();
-    }
-
-    /* TX: feed DR from the software output queue whenever TXE is set. */
-    if (((VESC_UART->CR1 & USART_CR1_TXEIE) != 0U) &&
-        ((sr & USART_SR_TXE) != 0U)) {
+    if (((cr1 & USART_CR1_TXEIE) != 0U) && ((sr & USART_SR_TXE) != 0U)) {
         uint8_t b;
         if (vesc_uart_tx_isr_get(&b)) {
             VESC_UART->DR = b;
         } else {
-            VESC_UART->CR1 &= ~USART_CR1_TXEIE;
-            VESC_UART->CR1 |= USART_CR1_TCIE;
+            VESC_UART->CR1 = (cr1 & (uint16_t)~USART_CR1_TXEIE) | USART_CR1_TCIE;
         }
     }
 
-    /* TC means the last queued byte has physically left the USART shifter. */
-    if (((VESC_UART->CR1 & USART_CR1_TCIE) != 0U) &&
-        ((sr & USART_SR_TC) != 0U)) {
-        VESC_UART->CR1 &= ~USART_CR1_TCIE;
-        vesc_uart_tx_complete_isr();
+    if ((sr & USART_SR_TC) != 0U) {
+        bool tc_irq_was_enabled = (VESC_UART->CR1 & USART_CR1_TCIE) != 0U;
+        VESC_UART->CR1 = cr1 & (uint16_t)~USART_CR1_TCIE;
+        VESC_UART->SR = (uint16_t)~USART_SR_TC;
+        if (tc_irq_was_enabled) {
+            vesc_uart_tx_complete_isr();
+        }
     }
 }
 

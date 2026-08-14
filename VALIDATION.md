@@ -54,3 +54,27 @@ python3 debug_vesc_f103.py config-status --port /dev/ttyUSB0
 ```
 
 Only after current-zero calibration and sensor detection are valid should active motor tests be used.
+
+## V7 handshake-first validation
+
+Executed in host environment:
+
+```text
+test_packet_v7: PASS
+audit_v7_handshake: PASS
+SELF-TEST PASS: CRC, framing, V7 FW parser, virtual-CAN routing, standard sample parser
+V7 host/audit tests: ALL PASS
+```
+
+The V7 audit verifies:
+
+- no HAL UART protocol handler or UART DMA path remains;
+- direct USART3 BRR/CR1/CR2/CR3 setup is present;
+- USART3 RX pull-up and IRQ priority 7 are present;
+- RX/error drain loop and explicit TC clear are present;
+- communication resources are initialized before motor boot;
+- motor initialization is moved behind `osKernelStart()` into `motor_boot_thread`;
+- packet parser rejects noncanonical 16-bit short frames;
+- LEFT local / RIGHT virtual CAN routing remains present.
+
+Hardware waveform validation on PB10/PB11 is still required after flashing.

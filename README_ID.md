@@ -1,3 +1,17 @@
+# V7 — Handshake-First VESC UART
+
+Versi ini adalah revisi V6 untuk kasus VESC Tool masih gagal membaca firmware version. Baca `V7_HANDSHAKE_SCREENING.md` terlebih dahulu.
+
+Tes pertama setelah flash:
+
+```bash
+python3 debug_vesc_f103.py handshake --port /dev/ttyUSB0 --baud 115200 --attempts 5
+```
+
+Target wire request adalah `02 01 00 00 00 03`. Firmware harus membalas `COMM_FW_VERSION` valid sebelum pengujian motor.
+
+---
+
 # vesc_f103_dual_foc_rtos2_v6
 
 Port STM32F103RCT6 + STM32Cube HAL + CMSIS-RTOS2/FreeRTOS yang mempertahankan fast FOC di ADC/DMA ISR dan memetakan semantik komunikasi/worker VESC upstream ke hardware F103 ini.

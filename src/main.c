@@ -12,6 +12,7 @@
 static void SystemClock_Config(void);
 static void dwt_init(void);
 static void early_fatal(void);
+static void motor_boot_thread(void *argument);
 
 int main(void) {
     HAL_Init();
@@ -19,35 +20,56 @@ int main(void) {
     SystemClock_Config();
     dwt_init();
 
+    /* Handshake-first boot architecture.
+     *
+     * Upstream app_uartcomm is an independent communication subsystem. Do not
+     * make COMM_FW_VERSION depend on ADC/PWM/FOC initialization succeeding.
+     * Initialize the RTOS and VESC UART/packet resources first, then perform
+     * all motor hardware startup from a lower-priority boot thread after the
+     * scheduler is already running. */
+    if (osKernelInitialize() != osOK) {
+        early_fatal();
+    }
+
+    if (!vesc_comm_task_init()) {
+        early_fatal();
+    }
+
+    const osThreadAttr_t boot_attr = {
+        .name = "motor_boot_thread",
+        .priority = osPriorityBelowNormal,
+        .stack_size = 1024U
+    };
+    if (osThreadNew(motor_boot_thread, NULL, &boot_attr) == NULL) {
+        early_fatal();
+    }
+
+    if (osKernelStart() != osOK) {
+        early_fatal();
+    }
+
+    while (1) { }
+}
+
+static void motor_boot_thread(void *argument) {
+    (void)argument;
+
+    /* packet_process_thread is Normal while this boot helper is BelowNormal, so a
+     * FW_VERSION request preempts motor initialization. Any motor HAL failure stays confined to
+     * this thread and must not globally disable USART interrupts. */
     motor_hw_init();
     motor_control_init();
     (void)config_store_load_apply();
     telemetry_init();
     debug_sample_init();
-
-    if (osKernelInitialize() != osOK) {
-        motor_hw_emergency_all_off();
-        while (1) { }
-    }
-
-    /* Reserve communication resources first so COMM_FW_VERSION remains
-       available even if later motor-task allocation is under memory pressure.
-       Communication: packet_process + blocking. USART3 RX/TX bytes are moved
-       by RXNE/TXE/TC IRQs through software rings; there is no UART DMA thread.
-       Fast FOC remains in the DMA1 Channel1 ISR. */
-    vesc_comm_task_init();
     motor_threads_init();
 
-    /* Start synchronized PWM counters + dual ADC DMA. Both TIM1/TIM8 MOE
-       remain disabled while the mandatory startup current-zero calibration
-       runs in DMA1_Channel1_IRQHandler(). */
+    /* Start synchronized PWM counters + dual ADC DMA only after communication
+     * is alive. TIM1/TIM8 MOE remain off through current-zero calibration. */
     motor_hw_start_sampling();
 
-    if (osKernelStart() != osOK) {
-        motor_hw_emergency_all_off();
-    }
-
-    while (1) { }
+    vesc_comm_set_motor_ready(true);
+    osThreadExit();
 }
 
 static void dwt_init(void) {

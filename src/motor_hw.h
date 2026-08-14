@@ -10,7 +10,6 @@ extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim8;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim4;
-extern UART_HandleTypeDef huart3;
 extern volatile uint32_t g_adc_dual_dma[4];
 
 void motor_hw_init(void);

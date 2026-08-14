@@ -5,6 +5,7 @@
 #include "foc_control.h"
 #include "vesc_comm.h"
 #include "foc_math.h"
+#include "cmsis_os2.h"
 #include <string.h>
 
 ADC_HandleTypeDef hadc1;
@@ -14,13 +15,16 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
-UART_HandleTypeDef huart3;
 volatile uint32_t g_adc_dual_dma[4] __attribute__((aligned(4)));
 
 static void Error_Handler_Local(void) {
+    /* Motor-subsystem failure must not kill the UART communication stack.
+     * main() starts motor hardware from a normal RTOS boot thread, so keeping
+     * IRQs enabled lets packet_process_thread continue answering FW_VERSION. */
     motor_hw_emergency_all_off();
-    __disable_irq();
-    while (1) { }
+    for (;;) {
+        osDelay(1000U);
+    }
 }
 
 static uint32_t deadtime_to_dtg(uint32_t ns) {
@@ -267,41 +271,11 @@ static void init_adc_dma(void) {
     HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
 }
 
-static void init_uart(void) {
-    __HAL_RCC_USART3_CLK_ENABLE();
-
-    GPIO_InitTypeDef g = {0};
-    g.Pin = VESC_UART_TX_PIN;
-    g.Mode = GPIO_MODE_AF_PP;
-    g.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(VESC_UART_TX_PORT, &g);
-
-    g.Pin = VESC_UART_RX_PIN;
-    g.Mode = GPIO_MODE_INPUT;
-    g.Pull = GPIO_NOPULL;
-    HAL_GPIO_Init(VESC_UART_RX_PORT, &g);
-
-    huart3.Instance = VESC_UART;
-    huart3.Init.BaudRate = VESC_UART_BAUD;
-    huart3.Init.WordLength = UART_WORDLENGTH_8B;
-    huart3.Init.StopBits = UART_STOPBITS_1;
-    huart3.Init.Parity = UART_PARITY_NONE;
-    huart3.Init.Mode = UART_MODE_TX_RX;
-    huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-    if (HAL_UART_Init(&huart3) != HAL_OK) Error_Handler_Local();
-
-    /* VESC UART transport is serviced manually from USART3_IRQHandler().
-       Priority 6 is RTOS-safe because configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY=5. */
-    HAL_NVIC_SetPriority(USART3_IRQn, 6, 0);
-    HAL_NVIC_EnableIRQ(USART3_IRQn);
-}
 
 void motor_hw_init(void) {
     init_gpio();
     init_timers();
     init_adc_dma();
-    init_uart();
 }
 
 void motor_hw_start_sampling(void) {

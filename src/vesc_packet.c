@@ -32,15 +32,24 @@ static int try_decode(const uint8_t *b, uint16_t available,
     uint32_t payload_len = 0U;
     uint16_t header = 0U;
     if (b[0] == 2U) {
-        if (available < 2U) { if (need_more) *need_more = (uint16_t)(2U - available); return -2; }
-        payload_len = b[1]; header = 2U;
+        if (available < 2U) {
+            if (need_more) *need_more = (uint16_t)(2U - available);
+            return -2;
+        }
+        payload_len = b[1];
+        header = 2U;
     } else if (b[0] == 3U) {
-        if (available < 3U) { if (need_more) *need_more = (uint16_t)(3U - available); return -2; }
-        payload_len = ((uint32_t)b[1] << 8) | b[2]; header = 3U;
-    } else if (b[0] == 4U) {
-        if (available < 4U) { if (need_more) *need_more = (uint16_t)(4U - available); return -2; }
-        payload_len = ((uint32_t)b[1] << 16) | ((uint32_t)b[2] << 8) | b[3]; header = 4U;
+        if (available < 3U) {
+            if (need_more) *need_more = (uint16_t)(3U - available);
+            return -2;
+        }
+        payload_len = ((uint32_t)b[1] << 8) | b[2];
+        header = 3U;
+        /* Current upstream packet.c rejects non-canonical long headers. */
+        if (payload_len < 255U) return -1;
     } else {
+        /* PACKET_MAX_PL_LEN is 512, therefore upstream compiles support for
+         * 8-bit and 16-bit length prefixes only; start byte 4 is not valid. */
         return -1;
     }
 
