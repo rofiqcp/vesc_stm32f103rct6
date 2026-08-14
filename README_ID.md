@@ -1,73 +1,67 @@
-# V13 — VESC Hall/Current Feedback Recovery for STM32F103RCT6
+# V14 — Driven Current Offset Calibration Recovery
 
-> V13 preserves the proven V8 UART-DMA communication and V11 timer/ADC/DMA topology. It corrects hoverboard current-feedback polarity/phase mapping, Hall active-low acquisition, VESC-style Hall detection timing/timeout semantics, and false over-current faults while the bridge is off. See `V13_VESC_HALL_CURRENT_FIX.md`.
+V14 keeps the **known-working V8 VESC Tool UART-DMA transport frozen** and keeps the V11 STM32F103 timing path (`TIM1/TIM8 -> TIM2 CC2 -> ADC1+ADC2 dual regular simultaneous -> DMA1_CH1 HT -> fixed-point FOC`). The main V14 change is current-sense calibration: final FOC offsets are measured under the same switching condition used by active FOC instead of being learned only while MOE is off.
 
+## Why V14 exists
 
-V13 keeps the **known-working V8 VESC Tool transport frozen** and repairs the motor-side timing and data path to follow the current VESC FOC execution model as closely as practical on STM32F103RCT6 + STM32 HAL + CMSIS-RTOS2.
+The V13 Hall-detect trace showed calibration valid and near-zero current before detection, then `ABS_OVER_CURRENT` was latched immediately after entering PREPARE. The later packet already showed MOE/PWM off and small current, so the actual fault was a short transient lost before telemetry could capture it.
 
-## Frozen communication path
+V14 addresses that root cause with:
 
-- USART3 PB10 TX / PB11 RX, 115200 8N1.
-- RX: DMA1 Channel 3 circular, parser drains bytes in `packet_process_thread`.
-- TX: DMA1 Channel 2 queued DMA.
-- No packet parser, config serializer, flash write, or motor command execution inside UART/DMA ISR.
-- LEFT is local motor; RIGHT is virtual `COMM_FORWARD_CAN` node ID 2.
+- **undriven baseline**: 4096 samples, used for rail/gross-safety diagnostics;
+- **LEFT driven offset**: 50%/50%/50% zero-vector PWM, 64-event settle, 1000 samples at 1 kHz;
+- **RIGHT driven offset**: same process independently;
+- final phase/DC offsets used by the FOC PI are the **driven** averages;
+- driven offsets are no longer slowly overwritten by off-state ADC readings;
+- every normal PWM enable starts with 8 bounded FOC samples at exact 50% zero vector before current PI is allowed to act;
+- first active-drive current fault is snapshotted before MOE is cleared.
 
-The four V8 transport files are protected by `audit/V8_TRANSPORT_FROZEN.sha256`.
+This is aligned with VESC's separation between driven and undriven offsets. The low-side-shunt VESC calibration variant uses all phases at 50% modulation (zero SVM amplitude) and averages 1000 samples.
 
-## V12 motor timing path
+## Frozen VESC Tool communication
 
-```
-TIM1 RIGHT, center aligned 16 kHz, master TRGO=ENABLE
-        |
-        +--> TIM8 LEFT, ITR0 trigger slave, 180-degree counter phase
-                    |
-                    +--> TIM8 TRGO=UPDATE
-                              |
-                              +--> TIM2 ITR1 RESET slave
-                                      CH2 compare = sample offset/2
-                                              |
-                                              +--> ADC1 external T2_CC2
-                                                   + ADC2 regular simultaneous
-                                                        |
-                                                        +--> DMA1_CH1 circular
-                                                             HT after rank 3
-                                                                  |
-                                                                  +--> foc_adc_dma_isr()
-```
+- USART3 PB10 TX / PB11 RX, 115200 8N1
+- RX DMA1_CH3 circular
+- parser/commands in `packet_process_thread`
+- TX DMA1_CH2 queue
+- LEFT local; RIGHT virtual `COMM_FORWARD_CAN` ID 2
 
-ADC ranks are arranged so all two-shunt phase currents for LEFT and RIGHT plus both DC-current channels are already present by DMA half transfer. Slower DCLINK ranks finish in the second half of the scan.
+`audit/V8_TRANSPORT_FROZEN.sha256` protects the four proven transport files.
 
-Each ADC event performs the full current loop for exactly one motor. TIM1 `DIR` selects the V0/V7 half; because this PCB maps RIGHT=TIM1 and LEFT=TIM8, DIR=0 services LEFT and DIR=1 services RIGHT. Each motor therefore receives a 16-kHz current-loop update while the shared DMA fast ISR occurs twice per PWM period.
+## Current mapping / fixed point
 
-## Hard-real-time boundary
+Stock hoverboard baseline remains:
 
-`DMA1_Channel1_IRQHandler` and `TIM2_IRQHandler` do not call CMSIS-RTOS2, FreeRTOS, UART, printf, malloc or flash. The FOC ISR uses fixed-point Clarke/Park/current-PI/inverse-Park/SVM and direct timer-register updates. Slow control, telemetry, config, detect and persistence remain in RTOS threads.
+- current polarity: `offset - ADC`
+- 50 ADC counts/A -> 0.020 A/count
+- LEFT two shunts: phase A + phase B, reconstruct C
+- RIGHT two shunts: phase B + phase C, reconstruct A
+- Q15 current base: 64 A
+- current gain stored Q16.16; PI integrators Q31
 
-## Sensor detect
+Host arithmetic test verifies 50 counts -> 0.998046875 A and 1250 counts -> 24.998046875 A. The fixed-point quantization is far below one ADC-count step and there is no float trig/divide in the normal fast current loop.
 
-Hall and LEFT encoder detect use forced electrical phase before the normal sensor selector. This means the PWM/FOC path can produce a controlled rotating field without requiring a valid Hall/encoder angle first. RIGHT remains Hall-only; LEFT PB6/PB7 can be Hall V/W or TIM4 encoder A/B, never both simultaneously.
+## ADC/PWM timing retained
 
-`COMM_DETECT_APPLY_ALL_FOC` does **not** fake a successful full motor detect. Until physical R/L/flux measurement routines are ported and verified, it returns the VESC-style flux-detect failure code (`-10`) after calibration instead of storing invented parameters. Individual Hall/encoder detection remains available.
+- SYSCLK 64 MHz
+- TIM1/TIM8 center-aligned 16 kHz
+- TIM2 CC2 sampling event
+- ADC1 master + ADC2 regular-simultaneous slave
+- DMA1_CH1 circular, half-transfer after the three current ranks
+- one motor full FOC update per V0/V7 event, each motor 16 kHz
 
-## Motor/App configuration
+## First test after flashing
 
-- VESC 6.00 MCCONF wire size: 481 bytes.
-- VESC 6.00 APPCONF wire size: 493 bytes.
-- `GET_MCCONF` is safe even when it arrives immediately after FW_VERSION, before motor boot finishes.
-- SET config executes in the blocking worker, never in RX/DMA ISR.
-- V8 physical UART settings remain immutable even if App Config is written.
-- Persistent config uses the final 8 KiB of STM32 flash with version, sequence and CRC; firmware linker is restricted to 248 KiB.
-
-## Runtime diagnosis
-
-Use:
+Keep the wheels off the ground and use a current-limited supply. Do **not** run Hall detect first.
 
 ```bash
-python3 debug_vesc_f103.py handshake --port /dev/ttyUSB0 --baud 115200
-python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0 --baud 115200 --timeout 5
+python3 debug_vesc_f103.py calibrate \
+  --port /dev/ttyUSB0 \
+  --baud 115200 \
+  --timeout 8 \
+  --out v14_calibration.txt
 ```
 
-The calibration diagnostic reports ADC-FOC ISR count, DMA CNDTR, TIM1/TIM8/TIM2 running state, ADC1/ADC2 enable and DMA1_CH1 enable. `adc_isr_count` must continuously increase before motor commands can be expected to produce torque.
+The TXT now includes undriven vs driven offset deltas and the first active-drive current-fault snapshot. Only after calibration reports `valid=True` should Hall detect be tested at 0.5 A.
 
-See `V12_VESC_F103_TIMING.md` and `FIRST_POWER_TEST.md` before applying motor power.
+See `V14_DRIVEN_OFFSET_CALIBRATION.md` and `V14_TEST_RESULTS.txt`.

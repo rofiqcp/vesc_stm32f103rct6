@@ -433,7 +433,7 @@ static void reply_current_cal(void) {
 
     /* V12 detailed calibration diagnostics. Keep legacy fields first. */
     foc_cal_diag_t cd; foc_get_calibration_diag(&cd);
-    p[i++] = 12U; /* calibration diagnostic revision */
+    p[i++] = 14U; /* calibration diagnostic revision */
     put_u16(p, &i, cd.warn_mask);
     put_u16(p, &i, cd.fail_range_mask);
     put_u16(p, &i, cd.fail_noise_mask);
@@ -452,6 +452,23 @@ static void reply_current_cal(void) {
     put_u32(p, &i, TIM8->CR1); put_u32(p, &i, TIM8->ARR); put_u32(p, &i, TIM8->CNT); put_u32(p, &i, TIM8->BDTR);
     put_u32(p, &i, TIM2->CR1); put_u32(p, &i, TIM2->SMCR); put_u32(p, &i, TIM2->CCR2); put_u32(p, &i, TIM2->CNT);
     for (uint8_t k=0U;k<6U;k++) put_u32(p, &i, g_adc_dual_dma[k]);
+
+    /* V14: VESC-style driven/undriven current-offset diagnostics plus the
+       first active-drive over-current snapshot. Appended after V12 fields so
+       older debug clients still parse the legacy prefix. */
+    p[i++] = (uint8_t)cd.stage;
+    put_u16(p, &i, cd.shift_warn_mask);
+    for (uint8_t k=0U;k<6U;k++) put_i32(p, &i, cd.undriven_mean[k]);
+    for (uint8_t k=0U;k<6U;k++) put_i32(p, &i, cd.driven_mean[k]);
+
+    foc_fault_snapshot_t fs; foc_get_fault_snapshot(&fs);
+    p[i++] = fs.valid; p[i++] = fs.motor; p[i++] = fs.fault; p[i++] = fs.cal_stage;
+    put_u16(p, &i, fs.raw_u); put_u16(p, &i, fs.raw_v); put_u16(p, &i, fs.raw_dc);
+    put_i32(p, &i, fs.offset_u); put_i32(p, &i, fs.offset_v); put_i32(p, &i, fs.offset_dc);
+    put_i32(p, &i, fs.ia_q15); put_i32(p, &i, fs.ib_q15); put_i32(p, &i, fs.ic_q15);
+    put_i32(p, &i, fs.trip_q15); put_i32(p, &i, fs.id_target_q15); put_i32(p, &i, fs.iq_target_q15);
+    put_u16(p, &i, fs.ccr1); put_u16(p, &i, fs.ccr2); put_u16(p, &i, fs.ccr3);
+    put_u16(p, &i, fs.tim_cnt); put_u16(p, &i, fs.dma_cndtr); put_u32(p, &i, fs.adc_isr_count);
     payload_end(i);
 }
 

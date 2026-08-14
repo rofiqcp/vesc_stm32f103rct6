@@ -300,6 +300,10 @@ void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms) {
 
     (void)now_ms; /* command timeout is global and handled by timeout_thread. */
     if (m->fault!=MOTOR_FAULT_NONE) { motor_hw_set_pwm_enabled(m,false); return; }
+    /* Before driven-offset calibration is complete, current_cal_thread owns
+       MOE. Do not let the generic stopped-state policy turn the 50% zero-vector
+       calibration off on the next 1-kHz tick. */
+    if (!foc_calibration_done()) return;
 
     bool encoder_ready = !(m->id==MOTOR_LEFT && m->sensor_mode==SENSOR_MODE_ENCODER) || m->encoder.synced || m->detect.busy;
     bool wants_pwm = m->detect.busy || (m->command_active && m->control_mode!=MOTOR_CTRL_OFF);

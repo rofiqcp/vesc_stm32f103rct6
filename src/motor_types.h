@@ -171,6 +171,11 @@ typedef struct MotorRuntime {
     volatile motor_control_mode_t control_mode;
     volatile motor_fault_t fault;
     volatile bool pwm_enabled;
+    /* Short zero-vector blanking window after MOE is asserted. During this
+       window the ISR holds 50%/50%/50% and only gross DC-current safety is
+       active; phase-current PI/ABS fault starts after the analog front-end
+       has settled. */
+    volatile uint16_t pwm_enable_blank_cycles;
     volatile bool command_active;
     volatile bool timeout_active;
     volatile bool detect_force_angle;

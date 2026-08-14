@@ -53,8 +53,8 @@ need 'sensor_detect_request_current(m, mode, current)' src/vesc_comm.c
 need 'p.add_argument("--current",type=float,default=0.5' debug_vesc_f103.py
 
 # V13 host trace support.
-need 'V13 SENSOR DETECT TRACE' debug_vesc_f103.py
-need 'v13_sensor_detect' debug_vesc_f103.py
+grep -Eq 'V1(3|4) SENSOR DETECT TRACE' debug_vesc_f103.py || fail 'missing V13/V14 sensor trace marker'
+grep -Eq 'v1(3|4)_sensor_detect' debug_vesc_f103.py || fail 'missing V13/V14 sensor trace filename'
 need 'NATIVE_FAULT_NAMES' debug_vesc_f103.py
 
 # The full Hall routine takes about 11.8 s at canonical timing; host timeout must exceed it.

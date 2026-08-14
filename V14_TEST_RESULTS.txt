@@ -1,0 +1,38 @@
+test_packet_v8: PASS
+test_foc_math: PASS
+test_vesc_buffer: PASS
+test_vesc_config_layout: PASS (MCCONF=481 APPCONF=493 unsupported-byte preservation + runtime canonicalization + encoder-ratio separation)
+test_vesc_config_early_get: PASS (safe exact-size MCCONF before motor runtime init)
+audit_v11_vesc_f103: PASS
+  V8 UART DMA transport frozen
+  64MHz + TIM1/TIM8/TIM2 VESC timing topology present
+  ADC1/ADC2 F103 multimode + SW-start slave/pre-enable + DMA1_CH1 HT present
+  FOC/ADC/TIM2 ISRs are kernel-free
+  V0/V7 one-motor-per-event + forced-angle detect present
+  VESC6 config/control/virtual-right checks present
+SELF-TEST PASS: CRC, framing, VESC-6.00 FW parser, virtual-CAN routing, standard sample parser
+V11 host/audit tests: ALL PASS
+canonical Hall detect scheduled duration: 11815 ms
+audit_v13_detection: PASS
+  V8 UART/packet transport frozen
+  current polarity + LEFT A/B + RIGHT B/C reconstruction corrected
+  off-state manual rotation no longer latches software over-current
+  active-low/NOPULL Hall inputs match stock hoverboard hardware
+  Hall detect uses VESC 1s current ramp + 1deg/5ms x 3 fwd/rev
+  timeout disabled/restored and standard detect restores old config
+  clean detect failure is non-latching; electrical faults retain their real cause
+  Hall GPIO is polled in FOC fast path; EXTI is optional hint only
+  V13 sensor-detect trace writes detailed TXT and supports low diagnostic current
+ISR blocking-call audit: PASS
+test_v14_current_fixedpoint: PASS
+  scale_q16= 671088
+  50 ADC counts -> 0.998046875 A
+  1250 ADC counts -> 24.998046875 A
+audit_v14_driven_cal: PASS
+  VESC-style driven/undriven offset separation present
+  low-side-shunt zero-vector driven calibration: 1000 samples per motor
+  current offsets are not re-tracked while undriven
+  PWM-enable blanking + first-fault ADC snapshot present
+  V8 communication and V11 TIM2/ADC/DMA topology retained
+SELF-TEST PASS: CRC, framing, VESC-6.00 FW parser, virtual-CAN routing, standard sample parser
+V14 host/audit tests: ALL PASS

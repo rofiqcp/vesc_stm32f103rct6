@@ -365,12 +365,14 @@ void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled) {
         if (!m->pwm_enabled) {
             motor_hw_set_pwm_q15(m, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
             motor_hw_gate_global(true);
+            m->pwm_enable_blank_cycles = PWM_ENABLE_BLANK_CYCLES;
             m->pwm_tim->BDTR |= TIM_BDTR_MOE;
             m->pwm_enabled = true;
         }
     } else {
         m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
         m->pwm_enabled = false;
+        m->pwm_enable_blank_cycles = 0U;
     }
 }
 

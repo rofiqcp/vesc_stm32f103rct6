@@ -10,14 +10,26 @@
 static volatile bool s_cal_done = false;
 static volatile bool s_cal_valid = false;
 static volatile bool s_cal_request = false;
-static uint32_t s_cal_count = 0U;
+static volatile foc_cal_stage_t s_cal_stage = FOC_CAL_STAGE_UNDRIVEN;
+static uint32_t s_cal_count = 0U;          /* sample count in current stage */
+static uint32_t s_cal_progress = 0U;       /* total accepted calibration samples */
 static uint32_t s_cal_warmup = 0U;
+static uint32_t s_cal_decimation = 0U;
+static uint8_t s_cal_dc_trip_consecutive = 0U;
 static uint64_t s_sum_lu = 0U, s_sum_lv = 0U, s_sum_ldc = 0U;
 static uint64_t s_sum_ru = 0U, s_sum_rv = 0U, s_sum_rdc = 0U;
 static uint64_t s_sq_lu = 0U, s_sq_lv = 0U, s_sq_ldc = 0U;
 static uint64_t s_sq_ru = 0U, s_sq_rv = 0U, s_sq_rdc = 0U;
 static uint16_t s_min_lu, s_min_lv, s_min_ldc, s_min_ru, s_min_rv, s_min_rdc;
 static uint16_t s_max_lu, s_max_lv, s_max_ldc, s_max_ru, s_max_rv, s_max_rdc;
+/* VESC keeps driven and undriven calibration states distinct. The current PI
+ * uses driven offsets. Undriven values are retained only for diagnostics and
+ * for gross zero-vector safety during the driven-calibration transition. */
+static int32_t s_undriven_mean[6] = {0};
+static int32_t s_driven_mean[6] = {0};
+static foc_cal_channel_diag_t s_cal_diag_channels[6];
+static volatile uint16_t s_cal_shift_warn_mask = 0U;
+static volatile foc_fault_snapshot_t s_fault_snapshot;
 static uint8_t s_overrun_consecutive[2] = {0U, 0U};
 static int32_t s_inv_vbus_q30 = 0;
 static int32_t s_inv_vbus_last_q15 = 0;
@@ -40,37 +52,76 @@ static inline int32_t q15_mul_q16(int32_t a_q15, int32_t b_q16) {
     return (int32_t)(((int64_t)a_q15 * (int64_t)b_q16) >> 16);
 }
 
-static void cal_reset_isr(void) {
-    s_cal_done = false;
-    s_cal_valid = false;
-    s_cal_request = false;
+static void cal_acc_reset(void) {
     s_cal_count = 0U;
     s_cal_warmup = 0U;
+    s_cal_decimation = 0U;
+    s_cal_dc_trip_consecutive = 0U;
     s_sum_lu = s_sum_lv = s_sum_ldc = 0U;
     s_sum_ru = s_sum_rv = s_sum_rdc = 0U;
     s_sq_lu = s_sq_lv = s_sq_ldc = 0U;
     s_sq_ru = s_sq_rv = s_sq_rdc = 0U;
     s_min_lu = s_min_lv = s_min_ldc = s_min_ru = s_min_rv = s_min_rdc = UINT16_MAX;
     s_max_lu = s_max_lv = s_max_ldc = s_max_ru = s_max_rv = s_max_rdc = 0U;
+}
+
+
+static void cal_task_reset_acc_and_stage(foc_cal_stage_t stage) {
+    /* The accumulators are written by DMA1_CH1 ISR. Reset them atomically so
+       the ISR can never observe a half-reset sum/count set. The critical
+       section is only register/RAM writes and contains no HAL/RTOS calls. */
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    cal_acc_reset();
+    s_cal_stage = stage;
+    if (!primask) __enable_irq();
+}
+
+static void cal_reset_isr(void) {
+    s_cal_done = false;
+    s_cal_valid = false;
+    s_cal_request = false;
+    s_cal_stage = FOC_CAL_STAGE_UNDRIVEN;
+    s_cal_progress = 0U;
     s_cal_warn_mask = 0U;
     s_cal_fail_range_mask = 0U;
     s_cal_fail_noise_mask = 0U;
+    s_cal_shift_warn_mask = 0U;
+    for (uint8_t i = 0U; i < 6U; i++) {
+        s_undriven_mean[i] = 0;
+        s_driven_mean[i] = 0;
+        s_cal_diag_channels[i].mean = 0;
+        s_cal_diag_channels[i].min = UINT16_MAX;
+        s_cal_diag_channels[i].max = 0U;
+        s_cal_diag_channels[i].variance_x100 = 0U;
+    }
+    s_fault_snapshot.valid = 0U;
+    cal_acc_reset();
 }
 
 bool foc_calibration_done(void) { return s_cal_done; }
 bool foc_calibration_valid(void) { return s_cal_done && s_cal_valid; }
+foc_cal_stage_t foc_calibration_stage(void) { return s_cal_stage; }
 
 uint32_t foc_adc_isr_count(void) { return s_adc_isr_count; }
 
 void foc_get_calibration_progress(uint32_t *count, uint32_t *target) {
-    if (count != NULL) *count = s_cal_count;
-    if (target != NULL) *target = ADC_OFFSET_CAL_SAMPLES;
+    if (count != NULL) *count = s_cal_progress;
+    if (target != NULL) *target = ADC_OFFSET_CAL_SAMPLES + (2U * ADC_DRIVEN_CAL_SAMPLES);
 }
 
 void foc_request_recalibration(void) {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     s_cal_request = true;
+    if (!primask) __enable_irq();
+}
+
+void foc_get_fault_snapshot(foc_fault_snapshot_t *out) {
+    if (out == NULL) return;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    *out = s_fault_snapshot;
     if (!primask) __enable_irq();
 }
 
@@ -198,16 +249,39 @@ static inline int32_t adc_current_to_q15(uint16_t raw, int32_t offset, int32_t s
 }
 
 static inline void offset_track_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, uint16_t raw_dc) {
-    if (m->pwm_enabled || m->command_active || m->detect.busy) return;
-    int64_t tu = ((int64_t)raw_u) << 16;
-    int64_t tv = ((int64_t)raw_v) << 16;
-    int64_t td = ((int64_t)raw_dc) << 16;
-    m->current_offset_u_acc_q16 += (tu - m->current_offset_u_acc_q16) >> ADC_OFFSET_TRACK_SHIFT;
-    m->current_offset_v_acc_q16 += (tv - m->current_offset_v_acc_q16) >> ADC_OFFSET_TRACK_SHIFT;
-    m->dc_current_offset_acc_q16 += (td - m->dc_current_offset_acc_q16) >> ADC_OFFSET_TRACK_SHIFT;
-    m->current_offset_u_counts = (int32_t)(m->current_offset_u_acc_q16 >> 16);
-    m->current_offset_v_counts = (int32_t)(m->current_offset_v_acc_q16 >> 16);
-    m->dc_current_offset_counts = (int32_t)(m->dc_current_offset_acc_q16 >> 16);
+    /* V14: do NOT drag the driven offsets back toward the undriven readings
+       while PWM is off. VESC explicitly distinguishes driven and undriven
+       calibration states. The current PI must keep using the driven offsets
+       measured under the same 50% zero-vector switching condition. */
+    (void)m; (void)raw_u; (void)raw_v; (void)raw_dc;
+}
+
+static void capture_current_fault_snapshot(MotorRuntime *m, motor_fault_t fault,
+                                           uint16_t raw_u, uint16_t raw_v, uint16_t raw_dc,
+                                           int32_t ia, int32_t ib, int32_t ic, int32_t trip) {
+    if (s_fault_snapshot.valid) return; /* preserve first root-cause sample */
+    s_fault_snapshot.valid = 1U;
+    s_fault_snapshot.motor = (uint8_t)m->id;
+    s_fault_snapshot.fault = (uint8_t)fault;
+    s_fault_snapshot.cal_stage = (uint8_t)s_cal_stage;
+    s_fault_snapshot.raw_u = raw_u;
+    s_fault_snapshot.raw_v = raw_v;
+    s_fault_snapshot.raw_dc = raw_dc;
+    s_fault_snapshot.offset_u = m->current_offset_u_counts;
+    s_fault_snapshot.offset_v = m->current_offset_v_counts;
+    s_fault_snapshot.offset_dc = m->dc_current_offset_counts;
+    s_fault_snapshot.ia_q15 = ia;
+    s_fault_snapshot.ib_q15 = ib;
+    s_fault_snapshot.ic_q15 = ic;
+    s_fault_snapshot.trip_q15 = trip;
+    s_fault_snapshot.id_target_q15 = m->id_target_q15;
+    s_fault_snapshot.iq_target_q15 = m->iq_target_q15;
+    s_fault_snapshot.ccr1 = (uint16_t)m->pwm_tim->CCR1;
+    s_fault_snapshot.ccr2 = (uint16_t)m->pwm_tim->CCR2;
+    s_fault_snapshot.ccr3 = (uint16_t)m->pwm_tim->CCR3;
+    s_fault_snapshot.tim_cnt = (uint16_t)m->pwm_tim->CNT;
+    s_fault_snapshot.dma_cndtr = (uint16_t)DMA1_Channel1->CNDTR;
+    s_fault_snapshot.adc_isr_count = s_adc_isr_count;
 }
 
 static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, uint16_t raw_dc,
@@ -247,12 +321,36 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
     }
 
     int32_t trip = (m->abs_current_trip_q15 > 0) ? m->abs_current_trip_q15 : s_current_trip_q15;
+
+    /* The first few PWM-synchronous samples after MOE is asserted are held at
+       the exact 50% zero vector. This is not a time delay in the hard loop: it
+       is a fixed, bounded number of current-loop updates. It prevents a single
+       analog-switching transient from being interpreted as 25 A while still
+       retaining a much lower gross DC-current safety check. */
+    if (m->pwm_enabled && m->pwm_enable_blank_cycles > 0U) {
+        int32_t dc_q15 = adc_current_to_q15(raw_dc, m->dc_current_offset_counts, m->current_scale_q16);
+        const int32_t dc_trip_q15 = (int32_t)((ADC_DRIVEN_CAL_MAX_DC_A / FOC_CURRENT_Q_BASE_A) * 32768.0f);
+        if (iabs32(dc_q15) > dc_trip_q15) {
+            capture_current_fault_snapshot(m, MOTOR_FAULT_ABS_OVER_CURRENT,
+                                           raw_u, raw_v, raw_dc, ia, ib, ic, dc_trip_q15);
+            motor_request_fault_from_isr(m, MOTOR_FAULT_ABS_OVER_CURRENT);
+            return;
+        }
+        m->pwm_enable_blank_cycles--;
+        m->vd_int_q31 = 0; m->vq_int_q31 = 0;
+        m->vd_int_q15 = 0; m->vq_int_q15 = 0;
+        motor_hw_set_pwm_q15(m, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
+        return;
+    }
+
     /* With MOE already OFF an externally back-driven motor can generate
        current through the bridge diodes. Latching ABS_OVER_CURRENT in that
-       state cannot protect the bridge and caused false 3-beep faults when the
-       wheel was rotated by hand. The hard software trip is meaningful while
-       this firmware is actively driving (MOE/pwm_enabled). */
+       state cannot protect the bridge. During active drive, preserve the first
+       failing ADC sample before disabling MOE so post-mortem diagnostics show
+       the actual transient rather than only the later zero-current state. */
     if (m->pwm_enabled && (iabs32(ia) > trip || iabs32(ib) > trip || iabs32(ic) > trip)) {
+        capture_current_fault_snapshot(m, MOTOR_FAULT_ABS_OVER_CURRENT,
+                                       raw_u, raw_v, raw_dc, ia, ib, ic, trip);
         motor_request_fault_from_isr(m, MOTOR_FAULT_ABS_OVER_CURRENT); return;
     }
     if (m->pwm_enabled && vbus_q15 > s_vbus_max_q15) { motor_request_fault_from_isr(m, MOTOR_FAULT_OVER_VOLTAGE); return; }
@@ -382,28 +480,20 @@ static void validate_cal_channel(uint8_t idx, int32_t mean, uint16_t mn, uint16_
 
 void foc_get_calibration_diag(foc_cal_diag_t *out) {
     if (out == NULL) return;
-    /* Snapshot ISR-owned counters atomically, but do the 64-bit divisions only
-       after IRQs are restored. Holding off the 32 kHz sampling IRQ across six
-       software 64-bit divisions would itself perturb the control timing. */
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    uint32_t n = s_cal_count;
-    uint16_t warn = s_cal_warn_mask, fail_range = s_cal_fail_range_mask, fail_noise = s_cal_fail_noise_mask;
-    uint64_t sums[6] = {s_sum_lu,s_sum_lv,s_sum_ldc,s_sum_ru,s_sum_rv,s_sum_rdc};
-    uint64_t sqs[6]  = {s_sq_lu,s_sq_lv,s_sq_ldc,s_sq_ru,s_sq_rv,s_sq_rdc};
-    uint16_t mins[6] = {s_min_lu,s_min_lv,s_min_ldc,s_min_ru,s_min_rv,s_min_rdc};
-    uint16_t maxs[6] = {s_max_lu,s_max_lv,s_max_ldc,s_max_ru,s_max_rv,s_max_rdc};
-    if (!primask) __enable_irq();
-
-    out->warn_mask = warn;
-    out->fail_range_mask = fail_range;
-    out->fail_noise_mask = fail_noise;
+    out->stage = (uint8_t)s_cal_stage;
+    out->reserved = 0U;
+    out->shift_warn_mask = s_cal_shift_warn_mask;
+    out->warn_mask = s_cal_warn_mask;
+    out->fail_range_mask = s_cal_fail_range_mask;
+    out->fail_noise_mask = s_cal_fail_noise_mask;
     for (uint8_t k=0U;k<6U;k++) {
-        out->ch[k].mean = (n > 0U) ? (int32_t)(sums[k] / n) : 0;
-        out->ch[k].min = mins[k];
-        out->ch[k].max = maxs[k];
-        out->ch[k].variance_x100 = variance_x100(sums[k], sqs[k], n);
+        out->ch[k] = s_cal_diag_channels[k];
+        out->undriven_mean[k] = s_undriven_mean[k];
+        out->driven_mean[k] = s_driven_mean[k];
     }
+    if (!primask) __enable_irq();
 }
 
 static void calibration_zero_fast_states(MotorRuntime *m) {
@@ -417,6 +507,221 @@ static void calibration_zero_fast_states(MotorRuntime *m) {
 }
 
 
+
+static void cal_store_diag(uint8_t idx, int32_t mean, uint16_t mn, uint16_t mx,
+                           uint64_t sum, uint64_t sum_sq, uint32_t n) {
+    s_cal_diag_channels[idx].mean = mean;
+    s_cal_diag_channels[idx].min = mn;
+    s_cal_diag_channels[idx].max = mx;
+    s_cal_diag_channels[idx].variance_x100 = variance_x100(sum, sum_sq, n);
+    validate_cal_channel(idx, mean, mn, mx, sum, sum_sq, n, idx == 0U || idx == 1U || idx == 3U || idx == 4U);
+    int32_t shift = mean - s_undriven_mean[idx];
+    if (shift < 0) shift = -shift;
+    if ((uint32_t)shift > ADC_OFFSET_WARN_SPREAD_COUNT) {
+        s_cal_shift_warn_mask |= (uint16_t)(1U << idx);
+    }
+}
+
+static void cal_set_runtime_offsets(MotorRuntime *m, int32_t u, int32_t v, int32_t dc) {
+    m->current_offset_u_counts = u;
+    m->current_offset_v_counts = v;
+    m->dc_current_offset_counts = dc;
+    m->current_offset_u_acc_q16 = ((int64_t)u) << 16;
+    m->current_offset_v_acc_q16 = ((int64_t)v) << 16;
+    m->dc_current_offset_acc_q16 = ((int64_t)dc) << 16;
+}
+
+static void cal_fail_from_isr(uint16_t bit) {
+    s_cal_fail_noise_mask |= bit;
+    s_cal_valid = false;
+    s_cal_done = true;
+    s_cal_stage = FOC_CAL_STAGE_FAILED;
+    motor_hw_emergency_all_off();
+}
+
+static bool cal_gross_dc_safe(uint16_t raw_dc, int32_t undriven_offset, uint16_t fail_bit) {
+    int32_t d = (int32_t)raw_dc - undriven_offset;
+    if (d < 0) d = -d;
+    if ((uint32_t)d > ADC_DRIVEN_CAL_MAX_DC_COUNTS) {
+        if (++s_cal_dc_trip_consecutive >= ADC_DRIVEN_CAL_DC_TRIP_SAMPLES) {
+            cal_fail_from_isr(fail_bit);
+            return false;
+        }
+    } else {
+        s_cal_dc_trip_consecutive = 0U;
+    }
+    return true;
+}
+
+static void cal_accumulate_all(uint16_t l_u, uint16_t l_v, uint16_t l_dc,
+                               uint16_t r_u, uint16_t r_v, uint16_t r_dc) {
+    s_sum_lu += l_u; s_sum_lv += l_v; s_sum_ldc += l_dc;
+    s_sum_ru += r_u; s_sum_rv += r_v; s_sum_rdc += r_dc;
+    s_sq_lu += (uint64_t)l_u * l_u; s_sq_lv += (uint64_t)l_v * l_v; s_sq_ldc += (uint64_t)l_dc * l_dc;
+    s_sq_ru += (uint64_t)r_u * r_u; s_sq_rv += (uint64_t)r_v * r_v; s_sq_rdc += (uint64_t)r_dc * r_dc;
+    cal_track_minmax(l_u,&s_min_lu,&s_max_lu); cal_track_minmax(l_v,&s_min_lv,&s_max_lv); cal_track_minmax(l_dc,&s_min_ldc,&s_max_ldc);
+    cal_track_minmax(r_u,&s_min_ru,&s_max_ru); cal_track_minmax(r_v,&s_min_rv,&s_max_rv); cal_track_minmax(r_dc,&s_min_rdc,&s_max_rdc);
+}
+
+static void cal_accumulate_left(uint16_t u, uint16_t v, uint16_t dc) {
+    s_sum_lu += u; s_sum_lv += v; s_sum_ldc += dc;
+    s_sq_lu += (uint64_t)u*u; s_sq_lv += (uint64_t)v*v; s_sq_ldc += (uint64_t)dc*dc;
+    cal_track_minmax(u,&s_min_lu,&s_max_lu); cal_track_minmax(v,&s_min_lv,&s_max_lv); cal_track_minmax(dc,&s_min_ldc,&s_max_ldc);
+}
+
+static void cal_accumulate_right(uint16_t u, uint16_t v, uint16_t dc) {
+    s_sum_ru += u; s_sum_rv += v; s_sum_rdc += dc;
+    s_sq_ru += (uint64_t)u*u; s_sq_rv += (uint64_t)v*v; s_sq_rdc += (uint64_t)dc*dc;
+    cal_track_minmax(u,&s_min_ru,&s_max_ru); cal_track_minmax(v,&s_min_rv,&s_max_rv); cal_track_minmax(dc,&s_min_rdc,&s_max_rdc);
+}
+
+/* Task-side portion of mcpwm_foc_dc_cal(): switch one bridge at a time into
+ * 50%/50%/50% zero-vector PWM. The ISR only accumulates ADC samples and never
+ * calls HAL/RTOS. This preserves the VESC ISR/task boundary on CMSIS-RTOS2. */
+void foc_calibration_service_task(void) {
+    switch (s_cal_stage) {
+    case FOC_CAL_STAGE_WAIT_LEFT_DRIVEN:
+        motor_hw_set_pwm_enabled(&g_motor_right, false);
+        motor_hw_set_pwm_q15(&g_motor_left, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
+        calibration_zero_fast_states(&g_motor_left);
+        cal_task_reset_acc_and_stage(FOC_CAL_STAGE_LEFT_WARMUP);
+        motor_hw_set_pwm_enabled(&g_motor_left, true);
+        break;
+
+    case FOC_CAL_STAGE_WAIT_RIGHT_DRIVEN:
+        motor_hw_set_pwm_enabled(&g_motor_left, false);
+        motor_hw_set_pwm_q15(&g_motor_right, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
+        calibration_zero_fast_states(&g_motor_right);
+        cal_task_reset_acc_and_stage(FOC_CAL_STAGE_RIGHT_WARMUP);
+        motor_hw_set_pwm_enabled(&g_motor_right, true);
+        break;
+
+    case FOC_CAL_STAGE_WAIT_FINALIZE: {
+        motor_hw_set_pwm_enabled(&g_motor_left, false);
+        motor_hw_set_pwm_enabled(&g_motor_right, false);
+        calibration_zero_fast_states(&g_motor_left);
+        calibration_zero_fast_states(&g_motor_right);
+        bool ok = (s_cal_fail_range_mask == 0U) && (s_cal_fail_noise_mask == 0U);
+        s_cal_valid = ok;
+        s_cal_done = true;
+        s_cal_stage = ok ? FOC_CAL_STAGE_DONE : FOC_CAL_STAGE_FAILED;
+    } break;
+
+    case FOC_CAL_STAGE_FAILED:
+        motor_hw_set_pwm_enabled(&g_motor_left, false);
+        motor_hw_set_pwm_enabled(&g_motor_right, false);
+        s_cal_valid = false;
+        s_cal_done = true;
+        break;
+
+    default:
+        break;
+    }
+}
+
+static bool calibration_process_isr(uint16_t l_u, uint16_t l_v, uint16_t l_dc,
+                                    uint16_t r_u, uint16_t r_v, uint16_t r_dc) {
+    if (s_cal_stage == FOC_CAL_STAGE_DONE) return false;
+    if (s_cal_stage == FOC_CAL_STAGE_FAILED) return true;
+
+    switch (s_cal_stage) {
+    case FOC_CAL_STAGE_UNDRIVEN:
+        if (s_cal_warmup < 64U) { s_cal_warmup++; return true; }
+        cal_accumulate_all(l_u,l_v,l_dc,r_u,r_v,r_dc);
+        s_cal_count++;
+        s_cal_progress = s_cal_count;
+        if (s_cal_count >= ADC_OFFSET_CAL_SAMPLES) {
+            const uint32_t n=s_cal_count;
+            s_undriven_mean[0]=(int32_t)(s_sum_lu/n); s_undriven_mean[1]=(int32_t)(s_sum_lv/n); s_undriven_mean[2]=(int32_t)(s_sum_ldc/n);
+            s_undriven_mean[3]=(int32_t)(s_sum_ru/n); s_undriven_mean[4]=(int32_t)(s_sum_rv/n); s_undriven_mean[5]=(int32_t)(s_sum_rdc/n);
+            /* Temporary baseline for gross DC safety. It will be replaced by
+               driven offsets before normal current control is allowed. */
+            cal_set_runtime_offsets(&g_motor_left,s_undriven_mean[0],s_undriven_mean[1],s_undriven_mean[2]);
+            cal_set_runtime_offsets(&g_motor_right,s_undriven_mean[3],s_undriven_mean[4],s_undriven_mean[5]);
+            /* Broad undriven sanity only. Do not use its means as final FOC
+               offsets; VESC uses the driven calibration for current feedback. */
+            /* Upstream VESC does not hard-reject the undriven current offset
+               because of normal ADC noise. At this stage only reject a channel
+               that is effectively on an ADC rail. Driven switching-state
+               statistics are checked later and are the offsets used by FOC. */
+            for (uint8_t k=0U;k<6U;k++) {
+                if (s_undriven_mean[k] < ADC_OFFSET_HARD_MIN_COUNT ||
+                    s_undriven_mean[k] > ADC_OFFSET_HARD_MAX_COUNT) {
+                    s_cal_fail_range_mask |= (uint16_t)(1U << k);
+                }
+            }
+            if (s_cal_fail_range_mask) {
+                cal_fail_from_isr(0U);
+            } else {
+                s_cal_stage = FOC_CAL_STAGE_WAIT_LEFT_DRIVEN;
+                cal_acc_reset();
+            }
+        }
+        return true;
+
+    case FOC_CAL_STAGE_LEFT_WARMUP:
+        if (!cal_gross_dc_safe(l_dc,s_undriven_mean[2],(uint16_t)(1U<<2))) return true;
+        if (++s_cal_warmup >= ADC_DRIVEN_CAL_WARMUP_EVENTS) {
+            cal_acc_reset();
+            s_cal_stage = FOC_CAL_STAGE_LEFT_DRIVEN;
+        }
+        return true;
+
+    case FOC_CAL_STAGE_LEFT_DRIVEN:
+        if (!cal_gross_dc_safe(l_dc,s_undriven_mean[2],(uint16_t)(1U<<2))) return true;
+        if (++s_cal_decimation < ADC_DRIVEN_CAL_DECIMATION) return true;
+        s_cal_decimation=0U;
+        cal_accumulate_left(l_u,l_v,l_dc);
+        s_cal_count++;
+        s_cal_progress = ADC_OFFSET_CAL_SAMPLES + s_cal_count;
+        if (s_cal_count >= ADC_DRIVEN_CAL_SAMPLES) {
+            const uint32_t n=s_cal_count;
+            s_driven_mean[0]=(int32_t)(s_sum_lu/n); s_driven_mean[1]=(int32_t)(s_sum_lv/n); s_driven_mean[2]=(int32_t)(s_sum_ldc/n);
+            cal_store_diag(0U,s_driven_mean[0],s_min_lu,s_max_lu,s_sum_lu,s_sq_lu,n);
+            cal_store_diag(1U,s_driven_mean[1],s_min_lv,s_max_lv,s_sum_lv,s_sq_lv,n);
+            cal_store_diag(2U,s_driven_mean[2],s_min_ldc,s_max_ldc,s_sum_ldc,s_sq_ldc,n);
+            cal_set_runtime_offsets(&g_motor_left,s_driven_mean[0],s_driven_mean[1],s_driven_mean[2]);
+            s_cal_stage=FOC_CAL_STAGE_WAIT_RIGHT_DRIVEN;
+        }
+        return true;
+
+    case FOC_CAL_STAGE_RIGHT_WARMUP:
+        if (!cal_gross_dc_safe(r_dc,s_undriven_mean[5],(uint16_t)(1U<<5))) return true;
+        if (++s_cal_warmup >= ADC_DRIVEN_CAL_WARMUP_EVENTS) {
+            cal_acc_reset();
+            s_cal_stage = FOC_CAL_STAGE_RIGHT_DRIVEN;
+        }
+        return true;
+
+    case FOC_CAL_STAGE_RIGHT_DRIVEN:
+        if (!cal_gross_dc_safe(r_dc,s_undriven_mean[5],(uint16_t)(1U<<5))) return true;
+        if (++s_cal_decimation < ADC_DRIVEN_CAL_DECIMATION) return true;
+        s_cal_decimation=0U;
+        cal_accumulate_right(r_u,r_v,r_dc);
+        s_cal_count++;
+        s_cal_progress = ADC_OFFSET_CAL_SAMPLES + ADC_DRIVEN_CAL_SAMPLES + s_cal_count;
+        if (s_cal_count >= ADC_DRIVEN_CAL_SAMPLES) {
+            const uint32_t n=s_cal_count;
+            s_driven_mean[3]=(int32_t)(s_sum_ru/n); s_driven_mean[4]=(int32_t)(s_sum_rv/n); s_driven_mean[5]=(int32_t)(s_sum_rdc/n);
+            cal_store_diag(3U,s_driven_mean[3],s_min_ru,s_max_ru,s_sum_ru,s_sq_ru,n);
+            cal_store_diag(4U,s_driven_mean[4],s_min_rv,s_max_rv,s_sum_rv,s_sq_rv,n);
+            cal_store_diag(5U,s_driven_mean[5],s_min_rdc,s_max_rdc,s_sum_rdc,s_sq_rdc,n);
+            cal_set_runtime_offsets(&g_motor_right,s_driven_mean[3],s_driven_mean[4],s_driven_mean[5]);
+            s_cal_progress = ADC_OFFSET_CAL_SAMPLES + 2U*ADC_DRIVEN_CAL_SAMPLES;
+            s_cal_stage=FOC_CAL_STAGE_WAIT_FINALIZE;
+        }
+        return true;
+
+    case FOC_CAL_STAGE_WAIT_LEFT_DRIVEN:
+    case FOC_CAL_STAGE_WAIT_RIGHT_DRIVEN:
+    case FOC_CAL_STAGE_WAIT_FINALIZE:
+        return true;
+
+    default:
+        return true;
+    }
+}
+
 void foc_adc_dma_isr(const volatile uint32_t adc_words[6]) {
     uint32_t start = DWT->CYCCNT;
     s_adc_isr_count++;
@@ -427,42 +732,11 @@ void foc_adc_dma_isr(const volatile uint32_t adc_words[6]) {
     uint16_t l_dc = low16(adc_words[2]), r_dc = high16(adc_words[2]);
     uint16_t vraw = low16(adc_words[3]);
 
-    if (!s_cal_done) {
-        /* Ignore startup pipeline content; then average thousands of PWM-synchronous samples with both MOE off. */
-        if (s_cal_warmup < 64U) { s_cal_warmup++; return; }
-        s_sum_lu += l_u; s_sum_lv += l_v; s_sum_ldc += l_dc;
-        s_sum_ru += r_u; s_sum_rv += r_v; s_sum_rdc += r_dc;
-        s_sq_lu += (uint64_t)l_u * l_u; s_sq_lv += (uint64_t)l_v * l_v; s_sq_ldc += (uint64_t)l_dc * l_dc;
-        s_sq_ru += (uint64_t)r_u * r_u; s_sq_rv += (uint64_t)r_v * r_v; s_sq_rdc += (uint64_t)r_dc * r_dc;
-        cal_track_minmax(l_u,&s_min_lu,&s_max_lu); cal_track_minmax(l_v,&s_min_lv,&s_max_lv); cal_track_minmax(l_dc,&s_min_ldc,&s_max_ldc);
-        cal_track_minmax(r_u,&s_min_ru,&s_max_ru); cal_track_minmax(r_v,&s_min_rv,&s_max_rv); cal_track_minmax(r_dc,&s_min_rdc,&s_max_rdc);
-        s_cal_count++;
-        if (s_cal_count >= ADC_OFFSET_CAL_SAMPLES) {
-            MotorRuntime *l=&g_motor_left, *r=&g_motor_right;
-            l->current_offset_u_counts=(int32_t)(s_sum_lu/s_cal_count); l->current_offset_v_counts=(int32_t)(s_sum_lv/s_cal_count); l->dc_current_offset_counts=(int32_t)(s_sum_ldc/s_cal_count);
-            r->current_offset_u_counts=(int32_t)(s_sum_ru/s_cal_count); r->current_offset_v_counts=(int32_t)(s_sum_rv/s_cal_count); r->dc_current_offset_counts=(int32_t)(s_sum_rdc/s_cal_count);
-            l->current_offset_u_acc_q16=((int64_t)l->current_offset_u_counts)<<16; l->current_offset_v_acc_q16=((int64_t)l->current_offset_v_counts)<<16; l->dc_current_offset_acc_q16=((int64_t)l->dc_current_offset_counts)<<16;
-            r->current_offset_u_acc_q16=((int64_t)r->current_offset_u_counts)<<16; r->current_offset_v_acc_q16=((int64_t)r->current_offset_v_counts)<<16; r->dc_current_offset_acc_q16=((int64_t)r->dc_current_offset_counts)<<16;
-            /* VESC-like acceptance: the offset is the measured mean. Noise is
-               diagnostic unless it is extreme enough to make current feedback
-               unsafe. V11's <=12-count stddev hard gate was not upstream VESC
-               behavior and falsely rejected this hoverboard analog front-end. */
-            s_cal_warn_mask = s_cal_fail_range_mask = s_cal_fail_noise_mask = 0U;
-            validate_cal_channel(0U,l->current_offset_u_counts,s_min_lu,s_max_lu,s_sum_lu,s_sq_lu,s_cal_count,true);
-            validate_cal_channel(1U,l->current_offset_v_counts,s_min_lv,s_max_lv,s_sum_lv,s_sq_lv,s_cal_count,true);
-            validate_cal_channel(2U,l->dc_current_offset_counts,s_min_ldc,s_max_ldc,s_sum_ldc,s_sq_ldc,s_cal_count,false);
-            validate_cal_channel(3U,r->current_offset_u_counts,s_min_ru,s_max_ru,s_sum_ru,s_sq_ru,s_cal_count,true);
-            validate_cal_channel(4U,r->current_offset_v_counts,s_min_rv,s_max_rv,s_sum_rv,s_sq_rv,s_cal_count,true);
-            validate_cal_channel(5U,r->dc_current_offset_counts,s_min_rdc,s_max_rdc,s_sum_rdc,s_sq_rdc,s_cal_count,false);
-            bool ok = (s_cal_fail_range_mask == 0U) && (s_cal_fail_noise_mask == 0U);
-            calibration_zero_fast_states(l);
-            calibration_zero_fast_states(r);
-            s_cal_valid = ok; s_cal_done = true;
-            if (!ok) {
-                motor_request_fault_from_isr(l,MOTOR_FAULT_CURRENT_OFFSET);
-                motor_request_fault_from_isr(r,MOTOR_FAULT_CURRENT_OFFSET);
-            }
-        }
+    /* V14 calibration is a VESC-style two-state measurement: first retain an
+       undriven baseline, then measure the actual current offsets under 50%%
+       zero-vector switching for LEFT and RIGHT separately. The hard ISR only
+       accumulates ADC data; the RTOS calibration service owns MOE transitions. */
+    if (calibration_process_isr(l_u,l_v,l_dc,r_u,r_v,r_dc)) {
         return;
     }
 

@@ -378,6 +378,27 @@ def parse_cal(p: bytes) -> dict:
             if len(p)-r.i < 4: break
             w=r.u32(); dma_words.append({"word":w,"adc1":w & 0xFFFF,"adc2":(w>>16)&0xFFFF})
         if dma_words: d["dma_words"] = dma_words
+
+        # V14 appended fields: driven/undriven offset split and first fault snapshot.
+        if d.get("cal_diag_revision",0) >= 14 and len(p)-r.i >= 51:
+            d["cal_stage"] = r.u8()
+            d["shift_warn_mask"] = r.u16()
+            names=["left_u","left_v","left_dc","right_u","right_v","right_dc"]
+            d["undriven_mean"] = {name:r.i32() for name in names}
+            d["driven_mean"] = {name:r.i32() for name in names}
+            if len(p)-r.i >= 60:
+                fs={}
+                fs["valid"]=bool(r.u8()); fs["motor"]=r.u8(); fs["fault"]=r.u8(); fs["cal_stage"]=r.u8()
+                fs["raw_u"]=r.u16(); fs["raw_v"]=r.u16(); fs["raw_dc"]=r.u16()
+                fs["offset_u"]=r.i32(); fs["offset_v"]=r.i32(); fs["offset_dc"]=r.i32()
+                fs["ia_q15"]=r.i32(); fs["ib_q15"]=r.i32(); fs["ic_q15"]=r.i32()
+                fs["trip_q15"]=r.i32(); fs["id_target_q15"]=r.i32(); fs["iq_target_q15"]=r.i32()
+                fs["ccr1"]=r.u16(); fs["ccr2"]=r.u16(); fs["ccr3"]=r.u16()
+                fs["tim_cnt"]=r.u16(); fs["dma_cndtr"]=r.u16(); fs["adc_isr_count"]=r.u32()
+                # Q15 current base in this firmware is 64 A.
+                for qn in ("ia_q15","ib_q15","ic_q15","trip_q15","id_target_q15","iq_target_q15"):
+                    fs[qn.replace("_q15","_a")] = fs[qn] * 64.0 / 32768.0
+                d["fault_snapshot"] = fs
     return d
 
 
@@ -575,7 +596,7 @@ def _print_calibration_diagnostics(d: dict) -> None:
               "adc1_enabled","adc2_enabled","dma1_ch1_enabled"):
         if k in d: print(f"{k:24s}: {d[k]}")
     if "cal_diag_revision" in d:
-        print("\n=== V12 CALIBRATION STATISTICS ===")
+        print("\n=== V14 CALIBRATION STATISTICS ===")
         print(f"diag_revision           : {d['cal_diag_revision']}")
         print(f"warn_mask               : 0x{d.get('warn_mask',0):04X}")
         print(f"fail_range_mask         : 0x{d.get('fail_range_mask',0):04X}")
@@ -586,11 +607,32 @@ def _print_calibration_diagnostics(d: dict) -> None:
             c=d.get("channels",{}).get(name)
             if not c: continue
             print(f"{name:10s} {c['mean']:5d} {c['min']:5d} {c['max']:5d} {c['spread']:6d} {c['stddev']:8.3f}  {_calibration_channel_status(d,idx,name)}")
-        print("\nThreshold policy V12:")
+        print("\nThreshold policy V14:")
+        print("  undriven pass         : only reject ADC rail / gross hardware fault")
+        print("  driven offset source  : 50%/50%/50% zero-vector switching, 1000 samples/motor")
         print("  hard mean range       : 128..3967 ADC counts")
         print("  warning noise         : spread >160 OR stddev >16 counts")
-        print("  hard noise failure    : spread >800 OR stddev >80 counts")
+        print("  hard driven-noise fail: spread >800 OR stddev >80 counts")
+        print("  PWM start blanking    : 8 motor-current-loop samples at 50% zero vector")
         print("  warning does NOT inhibit PWM; hard failure does.")
+        if d.get("cal_diag_revision",0) >= 14:
+            stage_names={0:"UNDRIVEN",1:"WAIT_LEFT_DRIVEN",2:"LEFT_WARMUP",3:"LEFT_DRIVEN",
+                         4:"WAIT_RIGHT_DRIVEN",5:"RIGHT_WARMUP",6:"RIGHT_DRIVEN",
+                         7:"WAIT_FINALIZE",8:"DONE",9:"FAILED"}
+            st=d.get("cal_stage",-1)
+            print("\n=== V14 DRIVEN/OFFSET SPLIT ===")
+            print(f"cal_stage               : {st} {stage_names.get(st,'?')}")
+            print(f"shift_warn_mask         : 0x{d.get('shift_warn_mask',0):04X}")
+            print("channel      undriven driven  delta")
+            for name in ["left_u","left_v","left_dc","right_u","right_v","right_dc"]:
+                u=d.get("undriven_mean",{}).get(name,0); v=d.get("driven_mean",{}).get(name,0)
+                print(f"{name:10s} {u:8d} {v:6d} {v-u:6d}")
+            fs=d.get("fault_snapshot",{})
+            print("\n=== FIRST ACTIVE-DRIVE CURRENT-FAULT SNAPSHOT ===")
+            if fs.get("valid"):
+                for k,v in fs.items(): print(f"{k:24s}: {v}")
+            else:
+                print("valid                   : False (no active-drive current fault captured)")
     regs=d.get("registers",{})
     if regs:
         print("\n=== RAW PERIPHERAL REGISTERS ===")
@@ -645,7 +687,7 @@ def _default_txt(prefix: str) -> Path:
 
 
 def cmd_calibrate(link: Link,args: argparse.Namespace)->int:
-    path=Path(getattr(args,"out",None) or _default_txt("v13_calibration_debug"))
+    path=Path(getattr(args,"out",None) or _default_txt("v14_calibration_debug"))
     path.parent.mkdir(parents=True,exist_ok=True)
     rc=1
     with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -660,14 +702,14 @@ def cmd_calibrate(link: Link,args: argparse.Namespace)->int:
     return rc
 
 
-# Regression token: v12_full_debug (V13 supersedes the filename prefix).
+# Regression token: v12_full_debug (V14 driven-offset calibration supersedes the filename prefix).
 def cmd_diagnose(link: Link,args: argparse.Namespace)->int:
-    path=Path(getattr(args,"out",None) or _default_txt("v13_full_debug"))
+    path=Path(getattr(args,"out",None) or _default_txt("v14_full_debug"))
     path.parent.mkdir(parents=True,exist_ok=True)
     rc=0
     with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
         try:
-            print("V13 STM32F103RCT6 FULL PASSIVE DEBUG REPORT")
+            print("V14 STM32F103RCT6 FULL PASSIVE DEBUG REPORT")
             print("timestamp:",datetime.now().isoformat(timespec='seconds'))
             print("port:",link.ser.port,"baud:",link.ser.baudrate)
             print("\n=== FIRMWARE ===")
@@ -735,7 +777,7 @@ def _cmd_sensor_detect_body(link: Link,args: argparse.Namespace)->int:
     if args.motor==1 and mode==SENSOR_ENCODER: raise RuntimeError("RIGHT tidak memiliki encoder")
     cal=get_cal(link,False)
     if not cal['done'] or not cal['valid']: raise RuntimeError("Current-zero calibration belum valid. Jalankan 'calibrate' dulu.")
-    print("V13 SENSOR DETECT TRACE")
+    print("V14 SENSOR DETECT TRACE")
     print("timestamp:",datetime.now().isoformat(timespec='seconds'))
     print("motor:","LEFT" if args.motor==0 else "RIGHT","mode:",args.mode,"current_A:",args.current)
     print("NOTE: Hall detect follows VESC 1s Id ramp + 1deg/5ms forward/reverse sweeps.")
@@ -764,7 +806,7 @@ def _cmd_sensor_detect_body(link: Link,args: argparse.Namespace)->int:
 
 
 def cmd_sensor_detect(link: Link,args: argparse.Namespace)->int:
-    path=Path(getattr(args,"out",None) or _default_txt("v13_sensor_detect"))
+    path=Path(getattr(args,"out",None) or _default_txt("v14_sensor_detect"))
     path.parent.mkdir(parents=True,exist_ok=True)
     rc=1
     with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -1090,13 +1132,13 @@ def main() -> int:
     sp("config-save",cmd_config_save,"save runtime Hall/encoder/PID/timeout config to flash")
     p=sp("status",cmd_status,"standard VESC telemetry + extended telemetry"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("monitor",cmd_monitor,"monitor both motors"); p.add_argument("--hz",type=float,default=5); p.add_argument("--seconds",type=float,default=10)
-    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration and write TXT only"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v13_calibration_debug_TIMESTAMP.txt")
-    p=sp("diagnose",cmd_diagnose,"full passive V13 diagnostic; writes one TXT report"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v13_full_debug_TIMESTAMP.txt")
+    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration and write TXT only"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v14_calibration_debug_TIMESTAMP.txt")
+    p=sp("diagnose",cmd_diagnose,"full passive V14 diagnostic; writes one TXT report"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v14_full_debug_TIMESTAMP.txt")
     p=sp("sensor-info",cmd_sensor_info,"show runtime Hall/encoder state"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("sensor-select",cmd_sensor_select,"live switch Hall/encoder while stopped"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["hall","encoder"],required=True)
-    p=sp("sensor-detect",cmd_sensor_detect,"V13 VESC-style forced-angle Hall/encoder detect; writes TXT"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto"); p.add_argument("--current",type=float,default=0.5,help="diagnostic detect current in A (0.2..2.0, default 0.5)"); p.add_argument("--timeout",type=float,default=25); p.add_argument("--out",help="TXT output path; default v13_sensor_detect_TIMESTAMP.txt"); p.add_argument("--yes",action="store_true")
+    p=sp("sensor-detect",cmd_sensor_detect,"V14 VESC-style forced-angle Hall/encoder detect; writes TXT"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto"); p.add_argument("--current",type=float,default=0.5,help="diagnostic detect current in A (0.2..2.0, default 0.5)"); p.add_argument("--timeout",type=float,default=25); p.add_argument("--out",help="TXT output path; default v14_sensor_detect_TIMESTAMP.txt"); p.add_argument("--yes",action="store_true")
     p=sp("rotor",cmd_rotor,"stream COMM_ROTOR_POSITION"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=list(DISPLAY_MODES),default="encoder"); p.add_argument("--seconds",type=float,default=5)
-    p=sp("sample",cmd_sample,"capture fast FOC samples from ISR buffer"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--count",type=int,default=128); p.add_argument("--decimation",type=int,default=8); p.add_argument("--timeout",type=float,default=5); p.add_argument("--csv"); p.add_argument("--raw",action="store_true")
+    p=sp("sample",cmd_sample,"capture fast FOC samples from ISR buffer"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--count",type=int,default=128); p.add_argument("--decimation",type=int,default=8); p.add_argument("--timeout",type=float,default=8); p.add_argument("--csv"); p.add_argument("--raw",action="store_true")
     p=sp("motor-test",cmd_motor_test,"active current/brake/rpm/duty/position test at 50 Hz command refresh"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["current","brake","rpm","duty","position"],required=True); p.add_argument("--value",type=float,required=True); p.add_argument("--seconds",type=float,default=2); p.add_argument("--yes",action="store_true"); p.add_argument("--force",action="store_true")
     p=sp("test-all",cmd_test_all,"passive end-to-end firmware/telemetry test"); p.add_argument("--zero-limit",type=float,default=0.30)
     p=sp("full-test",cmd_full_test,"ACTIVE commissioning: calibration, auto-detect, samples, current +/- and optional RPM/position"); p.add_argument("--yes",action="store_true"); p.add_argument("--current",type=float,default=0.5); p.add_argument("--erpm",type=float,default=300.0); p.add_argument("--stage-seconds",type=float,default=1.0); p.add_argument("--cal-timeout",type=float,default=5.0); p.add_argument("--detect-timeout",type=float,default=15.0); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--sample-decimation",type=int,default=8); p.add_argument("--skip-rpm",action="store_true"); p.add_argument("--position-step",type=float,default=5.0)

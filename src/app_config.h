@@ -71,7 +71,20 @@
 
 /* VESC-style boot current-offset calibration. */
 #define ADC_OFFSET_CAL_SAMPLES          4096U
-/* V12 calibration policy:
+/* V14: VESC-style driven current-offset calibration. Upstream VESC stores
+ * driven and undriven offsets separately; for low-side-shunt hardware its
+ * alternative calibration runs all three phases at 50% (zero SVM amplitude)
+ * and averages 1000 samples. We preserve an undriven diagnostic pass, then
+ * calibrate LEFT and RIGHT one at a time under 50% zero-vector PWM. */
+#define ADC_DRIVEN_CAL_SAMPLES          1000U
+#define ADC_DRIVEN_CAL_SAMPLE_HZ        1000U
+#define ADC_DRIVEN_CAL_DECIMATION       (FOC_ISR_EVENT_HZ / ADC_DRIVEN_CAL_SAMPLE_HZ)
+#define ADC_DRIVEN_CAL_WARMUP_EVENTS    64U
+#define ADC_DRIVEN_CAL_MAX_DC_A         6.0f
+#define ADC_DRIVEN_CAL_MAX_DC_COUNTS    300U /* 6 A at 0.02 A/count */
+#define ADC_DRIVEN_CAL_DC_TRIP_SAMPLES  8U
+#define PWM_ENABLE_BLANK_CYCLES         8U
+/* V14 validation policy:
  * - VESC upstream calibrates by averaging current offsets and does not reject
  *   a board merely because the raw ADC has modest PWM-synchronous noise.
  * - Keep broad 12-bit rail/saturation and extreme-noise checks as HARD safety.
@@ -84,7 +97,7 @@
 #define ADC_OFFSET_WARN_STDDEV_COUNT    16U
 #define ADC_OFFSET_HARD_SPREAD_COUNT    800U
 #define ADC_OFFSET_HARD_STDDEV_COUNT    80U
-#define ADC_OFFSET_TRACK_SHIFT          12U /* only when motor is OFF: 1/4096 */
+#define ADC_OFFSET_TRACK_SHIFT          12U /* retained ABI constant; V14 does not track driven offsets while OFF */
 
 /* Low-pass only for telemetry/slow functions. The raw Id/Iq values remain the
  * feedback to the current PI, matching the VESC design principle. */

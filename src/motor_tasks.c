@@ -59,6 +59,9 @@ static void current_cal_thread(void *arg) {
     uint32_t next = osKernelGetTickCount();
     for (;;) {
         next += 5U; /* 200 Hz supervision */
+        /* Task side of VESC-style driven offset calibration. This owns MOE
+           transitions; DMA1_CH1 ISR only samples/accumulates. */
+        foc_calibration_service_task();
         if (foc_calibration_done()) {
             if (!foc_calibration_valid() && !fault_reported) {
                 fault_reported = true;
