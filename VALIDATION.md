@@ -1,107 +1,56 @@
-# V5 Validation
+# V6 Validation
 
-## Fokus revisi V5
+## Static source audit
 
-V5 mengganti total transport UART VESC pada V4 dari DMA menjadi model interrupt + software queue:
+Target checks:
 
-```text
-USART3 PB11 RX -> RXNE IRQ -> RX software ring -> packet_process_thread
-packet reply -> TX software ring -> TXE IRQ -> USART3 PB10 TX -> TC IRQ
-```
+- no UART DMA calls/handlers;
+- no HAL CAN/CAN1/physical comm_can implementation;
+- RXNE/TXE/TC USART path retained;
+- `COMM_FORWARD_CAN` + virtual RIGHT ID2 present;
+- `COMM_PING_CAN`, GET_VALUES selective/setup selective, handbrake/current-rel present;
+- expected CMSIS-RTOS2 worker functions present;
+- persistent flash page reserved;
+- packet max payload 512.
 
-Konfigurasi tetap:
-
-```text
-USART3
-TX = PB10
-RX = PB11
-115200 baud
-8 data bit, no parity, 1 stop bit
-```
-
-DMA UART RX/TX tidak digunakan. DMA1 Channel1 tetap dipakai khusus ADC/FOC fast loop.
-
-## Yang sudah diuji di environment pembuatan
-
-1. Host packet test:
-   - VESC short-frame encode/decode
-   - CRC16/XMODEM vector `123456789 = 0x31C3`
-2. Host FOC math test:
-   - sin/cos Q15 checkpoints
-   - zero-vector SVM
-   - duty range
-3. Python debug utility:
-   - `py_compile`
-   - `--self-test`
-   - VESC FW_VERSION payload parser 7.01
-   - streaming frame parser
-   - sample parser
-4. Source audit V5:
-   - USART3 PB11 RX menggunakan RXNE interrupt
-   - USART3 PB10 TX menggunakan TXE interrupt
-   - TC interrupt menandai akhir transmisi fisik
-   - parser/CRC/command tidak dijalankan di ISR
-   - tidak ada `uart_process_thread`
-   - tidak ada `HAL_UART_Transmit_DMA`
-   - tidak ada `HAL_UART_Receive_DMA`
-   - tidak ada `HAL_UARTEx_ReceiveToIdle_DMA`
-   - tidak ada DMA1 Channel2/Channel3 handler untuk USART3
-   - tidak ada `HAL_UART_IRQHandler` pada jalur VESC
-   - fast FOC tetap berada di DMA1 Channel1 IRQ
-   - PWM high-side active HIGH dan complementary low-side active LOW tetap dipertahankan dari V4
-
-Host command:
+Run:
 
 ```bash
-bash tests/host/run.sh
+bash tests/host/audit_v6_upstream.sh
 ```
 
-Expected:
+## Host protocol tests
 
-```text
-test_packet: PASS
-test_foc_math: PASS
-SELF-TEST PASS: CRC, framing, VESC FW_VERSION parser, streaming parser, sample parser
-host tests: ALL PASS
+```bash
+gcc -std=c11 -O2 -Wall -Wextra -Werror -Isrc \
+  tests/host/test_packet_v6.c src/vesc_packet.c -o /tmp/test_packet_v6
+/tmp/test_packet_v6
+
+python3 debug_vesc_f103.py --self-test
 ```
 
-## ARM build status
+Host packet test covers normal frame, 512-byte frame, CRC corruption/noise recovery, and re-synchronization. Python self-test covers framing, CRC vector, FW_VERSION parser, LEFT/local vs RIGHT/COMM_FORWARD_CAN routing, and standard COMM_SAMPLE_PRINT parser.
 
-Environment pembuatan artifact ini tidak memiliki PlatformIO / `arm-none-eabi-gcc`. Upaya mengambil PlatformIO juga tidak dapat dilakukan karena runtime tidak memiliki akses jaringan. Karena itu V5 **tidak diklaim sudah cross-compile** di environment ini.
+## Syntax audit
 
-Verifikasi pada PC STM32/PlatformIO pengguna:
+The modified protocol/config/timeout/app-ADC modules were checked with Clang `-fsyntax-only` against minimal HAL/CMSIS type stubs. This caught and fixed a missing `foc_control.h` include in the persistence module. These stubs are only for syntax checking and are not included in the firmware artifact.
+
+## Cross-build limitation
+
+The artifact environment does not contain PlatformIO or `arm-none-eabi-gcc`, therefore **an actual STM32F103 cross-build is not claimed here**. Run on the development machine:
 
 ```bash
 pio run -t clean
 pio run
 ```
 
-Kemudian upload:
+Then live validation should start with UART/virtual CAN before energizing a motor:
 
 ```bash
-pio run -t upload
+python3 debug_vesc_f103.py handshake --port /dev/ttyUSB0
+python3 debug_vesc_f103.py can-scan --port /dev/ttyUSB0
+python3 debug_vesc_f103.py comm-diag --port /dev/ttyUSB0
+python3 debug_vesc_f103.py config-status --port /dev/ttyUSB0
 ```
 
-## Audit UART DMA
-
-Perintah audit:
-
-```bash
-grep -R -n -E \
-  "HAL_UART_Transmit_DMA|HAL_UART_Receive_DMA|HAL_UARTEx_ReceiveToIdle_DMA|USART_CR3_DMAR|USART_CR3_DMAT|hdma_usart3_rx|hdma_usart3_tx|DMA1_Channel2_IRQHandler|DMA1_Channel3_IRQHandler|uart_process_thread|HAL_UART_IRQHandler" \
-  src
-```
-
-Target V5:
-
-```text
-tidak ada output
-```
-
-## Batas implementasi yang tidak diubah dari V4
-
-- Sensor Hall/encoder runtime selection/detection: ada.
-- Startup zero-current offset calibration: ada.
-- Full physical R/L/flux-linkage VESC Detect All: belum selesai; blocking command tetap dikarantina di `blocking_thread` dan mengembalikan failure/sentinel, bukan angka palsu.
-- Exact A/count dan V/count: harus disesuaikan dengan PCB.
-- MCCONF/APPCONF binary compatibility penuh VESC Tool: belum diklaim.
+Only after current-zero calibration and sensor detection are valid should active motor tests be used.

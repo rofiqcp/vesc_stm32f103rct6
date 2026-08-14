@@ -103,6 +103,20 @@ void motor_keepalive(MotorRuntime *m) {
 }
 void motor_set_current(MotorRuntime *m, float amp) { m->current_command_a=foc_clampf(amp,-FOC_MAX_CURRENT_A,FOC_MAX_CURRENT_A); m->control_mode=MOTOR_CTRL_CURRENT; motor_touch_command(m); }
 void motor_set_brake_current(MotorRuntime *m, float amp) { m->brake_current_a=fabsf(foc_clampf(amp,-FOC_MAX_CURRENT_A,FOC_MAX_CURRENT_A)); m->control_mode=MOTOR_CTRL_BRAKE_CURRENT; motor_touch_command(m); }
+void motor_set_current_rel(MotorRuntime *m, float rel) {
+    rel = foc_clampf(rel, -1.0f, 1.0f);
+    motor_set_current(m, rel * FOC_MAX_CURRENT_A);
+}
+void motor_set_handbrake(MotorRuntime *m, float amp) {
+    if (m == NULL) return;
+    m->handbrake_current_a = fabsf(foc_clampf(amp, -FOC_MAX_CURRENT_A, FOC_MAX_CURRENT_A));
+    /* Reduced-port equivalent of FOC handbrake: hold a stationary field at
+     * the electrical phase present when the command is received. */
+    m->detect_phase_u16 = motor_sensor_electrical_phase_u16(m);
+    m->detect_force_angle = true;
+    m->control_mode = MOTOR_CTRL_HANDBRAKE;
+    motor_touch_command(m);
+}
 void motor_set_speed(MotorRuntime *m, float erpm) { m->speed_target_erpm=foc_clampf(erpm,-SPEED_PID_MAX_ERPM,SPEED_PID_MAX_ERPM); m->control_mode=MOTOR_CTRL_SPEED; motor_touch_command(m); }
 void motor_set_position(MotorRuntime *m, float deg) { m->position_target_deg=foc_wrap_deg(deg); m->control_mode=MOTOR_CTRL_POSITION; motor_touch_command(m); }
 void motor_set_duty_approx(MotorRuntime *m, float duty) { m->duty_command=foc_clampf(duty,-0.95f,0.95f); m->control_mode=MOTOR_CTRL_DUTY_APPROX; motor_touch_command(m); }
@@ -198,15 +212,7 @@ void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms) {
 
     m->rotor_elec_deg=((float)motor_sensor_electrical_phase_u16(m)*360.0f)/65536.0f;
 
-    if (m->command_active && !m->detect.busy &&
-        (uint32_t)(now_ms - m->last_command_tick) > MOTOR_COMMAND_TIMEOUT_MS) {
-        /* VESC-like communication timeout: release the motor instead of
-           latching a permanent fault. The timeout state is reported through
-           COMM_GET_VALUES_SELECTIVE bit 21. */
-        m->timeout_active = true;
-        motor_stop(m);
-        return;
-    }
+    (void)now_ms; /* command timeout is global and handled by timeout_thread. */
     if (m->fault!=MOTOR_FAULT_NONE) { motor_hw_set_pwm_enabled(m,false); return; }
 
     bool wants_pwm = m->detect.busy || (m->command_active && m->control_mode!=MOTOR_CTRL_OFF);
@@ -231,6 +237,9 @@ void motor_pid_update_1khz(MotorRuntime *m) {
         case MOTOR_CTRL_SPEED: iq=speed_pid_step(m,m->speed_target_erpm); break;
         case MOTOR_CTRL_POSITION: { float now=foc_wrap_deg(m->position_deg); float err=m->position_target_deg-now; while(err>180.0f)err-=360.0f; while(err<-180.0f)err+=360.0f; float cmd=foc_clampf(err*POSITION_PID_KP_ERPM_PER_DEG,-POSITION_PID_MAX_ERPM,POSITION_PID_MAX_ERPM); iq=speed_pid_step(m,cmd); } break;
         case MOTOR_CTRL_DUTY_APPROX: iq=foc_clampf(m->duty_command*FOC_MAX_CURRENT_A,-FOC_MAX_CURRENT_A,FOC_MAX_CURRENT_A); break;
+        case MOTOR_CTRL_HANDBRAKE:
+            motor_set_foc_targets(m, m->handbrake_current_a, 0.0f);
+            return;
         default: iq=0.0f; break;
     }
     motor_set_foc_targets(m,0.0f,iq);

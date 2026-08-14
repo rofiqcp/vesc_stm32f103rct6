@@ -8,12 +8,14 @@
 #include "vesc_comm.h"
 #include "cmsis_os2.h"
 #include "app_config.h"
+#include "app_adc_port.h"
+#include "vesc_timeout.h"
 #include <stddef.h>
 
 /* CMSIS-RTOS2 equivalents of the requested VESC-style threads.
  * The names deliberately match the upstream semantic thread names.
  * Fast ADC->FOC->SVPWM stays in DMA1_Channel1_IRQHandler(), not here. */
-static osThreadId_t adc_thread_tp;
+static osThreadId_t current_cal_thread_tp;
 static osThreadId_t timer_thread_tp;
 static osThreadId_t pid_thread_tp;
 static osThreadId_t rpm_thread_tp;
@@ -23,7 +25,7 @@ static osThreadId_t stat_thread_tp;
 static osThreadId_t periodic_thread_tp;
 static osThreadId_t led_thread_tp;
 
-static void adc_thread(void *arg);
+static void current_cal_thread(void *arg);
 static void timer_thread(void *arg);
 static void pid_thread(void *arg);
 static void rpm_thread(void *arg);
@@ -45,9 +47,9 @@ void motor_threads_sample_signal(void) {
     }
 }
 
-/* adc_thread is deliberately slow/background. It never performs the FOC.
- * It supervises startup zero-current calibration and leaves the DMA ISR alone. */
-static void adc_thread(void *arg) {
+/* Port-specific startup current-calibration supervisor. This is intentionally
+ * NOT named adc_thread: upstream adc_thread belongs to applications/app_adc.c. */
+static void current_cal_thread(void *arg) {
     (void)arg;
     bool fault_reported = false;
     uint32_t next = osKernelGetTickCount();
@@ -106,8 +108,9 @@ static void pid_thread(void *arg) {
     }
 }
 
-/* Separate sensor-derived speed/position update so RPM work cannot lengthen
- * timer_thread. Encoder and Hall edge capture are still interrupt/hardware. */
+/* F103 port sensor-estimator service. Upstream FOC does not require the BLDC
+ * mcpwm.c rpm_thread; this task exists only to update Hall/ABI speed mirrors
+ * outside the current ISR. */
 static void rpm_thread(void *arg) {
     (void)arg;
     uint32_t next = osKernelGetTickCount();
@@ -186,7 +189,7 @@ static void led_thread(void *arg) {
 }
 
 void motor_threads_init(void) {
-    const osThreadAttr_t adc_attr      = {.name="adc_thread",         .priority=osPriorityAboveNormal, .stack_size=512U};
+    const osThreadAttr_t cal_attr      = {.name="current_cal_thread", .priority=osPriorityAboveNormal, .stack_size=512U};
     const osThreadAttr_t timer_attr    = {.name="timer_thread",       .priority=osPriorityAboveNormal, .stack_size=640U};
     const osThreadAttr_t pid_attr      = {.name="pid_thread",         .priority=osPriorityHigh,        .stack_size=512U};
     const osThreadAttr_t rpm_attr      = {.name="rpm_thread",         .priority=osPriorityAboveNormal, .stack_size=512U};
@@ -196,7 +199,7 @@ void motor_threads_init(void) {
     const osThreadAttr_t periodic_attr = {.name="periodic_thread",    .priority=osPriorityNormal,      .stack_size=640U};
     const osThreadAttr_t led_attr      = {.name="led_thread",         .priority=osPriorityLow,         .stack_size=384U};
 
-    adc_thread_tp      = osThreadNew(adc_thread, NULL, &adc_attr);
+    current_cal_thread_tp = osThreadNew(current_cal_thread, NULL, &cal_attr);
     timer_thread_tp    = osThreadNew(timer_thread, NULL, &timer_attr);
     pid_thread_tp      = osThreadNew(pid_thread, NULL, &pid_attr);
     rpm_thread_tp      = osThreadNew(rpm_thread, NULL, &rpm_attr);
@@ -206,7 +209,10 @@ void motor_threads_init(void) {
     periodic_thread_tp = osThreadNew(periodic_thread, NULL, &periodic_attr);
     led_thread_tp      = osThreadNew(led_thread, NULL, &led_attr);
 
-    (void)adc_thread_tp; (void)timer_thread_tp; (void)pid_thread_tp;
+    app_adc_port_init();
+    vesc_timeout_init();
+
+    (void)current_cal_thread_tp; (void)timer_thread_tp; (void)pid_thread_tp;
     (void)rpm_thread_tp; (void)sample_send_tp; (void)fault_stop_tp;
     (void)stat_thread_tp; (void)periodic_thread_tp; (void)led_thread_tp;
 }

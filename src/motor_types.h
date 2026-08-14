@@ -15,6 +15,7 @@ typedef enum {
     MOTOR_CTRL_SPEED,
     MOTOR_CTRL_POSITION,
     MOTOR_CTRL_DUTY_APPROX,
+    MOTOR_CTRL_HANDBRAKE,
     MOTOR_CTRL_DETECT
 } motor_control_mode_t;
 
@@ -93,6 +94,7 @@ typedef struct {
     volatile bool busy;
     volatile bool success;
     volatile uint8_t result_mode;
+    volatile float drive_current_a;
     volatile uint32_t step_tick;
     volatile uint32_t sweep_index;
     volatile uint32_t sweep_pass;
@@ -142,6 +144,7 @@ typedef struct MotorRuntime {
     volatile int32_t iq_target_q15;
     volatile float current_command_a;
     volatile float brake_current_a;
+    volatile float handbrake_current_a;
     volatile float duty_command;
     volatile float speed_target_erpm;
     volatile float position_target_deg;
@@ -277,6 +280,9 @@ typedef struct {
     uint16_t duty_u_q15;
     uint16_t duty_v_q15;
     uint16_t duty_w_q15;
+    uint16_t current_raw_u;
+    uint16_t current_raw_v;
+    uint16_t vbus_dV;
     uint8_t motor;
     uint8_t hall_raw;
 } debug_sample_t;

@@ -17,14 +17,21 @@ static void detect_clear_acc(MotorRuntime *m) {
     m->detect.hall_valid_states=0U;
 }
 
-bool sensor_detect_request(MotorRuntime *m, uint8_t requested_mode) {
+bool sensor_detect_request_current(MotorRuntime *m, uint8_t requested_mode, float current_a) {
     if (m==NULL || requested_mode>SENSOR_MODE_ENCODER) return false;
     if (m->id==MOTOR_RIGHT && requested_mode==SENSOR_MODE_ENCODER) return false;
     motor_stop(m);
     m->detect.requested=true; m->detect.busy=false; m->detect.success=false;
     m->detect.result_mode=SENSOR_MODE_AUTO; m->detect.state=SENSOR_DETECT_PREPARE;
+    if (current_a < 0.2f) current_a = 0.2f;
+    if (current_a > FOC_MAX_CURRENT_A * 0.25f) current_a = FOC_MAX_CURRENT_A * 0.25f;
+    m->detect.drive_current_a=current_a;
     m->sensor_request_mode=requested_mode;
     return true;
+}
+
+bool sensor_detect_request(MotorRuntime *m, uint8_t requested_mode) {
+    return sensor_detect_request_current(m, requested_mode, SENSOR_DETECT_CURRENT_A);
 }
 
 static void detect_fail(MotorRuntime *m) {
@@ -92,11 +99,11 @@ void sensor_detect_update_1khz(MotorRuntime *m,uint32_t now_ms) {
         } else {
             motor_hw_configure_sensor(m,SENSOR_MODE_HALL); motor_hall_edge_isr(m); d->state=SENSOR_DETECT_HALL_LOCK;
         }
-        motor_set_foc_targets(m,SENSOR_DETECT_CURRENT_A,0.0f); d->step_tick=now_ms;
+        motor_set_foc_targets(m,d->drive_current_a,0.0f); d->step_tick=now_ms;
         break;
 
     case SENSOR_DETECT_HALL_LOCK:
-        m->detect_phase_u16=0U; motor_set_foc_targets(m,SENSOR_DETECT_CURRENT_A,0.0f);
+        m->detect_phase_u16=0U; motor_set_foc_targets(m,d->drive_current_a,0.0f);
         if((uint32_t)(now_ms-d->step_tick)>=SENSOR_DETECT_LOCK_MS){d->step_tick=now_ms;d->sweep_index=0U;d->state=SENSOR_DETECT_HALL_FWD;}
         break;
 
@@ -119,13 +126,13 @@ void sensor_detect_update_1khz(MotorRuntime *m,uint32_t now_ms) {
         if(hall_evaluate(m)){detect_done(m,SENSOR_MODE_HALL);}
         else if(m->id==MOTOR_LEFT && m->sensor_request_mode==SENSOR_MODE_AUTO){
             motor_set_foc_targets(m,0.0f,0.0f); motor_hw_set_pwm_enabled(m,false); motor_hw_configure_sensor(m,SENSOR_MODE_ENCODER); motor_hw_encoder_reset();
-            d->busy=true; m->detect_force_angle=true; m->detect_phase_u16=0U; motor_set_foc_targets(m,SENSOR_DETECT_CURRENT_A,0.0f);
+            d->busy=true; m->detect_force_angle=true; m->detect_phase_u16=0U; motor_set_foc_targets(m,d->drive_current_a,0.0f);
             d->step_tick=now_ms; d->state=SENSOR_DETECT_ENCODER_LOCK0;
         } else detect_fail(m);
         break;
 
     case SENSOR_DETECT_ENCODER_LOCK0:
-        m->detect_phase_u16=0U; motor_set_foc_targets(m,SENSOR_DETECT_CURRENT_A,0.0f);
+        m->detect_phase_u16=0U; motor_set_foc_targets(m,d->drive_current_a,0.0f);
         if((uint32_t)(now_ms-d->step_tick)>=SENSOR_DETECT_LOCK_MS){
             motor_hw_encoder_reset(); d->encoder_start_count=0; d->sweep_index=0U; d->step_tick=now_ms; d->state=SENSOR_DETECT_ENCODER_SWEEP;
         }

@@ -116,10 +116,17 @@ bool vesc_uart_write_raw(const uint8_t *data, uint16_t len) {
 
     if (osMutexAcquire(tx_mutex, osWaitForever) != osOK) return false;
 
-    if (tx_free_space() < len) {
-        uart_stats.tx_overruns++;
-        (void)osMutexRelease(tx_mutex);
-        return false;
+    /* Upstream SerialDriver writes are queued rather than silently losing a
+     * valid reply. At 115200 baud a 512-byte packet can take tens of ms, so
+     * wait for ring space instead of dropping bursty RT/sample responses. */
+    uint32_t start = osKernelGetTickCount();
+    while (tx_free_space() < len) {
+        if ((uint32_t)(osKernelGetTickCount() - start) > 250U) {
+            uart_stats.tx_overruns++;
+            (void)osMutexRelease(tx_mutex);
+            return false;
+        }
+        osDelay(1U);
     }
 
     uint16_t head = tx_head;

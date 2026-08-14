@@ -34,7 +34,7 @@ static void snapshot(MotorRuntime *m,motor_telemetry_t *t){
     t->current_offset_u=(float)m->current_offset_u_counts;t->current_offset_v=(float)m->current_offset_v_counts;t->dc_current_offset=(float)m->dc_current_offset_counts;
     t->amp_hours=m->stats.amp_hours;t->amp_hours_charged=m->stats.amp_hours_charged;t->watt_hours=m->stats.watt_hours;t->watt_hours_charged=m->stats.watt_hours_charged;
     t->tachometer=m->stats.tachometer;t->tachometer_abs=m->stats.tachometer_abs;
-    t->fault=(uint8_t)m->fault;t->controller_id=(m->id==MOTOR_LEFT)?1U:2U;t->sensor_mode=m->sensor_mode;t->sensor_detect_state=(uint8_t)m->detect.state;
+    t->fault=(uint8_t)m->fault;t->controller_id=(m->id==MOTOR_LEFT)?VESC_CONTROLLER_ID_LEFT:VESC_CONTROLLER_ID_RIGHT;t->sensor_mode=m->sensor_mode;t->sensor_detect_state=(uint8_t)m->detect.state;
     t->calibration_done=foc_calibration_done()?1U:0U;t->calibration_valid=foc_calibration_valid()?1U:0U;t->timeout_active=m->timeout_active?1U:0U;
     t->isr_max_cycles=m->isr_max_cycles;t->isr_overruns=m->isr_overruns;
 }

@@ -122,3 +122,10 @@
 
 /* OFF pin is assumed ACTIVE-HIGH: HIGH disables gate-power, LOW enables. */
 #define OFF_PIN_ACTIVE_HIGH             1
+
+/* ===================== VESC DUAL-MOTOR IDENTITY =====================
+ * UART is always motor-left/local. Motor-right is exposed through the exact
+ * COMM_FORWARD_CAN dual-motor semantic, without enabling physical CAN HW. */
+#define VESC_CONTROLLER_ID_LEFT         1U
+#define VESC_CONTROLLER_ID_RIGHT        2U
+#define VESC_VIRTUAL_CAN_RIGHT_ID       VESC_CONTROLLER_ID_RIGHT

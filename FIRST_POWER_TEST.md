@@ -1,76 +1,59 @@
-# First Test V5
+# First Power Test V6
 
-## A. Uji komunikasi tanpa power motor
-
-1. Flash firmware:
+1. Build only:
 
 ```bash
 pio run -t clean
 pio run
+```
+
+2. Flash with motor power/current limited and wheels unloaded:
+
+```bash
 pio run -t upload
 ```
 
-2. Wiring serial:
-
-```text
-USB-UART TX -> PB11 / USART3_RX
-USB-UART RX <- PB10 / USART3_TX
-GND         -> GND
-baud        = 115200 8N1
-```
-
-3. Jalankan:
+3. Check handshake; do not command motor yet:
 
 ```bash
-python3 -m pip install pyserial
-python3 debug_vesc_f103.py --self-test
-python3 debug_vesc_f103.py handshake --port /dev/ttyUSB0 --baud 115200 --timeout 1.5
+python3 debug_vesc_f103.py handshake --port /dev/ttyUSB0
+python3 debug_vesc_f103.py comm-diag --port /dev/ttyUSB0
 ```
 
-Jangan lanjut sebelum handshake memberi:
-
-```text
-PASS: framing + CRC + COMM_FW_VERSION reply valid
-```
-
-4. Setelah PASS:
+4. Verify virtual CAN topology:
 
 ```bash
-python3 debug_vesc_f103.py comm-diag --port /dev/ttyUSB0 --baud 115200
-python3 debug_vesc_f103.py info --port /dev/ttyUSB0 --baud 115200
-python3 debug_vesc_f103.py test-all --port /dev/ttyUSB0 --baud 115200
+python3 debug_vesc_f103.py can-scan --port /dev/ttyUSB0
 ```
 
-## B. Baru uji ADC/current zero
+Expected: node 2 is reported and forwarded FW_VERSION for RIGHT returns successfully.
 
-Power stage tetap tidak diberi command motor.
+5. Verify current calibration and passive telemetry:
 
 ```bash
-python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0 --baud 115200
+python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0
+python3 debug_vesc_f103.py status --port /dev/ttyUSB0
 ```
 
-Pastikan calibration done/valid dan Id/Iq/Imotor dekat nol.
-
-## C. Sensor
+6. Detect sensors at current-limited bench supply:
 
 ```bash
-python3 debug_vesc_f103.py sensor-info --port /dev/ttyUSB0
+python3 debug_vesc_f103.py sensor-detect --motor 0 --mode auto --yes --port /dev/ttyUSB0
+python3 debug_vesc_f103.py sensor-detect --motor 1 --mode hall --yes --port /dev/ttyUSB0
 ```
 
-Auto-detect hanya ketika roda bebas dan area aman.
+7. Save detected runtime configuration:
 
-## D. Motor aktif
+```bash
+python3 debug_vesc_f103.py config-save --port /dev/ttyUSB0
+python3 debug_vesc_f103.py config-status --port /dev/ttyUSB0
+```
 
-Pastikan terlebih dahulu:
+8. Capture samples before higher-current tests:
 
-- current sensor gain benar,
-- DC-link scale benar,
-- phase U/V/W benar,
-- high-side active HIGH,
-- low-side active LOW,
-- deadtime benar,
-- current limit rendah,
-- roda terangkat.
+```bash
+python3 debug_vesc_f103.py sample --motor 0 --count 64 --decimation 8 --port /dev/ttyUSB0
+python3 debug_vesc_f103.py sample --motor 1 --count 64 --decimation 8 --port /dev/ttyUSB0
+```
 
-Kemudian gunakan `full-test --yes` dengan current kecil.
-
+9. Start active tests at low current only after all passive checks pass.

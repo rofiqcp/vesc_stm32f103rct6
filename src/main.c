@@ -7,6 +7,7 @@
 #include "telemetry.h"
 #include "debug_sample.h"
 #include "vesc_comm.h"
+#include "config_store.h"
 
 static void SystemClock_Config(void);
 static void dwt_init(void);
@@ -20,6 +21,7 @@ int main(void) {
 
     motor_hw_init();
     motor_control_init();
+    (void)config_store_load_apply();
     telemetry_init();
     debug_sample_init();
 

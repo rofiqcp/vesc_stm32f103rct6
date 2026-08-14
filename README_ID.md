@@ -1,368 +1,164 @@
-# vesc_f103_dual_foc_rtos2_v5
+# vesc_f103_dual_foc_rtos2_v6
 
-Firmware dual-motor STM32F103RCT6 + STM32Cube HAL + CMSIS-RTOS2/FreeRTOS dengan fast-loop FOC di ISR ADC/DMA dan transport UART VESC yang dipisahkan dari loop motor.
+Port STM32F103RCT6 + STM32Cube HAL + CMSIS-RTOS2/FreeRTOS yang mempertahankan fast FOC di ADC/DMA ISR dan memetakan semantik komunikasi/worker VESC upstream ke hardware F103 ini.
 
-## Perubahan utama V5
-
-V5 mengubah transport USART3 agar mengikuti pola VESC UART interrupt/queue: RXNE untuk RX, TXE untuk TX, dan TC untuk akhir transmisi fisik. Jalur komunikasi sekarang dibuat:
+## Topologi motor
 
 ```text
-USB-UART
-   |
-USART3 PB11 RX
-   |
-RXNE interrupt
-   |
-software RX ring
-   |
-packet_process_thread
-   |
-VESC packet framing + CRC
-   |
-COMM_FW_VERSION / commands
-   |
-software TX ring
-   |
-TXE interrupt
-   |
-USART3 PB10 TX
-   |
-TC interrupt (physical TX complete)
+VESC Tool / USB-UART
+        |
+        v
+USART3 PB10/PB11 @ 115200 8N1
+        |
+        +-- command normal ------------------------> MOTOR LEFT / local / ID 1
+        |
+        `-- COMM_FORWARD_CAN + target 2 + inner --> MOTOR RIGHT / virtual CAN / ID 2
+                                                   (tanpa CAN peripheral fisik)
 ```
 
-UART VESC:
+Reply motor RIGHT dari `COMM_FORWARD_CAN` dikirim sebagai **inner VESC reply normal**, bukan dibungkus lagi dengan `COMM_FORWARD_CAN`.
+
+## UART
+
+- USART3 TX PB10, RX PB11.
+- RX = RXNE interrupt -> software RX ring -> `packet_process_thread`.
+- TX = software TX ring -> TXE interrupt -> DR; TC menandai transmisi fisik selesai.
+- Tidak ada UART RX/TX DMA.
+- DMA1 Channel1 tetap khusus ADC/FOC fast loop.
+
+## Packet / VESC Tool
+
+V6 menangani payload sampai 512 byte, framing 2/3-byte length, CRC16, recovery setelah noise/bad frame, dan jalur request/reply berikut:
+
+- `COMM_FW_VERSION`
+- `COMM_GET_VALUES`
+- `COMM_GET_VALUES_SELECTIVE`
+- `COMM_GET_VALUES_SETUP`
+- `COMM_GET_VALUES_SETUP_SELECTIVE`
+- `COMM_SET_DUTY`
+- `COMM_SET_CURRENT`
+- `COMM_SET_CURRENT_BRAKE`
+- `COMM_SET_RPM`
+- `COMM_SET_POS`
+- `COMM_SET_HANDBRAKE`
+- `COMM_SET_CURRENT_REL`
+- `COMM_ALIVE`
+- `COMM_SET_DETECT` / rotor-position stream
+- `COMM_GET_DECODED_ADC`
+- `COMM_CUSTOM_APP_DATA` callback semantics
+- `COMM_SAMPLE_PRINT`
+- `COMM_DETECT_ENCODER`
+- `COMM_DETECT_HALL_FOC`
+- `COMM_FORWARD_CAN`
+- `COMM_PING_CAN`
+
+## Thread CMSIS-RTOS2
 
 ```text
-USART3
-TX = PB10
-RX = PB11
-115200 baud, 8N1
+adc_thread                 application ADC worker (applications/app_adc semantic)
+packet_process_thread      drain RX ring + framing + non-blocking command dispatch
+blocking_thread            Hall/encoder detect, ping CAN, blocking jobs
+current_cal_thread         F103-specific startup current-zero supervisor
+
+timer_thread               motor/interface housekeeping
+pid_thread                 speed/position outer-loop controller
+rpm_thread                 F103 Hall/ABI speed estimator service
+sample_send_thread         sample packet sender
+fault_stop_thread          deferred software fault handling
+stat_thread                telemetry/stat accumulation
+periodic_thread            telemetry + rotor-position periodic work
+led_thread                 board status LED
+timeout_thread             global command timeout for both motor contexts
 ```
 
-UART VESC **tidak memakai DMA RX maupun DMA TX**. DMA1 Channel1 tetap dipakai untuk ADC/FOC fast-loop.
-
-Wiring USB-UART:
+Fast current FOC **bukan thread**. Ia tetap di `DMA1_Channel1_IRQHandler()`:
 
 ```text
-USB-UART TX  -> PB11 (STM32 USART3 RX)
-USB-UART RX  <- PB10 (STM32 USART3 TX)
-USB-UART GND -> GND controller
+ADC dual simultaneous -> DMA HT IRQ -> Clarke -> Park -> Id/Iq PI
+-> Vd/Vq limit -> inverse Park -> SVPWM -> TIM8 LEFT + TIM1 RIGHT
 ```
 
-TX dan RX **harus silang**.
+## Persistence / EEPROM-equivalent
 
-## Thread V5
+STM32F103RC tidak memiliki data EEPROM. V6 menggunakan page flash terakhir 2 KiB (`0x0803F800`) sebagai emulasi persistent configuration:
 
-Semua fungsi thread yang diminta tersedia sebagai thread CMSIS-RTOS2 nyata. Nama fungsi dipertahankan sama dengan model VESC-style walaupun RTOS yang dipakai adalah CMSIS-RTOS2/FreeRTOS, bukan ChibiOS.
+- firmware build dibatasi 260096 byte agar tidak masuk ke page config;
+- record mempunyai version, sequence, CRC32;
+- multiple append slots untuk wear-level;
+- magic/commit ditulis paling akhir;
+- record lama tetap valid jika power loss terjadi sebelum record baru committed;
+- saat page penuh, page di-erase dan log dimulai lagi;
+- kedua motor dihentikan dan gate dimatikan sebelum write;
+- DMA1 Channel1 IRQ sementara dimatikan selama flash erase/program;
+- current PI fixed-point gains dihitung ulang saat config diload.
 
-```text
-adc_thread
-packet_process_thread
-blocking_thread
-timer_thread
-pid_thread
-rpm_thread
-sample_send_thread
-fault_stop_thread
-stat_thread
-periodic_thread
-led_thread
-```
+Yang disimpan: timeout, sensor mode, pole pairs, encoder CPR/invert/electrical offset, Hall table/angle, current Kp/Ki, speed Kp/Ki/Kd kedua motor.
 
-Pembagian pekerjaan:
-
-```text
-adc_thread             startup/current-zero calibration supervision
-packet_process_thread  drain RX ring + VESC framing/CRC + non-blocking commands
-blocking_thread        detection commands yang boleh lama
-
-timer_thread           motor/FOC housekeeping 1 kHz
-pid_thread             speed + position PID 1 kHz
-rpm_thread             encoder/Hall RPM + position update 1 kHz
-sample_send_thread     kirim captured FOC samples tanpa membebani ISR
-fault_stop_thread      fault event + stop/recovery software
-stat_thread            statistik 100 Hz
-periodic_thread        rotor-position stream + telemetry snapshot 100 Hz
-led_thread             LED status/fault
-```
-
-Fast FOC tetap **bukan RTOS thread**:
-
-```text
-PWM TIM1/TIM8
-     |
-ADC1+ADC2 simultaneous
-     |
-DMA1 Channel1 half-transfer IRQ
-     |
-FOC LEFT + RIGHT
-  - offset current
-  - Clarke
-  - electrical rotor angle
-  - Park
-  - PI Id/Iq
-  - Vd/Vq limiting
-  - inverse Park
-  - SVPWM
-     |
-TIM8 CCR1/2/3 LEFT
-TIM1 CCR1/2/3 RIGHT
-```
-
-Tidak ada UART, `printf`, atau RTOS call di fast FOC ISR.
-
-## Polaritas gate
-
-```text
-High-side UH/VH/WH : active HIGH
-Low-side  UL/VL/WL : active LOW
-```
-
-TIM1/TIM8 menggunakan:
-
-```c
-OCPolarity   = TIM_OCPOLARITY_HIGH;
-OCNPolarity  = TIM_OCNPOLARITY_LOW;
-OCIdleState  = TIM_OCIDLESTATE_RESET;
-OCNIdleState = TIM_OCNIDLESTATE_SET;
-```
-
-Dengan demikian kondisi OFF/dead-time adalah high-side LOW dan low-side HIGH.
-
-## `COMM_FW_VERSION`
-
-Reply V5 mengikuti layout paket firmware-version VESC 7.01:
-
-```text
-COMM_FW_VERSION
-major = 7
-minor = 1
-HW name\0
-12-byte STM32 UUID
-pairing
-FW test version
-HW type
-custom config count
-phase filter flag
-QML HW flag
-QML APP flag
-NRF flags
-FW name\0
-HW config CRC uint32
-```
-
-Handshake diproses langsung oleh `packet_process_thread`. Ia tidak menunggu current calibration, motor state, `periodic_thread`, atau telemetry.
-
-## Blocking detection
-
-Perintah berikut masuk queue depth-1 ke `blocking_thread` agar parser UART tetap hidup:
-
-```text
-COMM_DETECT_MOTOR_PARAM
-COMM_DETECT_MOTOR_R_L
-COMM_DETECT_MOTOR_FLUX_LINKAGE
-COMM_DETECT_ENCODER
-COMM_DETECT_HALL_FOC
-COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP
-COMM_DETECT_APPLY_ALL_FOC
-```
-
-Sensor Hall/encoder runtime detection yang sudah diimplementasikan tetap digunakan. **R/L/flux-linkage full VESC Detect All belum diimplementasikan sebagai measurement fisik final di V5**; command tersebut tidak dipalsukan dan mengembalikan failure/sentinel. Jangan menggunakan VESC Tool Detect All sebagai pengganti commissioning sensor V5 sampai modul R/L/flux ditambahkan.
-
-## Runtime sensor LEFT
-
-PB6/PB7 dipakai bersama oleh Hall kiri dan TIM4 encoder, sehingga V5 tetap melakukan runtime remux:
-
-```text
-LEFT HALL:
-PB5/PB6/PB7 -> Hall input
-TIM4 stop
-
-LEFT ENCODER:
-PB6/PB7 -> TIM4 CH1/CH2 encoder
-Hall EXTI kiri disable
-```
-
-Mode dapat diubah saat runtime setelah motor dihentikan. Tidak ada lagi `#if LEFT_SENSOR_MODE` untuk jalur ISR Hall.
-
-## Current zero calibration
-
-Saat boot:
-
-```text
-PWM MOE OFF
- -> discard initial ADC samples
- -> collect 4096 zero-current samples
- -> calculate mean/noise/range
- -> set U/V/DC current offsets
- -> reset Id/Iq/Vd/Vq state
- -> only then motor can become ready
-```
-
-Zero calibration mengoreksi **offset**, bukan gain sensor. Nilai berikut tetap harus sesuai hardware PCB:
-
-```c
-LEFT_CURRENT_A_PER_COUNT
-RIGHT_CURRENT_A_PER_COUNT
-LEFT_DC_CURRENT_A_PER_COUNT
-RIGHT_DC_CURRENT_A_PER_COUNT
-DCLINK_V_PER_COUNT
-```
-
-Jika gain salah, nol bisa tepat tetapi skala Ampere/Volt tetap salah.
-
-## Telemetry
-
-`COMM_GET_VALUES` / selective menyediakan field VESC yang relevan:
-
-```text
-FET temp placeholder
-motor temp placeholder
-Imotor
-Ibatt
-Id
-Iq
-duty
-ERPM
-Vin
-Ah / Ah charged
-Wh / Wh charged
-tachometer / tachometer_abs
-fault
-PID/rotor position
-controller id
-phase-temp placeholders
-Vd
-Vq
-timeout status
-```
-
-Extended custom telemetry juga menyediakan raw/filtered current, current-zero offsets, Hall, encoder, sensor mode, rotor electrical angle, ISR cycles dan overrun count.
-
-## Build
+Gunakan:
 
 ```bash
-pio run -t clean
-pio run
-pio run -t upload
+python3 debug_vesc_f103.py config-status --port /dev/ttyUSB0
+python3 debug_vesc_f103.py config-save   --port /dev/ttyUSB0
 ```
 
-## Python debug
+## Virtual CAN RIGHT
 
-Install:
-
-```bash
-python3 -m pip install pyserial
-```
-
-Self-test parser:
+Test:
 
 ```bash
-python3 debug_vesc_f103.py --self-test
-```
-
-### Test pertama setelah upload: HANDSHAKE SAJA
-
-Jangan hidupkan power motor dahulu.
-
-```bash
-python3 debug_vesc_f103.py handshake \
-  --port /dev/ttyUSB0 \
-  --baud 115200 \
-  --timeout 1.5
+python3 debug_vesc_f103.py can-scan --port /dev/ttyUSB0
 ```
 
 Target:
 
 ```text
-TX: ...
-RX raw: ...
-RX payload: 00 07 01 ...
-PASS: framing + CRC + COMM_FW_VERSION reply valid
+COMM_PING_CAN
+  -> [COMM_PING_CAN, 2]
+
+COMM_FORWARD_CAN, 2, COMM_FW_VERSION
+  -> COMM_FW_VERSION reply milik MOTOR RIGHT
+
+COMM_FORWARD_CAN, 2, COMM_GET_VALUES
+  -> COMM_GET_VALUES dengan controller_id = 2
 ```
 
-Kalau `RX raw: <no bytes>`:
+## Sample
+
+`COMM_SAMPLE_PRINT` output memakai satu packet per sample dengan layout VESC-style:
 
 ```text
-1. pastikan USB-UART TX -> PB11
-2. pastikan USB-UART RX <- PB10
-3. GND harus common
-4. baud 115200 8N1
-5. cek 3.3 V logic level
-6. cek firmware benar-benar boot
+COMM_SAMPLE_PRINT
+index int16
+current0 float32_auto
+current1 float32_auto
+current2 float32_auto
+phase1 float32_auto
+phase2 float32_auto
+phase3 float32_auto
+vzero float32_auto
+current_fir float32_auto
+switching_frequency float32_auto
+status uint8
+phase uint8
+index int32
 ```
 
-Kalau ada raw bytes tetapi CRC/framing gagal, fokus ke baud/noise/wiring.
-
-Baud scan:
+Test:
 
 ```bash
-python3 debug_vesc_f103.py baud-scan \
-  --port /dev/ttyUSB0
+python3 debug_vesc_f103.py sample --motor 0 --count 64 --decimation 8 --port /dev/ttyUSB0
+python3 debug_vesc_f103.py sample --motor 1 --count 64 --decimation 8 --port /dev/ttyUSB0
 ```
 
-Diagnostic transport setelah handshake:
+## Batas yang sengaja tidak diklaim 100% upstream
 
-```bash
-python3 debug_vesc_f103.py comm-diag \
-  --port /dev/ttyUSB0 \
-  --baud 115200
-```
+V6 **tidak mengklaim seluruh firmware `vedderb/bldc` telah dipindahkan byte-for-byte**. Hal berikut masih sengaja dibatasi:
 
-Metrik mencakup:
+1. Full `mc_configuration` / `app_configuration` confgenerator serialization untuk tombol Read/Write Motor/App Configuration VESC Tool belum dipindahkan. `COMM_SET/GET_MCCONF` dan `COMM_SET/GET_APPCONF` tidak di-ACK palsu. Persistence yang benar-benar bekerja saat ini adalah config-store V6 di atas.
+2. R/L/flux-linkage Detect All belum memberikan measurement palsu; command tersebut mengembalikan failure/sentinel.
+3. `COMM_SAMPLE_PRINT` packet layout sudah standar, tetapi trigger/fault prebuffer lengkap belum ada. Mode capture V6 saat ini immediate. PCB juga hanya mempunyai dua phase-current channels, sehingga channel ketiga dihitung/infer atau diset 0 pada raw sample.
+4. HFI/sensorless-estimator upstream tidak dipindahkan; port ini memang berfokus Hall + ABI encoder sesuai hardware proyek.
+5. Hardware IWDG/thread-monitor penuh upstream belum dipindahkan; global VESC-style command timeout sudah ada.
+6. `rpm_thread` di V6 adalah service estimator Hall/ABI F103. Ia bukan klaim port literal thread BLDC six-step `mcpwm.c` upstream.
 
-```text
-rx_bytes
-rx_ring_overruns
-rx_frames_ok
-tx_bytes
-uart_errors
-tx_frames
-tx_ring_overruns
-tx_complete_count
-blocking_busy_drops
-```
-
-Firmware info:
-
-```bash
-python3 debug_vesc_f103.py info --port /dev/ttyUSB0
-```
-
-Passive test:
-
-```bash
-python3 debug_vesc_f103.py test-all --port /dev/ttyUSB0
-```
-
-Current calibration:
-
-```bash
-python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0
-```
-
-Active commissioning baru setelah wiring/current scaling/sensor aman:
-
-```bash
-python3 debug_vesc_f103.py full-test \
-  --port /dev/ttyUSB0 \
-  --yes
-```
-
-## Urutan diagnosis VESC Tool
-
-```text
-Python handshake FAIL + 0 raw byte
-    -> masalah fisik UART / pin / baud / boot
-
-Python handshake raw ada, CRC FAIL
-    -> framing / baud / noise
-
-Python handshake PASS
-    -> UART transport + COMM_FW_VERSION sudah bekerja
-
-Python handshake PASS tetapi halaman konfigurasi VESC Tool tidak lengkap
-    -> transport bukan masalah lagi; periksa compatibility command/config
-       seperti MCCONF/APPCONF yang belum seluruhnya diimplementasikan.
-```
-
+Modul yang memang dikeluarkan sesuai permintaan: physical CAN hardware, IMU, BMS, bm_if, NRF, LEDPWM, COMUSB, QMLUI, LispIF, NTC temperature subsystem, LZO.

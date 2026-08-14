@@ -30,10 +30,15 @@ COMM_SET_CURRENT = 6
 COMM_SET_CURRENT_BRAKE = 7
 COMM_SET_RPM = 8
 COMM_SET_POS = 9
+COMM_SET_HANDBRAKE = 10
 COMM_SET_DETECT = 11
+COMM_SAMPLE_PRINT = 19
 COMM_ROTOR_POSITION = 22
 COMM_ALIVE = 30
+COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
+COMM_PING_CAN = 62
+COMM_SET_CURRENT_REL = 84
 
 CUSTOM_SELECT_MOTOR = 0xA0
 CUSTOM_DUAL_SUMMARY = 0xA1
@@ -46,7 +51,8 @@ CUSTOM_SAMPLE_START = 0xA7
 CUSTOM_EXT_TELEMETRY = 0xA8
 CUSTOM_SENSOR_INFO = 0xA9
 CUSTOM_COMM_DIAG = 0xAA
-CUSTOM_SAMPLE_DATA = 0xB0
+CUSTOM_CONFIG_SAVE = 0xAB
+CUSTOM_CONFIG_STATUS = 0xAC
 
 SENSOR_AUTO = 0
 SENSOR_HALL = 1
@@ -156,6 +162,7 @@ class Reader:
     def u16(self) -> int: return struct.unpack(">H", self._take(2))[0]
     def i32(self) -> int: return struct.unpack(">i", self._take(4))[0]
     def u32(self) -> int: return struct.unpack(">I", self._take(4))[0]
+    def f32_auto(self) -> float: return struct.unpack(">f", self._take(4))[0]
 
     def cstring(self) -> str:
         end = self.data.find(b"\x00", self.i)
@@ -221,7 +228,24 @@ class Link:
         self.send(payload)
         return self.recv(timeout=timeout, pred=pred)
 
+    @staticmethod
+    def standard_route(motor: int, payload: bytes) -> bytes:
+        if motor == 0:
+            return payload
+        if motor == 1:
+            return bytes((COMM_FORWARD_CAN, 2)) + payload
+        raise ValueError(f"motor invalid: {motor}")
+
+    def send_std(self, motor: int, payload: bytes) -> None:
+        self.send(self.standard_route(motor, payload))
+
+    def request_std(self, motor: int, payload: bytes, pred: Callable[[bytes], bool], timeout: float = 1.0) -> bytes:
+        # Upstream dual-motor COMM_FORWARD_CAN replies with the inner command
+        # directly, without wrapping the reply in COMM_FORWARD_CAN.
+        return self.request(self.standard_route(motor, payload), pred, timeout)
+
     def select_motor(self, motor: int) -> None:
+        # Legacy F103 diagnostic only. It does NOT alter standard UART routing.
         self.send(bytes((COMM_CUSTOM_APP_DATA, CUSTOM_SELECT_MOTOR, motor)))
         time.sleep(0.02)
 
@@ -286,8 +310,8 @@ def parse_values(p: bytes) -> Values:
 
 
 def get_values(link: Link, motor: int) -> Values:
-    link.select_motor(motor)
-    p = link.request(bytes((COMM_GET_VALUES,)), lambda x: bool(x) and x[0] == COMM_GET_VALUES)
+    p = link.request_std(motor, bytes((COMM_GET_VALUES,)),
+                         lambda x: bool(x) and x[0] == COMM_GET_VALUES)
     return parse_values(p)
 
 
@@ -312,10 +336,10 @@ def parse_sensor(p: bytes) -> dict:
     if len(p)<2 or p[:2] != bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO)):
         raise ValueError("bukan sensor-info")
     r=Reader(p,2)
-    motor=r.u8(); mode=r.u8(); request=r.u8(); state=r.u8(); success=bool(r.u8()); pp=r.u8(); inv=bool(r.u8()); off=r.u16()
+    motor=r.u8(); controller_id=r.u8(); mode=r.u8(); request=r.u8(); state=r.u8(); success=bool(r.u8()); pp=r.u8(); inv=bool(r.u8()); off=r.u16()
     hall=[r.u8() for _ in range(8)]
     angles=[r.u16() for _ in range(8)]
-    return {"motor":motor,"mode":mode,"request":request,"state":state,"success":success,"pole_pairs":pp,
+    return {"motor":motor,"controller_id":controller_id,"mode":mode,"request":request,"state":state,"success":success,"pole_pairs":pp,
             "encoder_inverted":inv,"encoder_offset_u16":off,"hall_table":hall,"hall_angles_u16":angles}
 
 
@@ -330,7 +354,7 @@ def parse_extended(p: bytes) -> dict:
         raise ValueError("bukan extended telemetry")
     r=Reader(p,2)
     d={}
-    d["motor"]=r.u8(); d["revision"]=r.u8(); d["sensor_mode"]=r.u8(); d["native_fault"]=r.u8(); d["detect_state"]=r.u8()
+    d["motor"]=r.u8(); d["revision"]=r.u8(); d["controller_id"]=r.u8(); d["sensor_mode"]=r.u8(); d["native_fault"]=r.u8(); d["detect_state"]=r.u8()
     d["cal_done"]=bool(r.u8()); d["cal_valid"]=bool(r.u8()); d["hall_raw"]=r.u8(); d["pole_pairs"]=r.u8(); d["encoder_inverted"]=bool(r.u8())
     names_scales=[("id",1000),("iq",1000),("id_filter",1000),("iq_filter",1000),("vd",1000),("vq",1000),
                   ("imotor",1000),("ibatt",1000),("erpm",1),("mech_rpm",10),("position_deg",1000),("rotor_elec_deg",1000),
@@ -417,15 +441,24 @@ def parse_comm_diag(p: bytes) -> dict:
     if len(p)<3 or p[:2]!=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)):
         raise ValueError("bukan COMM_DIAG")
     r=Reader(p,2); revision=r.u8()
-    if revision >= 5:
+    d={'revision':revision}
+    if revision >= 6:
+        names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames',
+               'tx_ring_overruns','tx_complete_count','blocking_busy_drops',
+               'virtual_can_forwards','virtual_can_unknown_ids','baud']
+        for name in names: d[name]=r.u32()
+        d['blocking_queue_depth']=r.u8()
+        d['timeout_active']=bool(r.u8())
+        d['config_valid']=bool(r.u8())
+    elif revision >= 5:
         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames','tx_ring_overruns','tx_complete_count','blocking_busy_drops','baud']
+        for name in names: d[name]=r.u32()
+        d['tx_queue_depth']=r.u8(); d['blocking_queue_depth']=r.u8()
     else:
         names=['rx_dma_bytes','rx_ring_overruns','rx_frames_ok','uart_idle_events','uart_errors','tx_frames','tx_queue_drops','tx_dma_errors','blocking_busy_drops','baud']
-    d={'revision':revision}
-    for name in names: d[name]=r.u32()
-    d['tx_queue_depth']=r.u8(); d['blocking_queue_depth']=r.u8()
+        for name in names: d[name]=r.u32()
+        d['tx_queue_depth']=r.u8(); d['blocking_queue_depth']=r.u8()
     return d
-
 
 def cmd_comm_diag(link: Link, _args: argparse.Namespace) -> int:
     p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
@@ -522,9 +555,8 @@ def cmd_sensor_detect(link: Link,args: argparse.Namespace)->int:
 
 
 def cmd_rotor(link: Link,args: argparse.Namespace)->int:
-    link.select_motor(args.motor)
     mode=DISPLAY_MODES[args.mode]
-    link.send(bytes((COMM_SET_DETECT,mode)))
+    link.send_std(args.motor, bytes((COMM_SET_DETECT,mode)))
     end=time.monotonic()+args.seconds
     try:
         while time.monotonic()<end:
@@ -532,32 +564,40 @@ def cmd_rotor(link: Link,args: argparse.Namespace)->int:
             pos=struct.unpack(">i",p[1:5])[0]/100000
             print(f"rotor/position = {pos:10.5f} deg")
     finally:
-        link.send(bytes((COMM_SET_DETECT,0)))
+        link.send_std(args.motor, bytes((COMM_SET_DETECT,0)))
     return 0
 
 
-def parse_sample_packet(p: bytes)->tuple[int,int,list[dict]]:
-    if len(p)<7 or p[:2]!=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SAMPLE_DATA)):
-        raise ValueError("not sample packet")
-    r=Reader(p,2); off=r.u16(); total=r.u16(); n=r.u8(); rows=[]
-    for _ in range(n):
-        row={"ia":r.i16()/100,"ib":r.i16()/100,"id":r.i16()/100,"iq":r.i16()/100,
-             "vd":r.i16()/100,"vq":r.i16()/100,"erpm":r.i16(),"phase_deg":r.u16()*360/65536,
-             "duty_u":r.u16()/32768,"duty_v":r.u16()/32768,"duty_w":r.u16()/32768,
-             "motor":r.u8(),"hall_raw":r.u8()}
-        rows.append(row)
-    return off,total,rows
+def parse_sample_packet(p: bytes) -> tuple[int, dict]:
+    if len(p) < 1 or p[0] != COMM_SAMPLE_PRINT:
+        raise ValueError("not COMM_SAMPLE_PRINT")
+    r=Reader(p,1)
+    index16=r.i16()
+    row={
+        "index": index16,
+        "current0": r.f32_auto(), "current1": r.f32_auto(), "current2": r.f32_auto(),
+        "phase1": r.f32_auto(), "phase2": r.f32_auto(), "phase3": r.f32_auto(),
+        "vzero": r.f32_auto(), "current_fir": r.f32_auto(),
+        "switching_frequency": r.f32_auto(),
+        "status": r.u8(),
+        "phase": r.u8(),
+        "index_full": r.i32(),
+    }
+    return index16,row
 
 
 def cmd_sample(link: Link,args: argparse.Namespace)->int:
-    count=max(1,min(args.count,256)); dec=max(1,args.decimation)
-    link.send(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SAMPLE_START,args.motor))+be_u16(count)+be_u16(dec))
-    collected:dict[int,dict]={}; total=count; deadline=time.monotonic()+args.timeout
-    while time.monotonic()<deadline and len(collected)<total:
-        p=link.recv(timeout=1.0,pred=lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SAMPLE_DATA)))
-        off,total,rows=parse_sample_packet(p)
-        for k,row in enumerate(rows): collected[off+k]=row
-        print(f"\rreceived {len(collected)}/{total}",end='',flush=True)
+    count=max(1,min(args.count,256)); dec=max(1,min(args.decimation,255))
+    # mode=1 is immediate/NOW sampling in the F103 port; wire format follows
+    # COMM_SAMPLE_PRINT: mode, uint16 sample_len, uint8 decimation, raw.
+    req=bytes((COMM_SAMPLE_PRINT,1))+be_u16(count)+bytes((dec,1 if getattr(args,'raw',False) else 0))
+    link.send_std(args.motor,req)
+    collected:dict[int,dict]={}; deadline=time.monotonic()+args.timeout
+    while time.monotonic()<deadline and len(collected)<count:
+        p=link.recv(timeout=1.0,pred=lambda x: len(x)>=1 and x[0]==COMM_SAMPLE_PRINT)
+        idx,row=parse_sample_packet(p)
+        collected[idx]=row
+        print(f"\rreceived {len(collected)}/{count}",end='',flush=True)
     print()
     rows=[collected[k] for k in sorted(collected)]
     if args.csv:
@@ -567,8 +607,7 @@ def cmd_sample(link: Link,args: argparse.Namespace)->int:
             if rows: w.writeheader(); w.writerows(rows)
         print("CSV:",path)
     for row in rows[:min(12,len(rows))]: print(row)
-    return 0 if len(rows)==total else 5
-
+    return 0 if len(rows)==count else 5
 
 def command_payload(mode:str,value:float)->bytes:
     if mode=="current": return bytes((COMM_SET_CURRENT,))+be_i32(round(value*1000))
@@ -586,14 +625,14 @@ def cmd_motor_test(link: Link,args: argparse.Namespace)->int:
     s=get_sensor(link,args.motor)
     if not s['success'] and not args.force:
         raise RuntimeError("sensor belum lulus auto-detect. Jalankan sensor-detect atau gunakan --force dengan risiko sendiri.")
-    link.select_motor(args.motor); link.clear_fault(args.motor); time.sleep(0.05)
+    link.clear_fault(args.motor); time.sleep(0.05)
     payload=command_payload(args.mode,args.value)
     end=time.monotonic()+args.seconds; next_t=0.0
     try:
         while time.monotonic()<end:
             now=time.monotonic()
             if now>=next_t:
-                link.send(payload); next_t=now+0.02  # 50 Hz, like VESC recommendation
+                link.send_std(args.motor,payload); next_t=now+0.02  # 50 Hz command refresh
             try:
                 v=get_values(link,args.motor); print_values(args.motor,v)
                 if v.fault!=0: return 6
@@ -602,8 +641,7 @@ def cmd_motor_test(link: Link,args: argparse.Namespace)->int:
             time.sleep(0.05)
     finally:
         link.stop(args.motor)
-        link.select_motor(args.motor)
-        link.send(bytes((COMM_SET_CURRENT,))+be_i32(0))
+        link.send_std(args.motor,bytes((COMM_SET_CURRENT,))+be_i32(0))
     return 0
 
 
@@ -655,7 +693,6 @@ def _wait_sensor_done(link: Link, motor: int, timeout: float) -> dict:
     raise TimeoutError(f"sensor detect M{motor} timeout")
 
 def _run_command_stage(link: Link, motor: int, mode: str, value: float, seconds: float) -> Values:
-    link.select_motor(motor)
     payload=command_payload(mode,value)
     end=time.monotonic()+seconds
     next_cmd=0.0
@@ -664,7 +701,7 @@ def _run_command_stage(link: Link, motor: int, mode: str, value: float, seconds:
         while time.monotonic()<end:
             now=time.monotonic()
             if now>=next_cmd:
-                link.send(payload)
+                link.send_std(motor,payload)
                 next_cmd=now+0.02
             try:
                 last=get_values(link,motor)
@@ -754,26 +791,57 @@ def cmd_full_test(link: Link,args: argparse.Namespace)->int:
     print("FULL ACTIVE TEST PASS (protocol/firmware-level; verify waveforms/current physically with scope/clamp)")
     return 0
 
+def cmd_can_scan(link: Link, _args: argparse.Namespace) -> int:
+    p=link.request(bytes((COMM_PING_CAN,)),lambda x: bool(x) and x[0]==COMM_PING_CAN,2.0)
+    ids=list(p[1:])
+    print("Virtual CAN IDs:",ids)
+    if 2 not in ids:
+        print("FAIL: motor RIGHT virtual CAN ID 2 tidak terdeteksi")
+        return 2
+    fw=link.request_std(1,bytes((COMM_FW_VERSION,)),lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.0)
+    d=parse_fw_version(fw)
+    print("RIGHT FW via COMM_FORWARD_CAN:",d)
+    return 0
+
+
+def parse_config_status(p: bytes) -> dict:
+    if len(p)<4 or p[:2]!=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)):
+        raise ValueError("bukan config status")
+    r=Reader(p,2)
+    return {"valid":bool(r.u8()),"last_save_ok":bool(r.u8()),"sequence":r.u32(),"timeout_ms":r.u32()}
+
+
+def cmd_config_status(link: Link, _args: argparse.Namespace) -> int:
+    p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),
+                   lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),1.0)
+    print(parse_config_status(p)); return 0
+
+
+def cmd_config_save(link: Link, _args: argparse.Namespace) -> int:
+    p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_SAVE)),
+                   lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),2.0)
+    d=parse_config_status(p); print(d); return 0 if d['last_save_ok'] else 3
+
+
 def self_test() -> int:
     payload=bytes((COMM_SET_CURRENT,))+be_i32(1234)
     fr=frame(payload)
     parser=FrameParser(); out=[]
     for chunk in (fr[:2],fr[2:5],fr[5:]): out.extend(parser.feed(chunk))
     assert out==[payload]
-    assert crc16(b"123456789")==0x31C3  # CRC16-CCITT/XMODEM vector
+    assert crc16(b"123456789")==0x31C3
+    assert Link.standard_route(0,payload)==payload
+    assert Link.standard_route(1,payload)==bytes((COMM_FORWARD_CAN,2))+payload
     fw=(bytes((COMM_FW_VERSION,7,1))+b"STM32F103RC_DUAL_FOC\x00"+bytes(range(12))+
-        bytes((1,1,0,0,0,0,0,0))+b"F103_DUAL_FOC_RTOS2_V5\x00"+struct.pack(">I",0))
+        bytes((1,1,0,0,0,0,0,0))+b"F103_DUAL_FOC_RTOS2_V6\x00"+struct.pack(">I",0))
     fwd=parse_fw_version(fw)
-    assert fwd["major"]==7 and fwd["minor"]==1 and fwd["fw_name"].endswith("V5") and fwd["hw_crc"]==0
-    # Sample round trip parser smoke test.
-    samp=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SAMPLE_DATA))+be_u16(0)+be_u16(1)+bytes((1,))+b''.join([
-        be_i16(100),be_i16(-100),be_i16(20),be_i16(30),be_i16(40),be_i16(50),be_i16(600),
-        be_u16(32768),be_u16(16384),be_u16(16384),be_u16(16384),bytes((0,5))])
-    off,total,rows=parse_sample_packet(samp)
-    assert off==0 and total==1 and len(rows)==1 and abs(rows[0]['ia']-1.0)<1e-6
-    print("SELF-TEST PASS: CRC, framing, VESC FW_VERSION parser, streaming parser, sample parser")
+    assert fwd["major"]==7 and fwd["minor"]==1 and fwd["fw_name"].endswith("V6") and fwd["hw_crc"]==0
+    vals=[1.0,-2.0,3.25,4.0,5.0,6.0,7.0,8.0,16000.0]
+    samp=bytes((COMM_SAMPLE_PRINT,))+be_i16(3)+b''.join(struct.pack(">f",x) for x in vals)+bytes((0,123))+be_i32(3)
+    idx,row=parse_sample_packet(samp)
+    assert idx==3 and abs(row['current1']+2.0)<1e-6 and row['index_full']==3
+    print("SELF-TEST PASS: CRC, framing, V6 FW parser, virtual-CAN routing, standard sample parser")
     return 0
-
 
 def add_live_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--port",default="/dev/ttyUSB0")
@@ -792,6 +860,9 @@ def main() -> int:
     p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=1.0)
     p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake"); p.add_argument("--bauds",default="115200,230400,250000,460800,921600"); p.add_argument("--timeout",type=float,default=0.6)
     sp("comm-diag",cmd_comm_diag,"read firmware USART IRQ/ring diagnostics")
+    sp("can-scan",cmd_can_scan,"verify virtual CAN RIGHT ID 2 + forwarded FW_VERSION")
+    sp("config-status",cmd_config_status,"read flash-emulated persistent config status")
+    sp("config-save",cmd_config_save,"save runtime Hall/encoder/PID/timeout config to flash")
     p=sp("status",cmd_status,"standard VESC telemetry + extended telemetry"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("monitor",cmd_monitor,"monitor both motors"); p.add_argument("--hz",type=float,default=5); p.add_argument("--seconds",type=float,default=10)
     p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--zero-limit",type=float,default=0.30)
@@ -799,7 +870,7 @@ def main() -> int:
     p=sp("sensor-select",cmd_sensor_select,"live switch Hall/encoder while stopped"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["hall","encoder"],required=True)
     p=sp("sensor-detect",cmd_sensor_detect,"forced-angle Hall/encoder autodetect"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto"); p.add_argument("--timeout",type=float,default=15); p.add_argument("--yes",action="store_true")
     p=sp("rotor",cmd_rotor,"stream COMM_ROTOR_POSITION"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=list(DISPLAY_MODES),default="encoder"); p.add_argument("--seconds",type=float,default=5)
-    p=sp("sample",cmd_sample,"capture fast FOC samples from ISR buffer"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--count",type=int,default=128); p.add_argument("--decimation",type=int,default=8); p.add_argument("--timeout",type=float,default=5); p.add_argument("--csv")
+    p=sp("sample",cmd_sample,"capture fast FOC samples from ISR buffer"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--count",type=int,default=128); p.add_argument("--decimation",type=int,default=8); p.add_argument("--timeout",type=float,default=5); p.add_argument("--csv"); p.add_argument("--raw",action="store_true")
     p=sp("motor-test",cmd_motor_test,"active current/brake/rpm/duty/position test at 50 Hz command refresh"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["current","brake","rpm","duty","position"],required=True); p.add_argument("--value",type=float,required=True); p.add_argument("--seconds",type=float,default=2); p.add_argument("--yes",action="store_true"); p.add_argument("--force",action="store_true")
     p=sp("test-all",cmd_test_all,"passive end-to-end firmware/telemetry test"); p.add_argument("--zero-limit",type=float,default=0.30)
     p=sp("full-test",cmd_full_test,"ACTIVE commissioning: calibration, auto-detect, samples, current +/- and optional RPM/position"); p.add_argument("--yes",action="store_true"); p.add_argument("--current",type=float,default=0.5); p.add_argument("--erpm",type=float,default=300.0); p.add_argument("--stage-seconds",type=float,default=1.0); p.add_argument("--cal-timeout",type=float,default=5.0); p.add_argument("--detect-timeout",type=float,default=15.0); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--sample-decimation",type=int,default=8); p.add_argument("--skip-rpm",action="store_true"); p.add_argument("--position-step",type=float,default=5.0)

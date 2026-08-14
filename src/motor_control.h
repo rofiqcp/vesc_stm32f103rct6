@@ -8,6 +8,8 @@ void motor_control_init(void);
 MotorRuntime *motor_get(motor_id_t id);
 void motor_set_current(MotorRuntime *m, float amp);
 void motor_set_brake_current(MotorRuntime *m, float amp);
+void motor_set_handbrake(MotorRuntime *m, float amp);
+void motor_set_current_rel(MotorRuntime *m, float rel);
 void motor_set_speed(MotorRuntime *m, float erpm);
 void motor_set_position(MotorRuntime *m, float deg);
 void motor_set_duty_approx(MotorRuntime *m, float duty);
