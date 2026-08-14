@@ -6,7 +6,7 @@
 void debug_sample_init(void);
 void debug_sample_start(motor_id_t motor, uint16_t len, uint16_t decimation);
 void debug_sample_start_ex(motor_id_t motor, uint16_t len, uint16_t decimation, bool raw);
-void debug_sample_capture_isr(MotorRuntime *left, MotorRuntime *right);
+void debug_sample_capture_isr(MotorRuntime *active);
 bool debug_sample_ready(void);
 uint16_t debug_sample_count(void);
 const debug_sample_t *debug_sample_data(void);

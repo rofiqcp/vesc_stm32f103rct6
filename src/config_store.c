@@ -9,8 +9,8 @@
 #define CFG_REGION_ADDR      0x0803E000UL
 #define CFG_FLASH_PAGE_SIZE  2048UL
 #define CFG_PAGE_COUNT       4U
-#define CFG_MAGIC            0x56394346UL /* V9CF */
-#define CFG_VERSION          0x0009U
+#define CFG_MAGIC            0x56314346UL /* V11 config format */
+#define CFG_VERSION          0x000BU
 #define CFG_PAYLOAD_LEN      (2U*VESC6_MCCONF_WIRE_SIZE + VESC6_APPCONF_WIRE_SIZE)
 
 typedef struct {
@@ -33,6 +33,8 @@ _Static_assert(sizeof(config_record_t)<CFG_FLASH_PAGE_SIZE,"VESC config must fit
 
 static bool s_valid=false;
 static uint32_t s_save_count=0U;
+/* Large (~1.5 KiB) flash staging record is static, never placed on a small RTOS thread stack. */
+static config_record_t s_stage;
 
 static uint32_t crc32_ieee(const uint8_t *p,uint32_t n){
     uint32_t c=0xFFFFFFFFUL;for(uint32_t i=0;i<n;i++){c^=p[i];for(uint8_t b=0;b<8;b++){uint32_t m=(uint32_t)-(int32_t)(c&1U);c=(c>>1)^(0xEDB88320UL&m);}}return ~c;
@@ -54,12 +56,15 @@ static HAL_StatusTypeDef write_commit(uint32_t addr,const config_record_t*r){
 }
 bool config_store_save_all(void){
     motor_stop(&g_motor_left);motor_stop(&g_motor_right);motor_hw_gate_global(false);if(osKernelGetState()==osKernelRunning)osDelay(5);
-    config_record_t r;memset(&r,0,sizeof(r));r.magic=CFG_MAGIC;r.version=CFG_VERSION;r.payload_len=CFG_PAYLOAD_LEN;r.sequence=s_save_count+1U;
-    vesc_config_export_wire(r.payload.mc_left,r.payload.mc_right,r.payload.app);r.crc32=crc32_ieee((const uint8_t*)&r.payload,sizeof(r.payload));
+    memset(&s_stage,0,sizeof(s_stage));s_stage.magic=CFG_MAGIC;s_stage.version=CFG_VERSION;s_stage.payload_len=CFG_PAYLOAD_LEN;s_stage.sequence=s_save_count+1U;
+    vesc_config_export_wire(s_stage.payload.mc_left,s_stage.payload.mc_right,s_stage.payload.app);s_stage.crc32=crc32_ieee((const uint8_t*)&s_stage.payload,sizeof(s_stage.payload));
     int cur=best_page();uint32_t next=(cur<0)?0U:((uint32_t)(cur+1)%CFG_PAGE_COUNT);
+    /* STM32F1 flash erase/program stalls code fetch. Current loop is stopped and
+       its DMA IRQ is masked; UART RX DMA remains circular so received bytes are
+       not lost and are drained after the short flash transaction. */
     HAL_NVIC_DisableIRQ(DMA1_Channel1_IRQn);DMA1->IFCR=DMA_IFCR_CGIF1;
-    HAL_StatusTypeDef st=HAL_FLASH_Unlock();if(st==HAL_OK)st=erase_page(next);if(st==HAL_OK)st=write_commit(CFG_REGION_ADDR+next*CFG_FLASH_PAGE_SIZE,&r);(void)HAL_FLASH_Lock();
+    HAL_StatusTypeDef st=HAL_FLASH_Unlock();if(st==HAL_OK)st=erase_page(next);if(st==HAL_OK)st=write_commit(CFG_REGION_ADDR+next*CFG_FLASH_PAGE_SIZE,&s_stage);(void)HAL_FLASH_Lock();
     DMA1->IFCR=DMA_IFCR_CGIF1;HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-    if(st==HAL_OK){const config_record_t*v=page_rec(next);if(rec_valid(v)&&v->sequence==r.sequence){s_valid=true;s_save_count=r.sequence;return true;}}return false;
+    if(st==HAL_OK){const config_record_t*v=page_rec(next);if(rec_valid(v)&&v->sequence==s_stage.sequence){s_valid=true;s_save_count=s_stage.sequence;return true;}}return false;
 }
 bool config_store_valid(void){return s_valid;}uint32_t config_store_save_count(void){return s_save_count;}

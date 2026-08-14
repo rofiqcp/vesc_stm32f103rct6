@@ -50,37 +50,51 @@ static int32_t amp_to_q15(float a){
 }
 static bool sig_ok(const uint8_t *w,uint32_t sig){int32_t i=0;return vesc_buf_get_u32(w,&i)==sig;}
 
+static bool runtime_mc_ready(const MotorRuntime *m) {
+    if (m == NULL) return false;
+    if (m->pole_pairs < 1U || m->pole_pairs > 60U) return false;
+    if (!isfinite(m->current_max_a) || m->current_max_a < 0.1f) return false;
+    if (!isfinite(m->max_duty) || fabsf(m->max_duty) < 0.01f) return false;
+    return true;
+}
+
 static void build_foc_hall(const MotorRuntime *m,uint8_t out[8]) {
-    for(unsigned k=0;k<8;k++) out[k]=m?m->foc_hall_table[k]:255U;
-    if(!m){ static const uint8_t d[8]={255,17,83,50,150,183,117,255}; memcpy(out,d,8); }
+    /* GET_MCCONF can arrive immediately after FW_VERSION, before motor_boot_thread
+       has initialized MotorRuntime. Never serialize the zeroed BSS as a Hall table. */
+    static const uint8_t safe[8]={255,17,83,50,150,183,117,255};
+    if (!runtime_mc_ready(m)) { memcpy(out,safe,8); return; }
+    bool sane = (m->foc_hall_table[0] == 255U && m->foc_hall_table[7] == 255U);
+    for (unsigned k=1;k<7U;k++) sane = sane && (m->foc_hall_table[k] <= 200U);
+    if (!sane) { memcpy(out,safe,8); return; }
+    memcpy(out,m->foc_hall_table,8);
 }
 
 /* VESC 6.00 wire image. Unsupported subsystems keep conservative values but
    their bytes are still retained exactly after a SET_MCCONF. */
 static bool build_mc_default(uint8_t *b,motor_id_t id) {
-    MotorRuntime *m=motor_get(id); bool right=id==MOTOR_RIGHT; int32_t i=0;
+    MotorRuntime *m=motor_get(id); bool right=id==MOTOR_RIGHT; bool mr=runtime_mc_ready(m); int32_t i=0;
     const uint8_t legacy[8]={255,1,3,2,5,6,4,255}; uint8_t hall[8]; build_foc_hall(m,hall);
     memset(b,0,VESC6_MCCONF_WIRE_SIZE);
     vesc_buf_append_u32(b,VESC6_MCCONF_SIGNATURE,&i);
     b[i++]=VESC_PWM_SYNCHRONOUS; b[i++]=VESC_COMM_INTEGRATE; b[i++]=VESC_MOTOR_FOC; b[i++]=VESC_SENSOR_SENSORED;
-    A(b,m?m->current_max_a:FOC_MAX_CURRENT_A,&i); A(b,m?m->current_min_a:-FOC_MAX_CURRENT_A,&i);
-    A(b,m?m->current_max_a:FOC_MAX_CURRENT_A,&i); A(b,m?m->current_min_a:-FOC_MAX_CURRENT_A,&i);
-    A(b,m?m->abs_current_max_a:FOC_ABS_CURRENT_TRIP_A,&i);
-    A(b,m?m->min_erpm:MOTOR_DEFAULT_MIN_ERPM,&i); A(b,m?m->max_erpm:MOTOR_DEFAULT_MAX_ERPM,&i);
-    F(b,0.8f,10000,&i); A(b,m?m->max_erpm:MOTOR_DEFAULT_MAX_ERPM,&i); A(b,m?m->max_erpm:MOTOR_DEFAULT_MAX_ERPM,&i);
+    A(b,mr?m->current_max_a:FOC_MAX_CURRENT_A,&i); A(b,mr?m->current_min_a:-FOC_MAX_CURRENT_A,&i);
+    A(b,mr?m->current_max_a:FOC_MAX_CURRENT_A,&i); A(b,mr?m->current_min_a:-FOC_MAX_CURRENT_A,&i);
+    A(b,mr?m->abs_current_max_a:FOC_ABS_CURRENT_TRIP_A,&i);
+    A(b,mr?m->min_erpm:MOTOR_DEFAULT_MIN_ERPM,&i); A(b,mr?m->max_erpm:MOTOR_DEFAULT_MAX_ERPM,&i);
+    F(b,0.8f,10000,&i); A(b,mr?m->max_erpm:MOTOR_DEFAULT_MAX_ERPM,&i); A(b,mr?m->max_erpm:MOTOR_DEFAULT_MAX_ERPM,&i);
     A(b,VBUS_MIN_RUN_V,&i); A(b,VBUS_MAX_RUN_V,&i); A(b,36.0f,&i); A(b,32.0f,&i); b[i++]=0;
     F(b,80,10,&i);F(b,100,10,&i);F(b,80,10,&i);F(b,100,10,&i);F(b,0.15f,10000,&i);
     /* VESC l_min_duty is a positive low-duty threshold, not a negative
        reverse limit. Reverse is represented by the sign of COMM_SET_DUTY. */
-    F(b,0.0f,10000,&i);F(b,m?m->max_duty:MOTOR_DEFAULT_MAX_DUTY,10000,&i);
+    F(b,0.0f,10000,&i);F(b,mr?m->max_duty:MOTOR_DEFAULT_MAX_DUTY,10000,&i);
     A(b,5000,&i);A(b,-5000,&i);F(b,1,10000,&i);F(b,1,10000,&i);F(b,0,10000,&i);
     A(b,250,&i);A(b,250,&i);A(b,10,&i);F(b,0,10,&i);F(b,0,10000,&i);A(b,1000,&i);A(b,0,&i);
     for(unsigned k=0;k<8;k++){b[i++]=legacy[k];} A(b,2000,&i);
-    A(b,m?m->current_kp:LEFT_FOC_KP,&i); A(b,m?m->current_ki:LEFT_FOC_KI,&i); A(b,(float)PWM_FREQUENCY_HZ,&i); A(b,1000000.0f/PWM_FREQUENCY_HZ,&i);
-    b[i++]=(!right&&m&&m->encoder.inverted)?1:0;
-    A(b,(!right&&m)?((float)m->encoder.elec_offset_u16*360.0f/65536.0f):0.0f,&i);
-    A(b,(!right&&m)?m->encoder.electrical_ratio:(float)(m?m->pole_pairs:RIGHT_POLE_PAIRS),&i);
-    b[i++]=(!right&&m&&m->sensor_mode==SENSOR_MODE_ENCODER)?VESC_FOC_SENSOR_ENCODER:VESC_FOC_SENSOR_HALL;
+    A(b,mr?m->current_kp:(right?RIGHT_FOC_KP:LEFT_FOC_KP),&i); A(b,mr?m->current_ki:(right?RIGHT_FOC_KI:LEFT_FOC_KI),&i); A(b,(float)PWM_FREQUENCY_HZ,&i); A(b,1000000.0f/PWM_FREQUENCY_HZ,&i);
+    b[i++]=(!right&&mr&&m->encoder.inverted)?1:0;
+    A(b,(!right&&mr)?((float)m->encoder.elec_offset_u16*360.0f/65536.0f):0.0f,&i);
+    A(b,(!right&&mr)?m->encoder.electrical_ratio:(float)(mr?m->pole_pairs:(right?RIGHT_POLE_PAIRS:LEFT_POLE_PAIRS)),&i);
+    b[i++]=(!right&&mr&&m->sensor_mode==SENSOR_MODE_ENCODER)?VESC_FOC_SENSOR_ENCODER:VESC_FOC_SENSOR_HALL;
     A(b,2000,&i);A(b,30000,&i);A(b,20e-6f,&i);A(b,0,&i);A(b,0.05f,&i);A(b,0.003f,&i);A(b,1000,&i);A(b,1000,&i);
     F(b,0,1000,&i);A(b,0,&i);A(b,0,&i);F(b,0,10000,&i);A(b,0,&i);A(b,0,&i);
     F(b,0,1000,&i);F(b,0,1000,&i);F(b,0,1000,&i);F(b,0,100,&i);F(b,0,100,&i);F(b,0,100,&i);F(b,0,100,&i);F(b,0,100,&i);F(b,0,100,&i);
@@ -90,13 +104,13 @@ static bool build_mc_default(uint8_t *b,motor_id_t id) {
     for(unsigned k=0;k<6;k++){F(b,0,10000,&i);} b[i++]=0;b[i++]=0;A(b,0,&i);b[i++]=0;
     A(b,0,&i);F(b,0.85f,10000,&i);F(b,0.4f,1000,&i);F(b,0.0f,10000,&i);b[i++]=0;
     vesc_buf_append_i16(b,0,&i);vesc_buf_append_i16(b,0,&i);F(b,0,10000,&i);A(b,0,&i);A(b,0,&i);b[i++]=5; /* 1 kHz */
-    A(b,m?m->speed_pid.kp:SPEED_PID_KP,&i);A(b,m?m->speed_pid.ki:SPEED_PID_KI,&i);A(b,m?m->speed_pid.kd:SPEED_PID_KD,&i);F(b,m?m->speed_kd_filter:SPEED_PID_D_FILTER,10000,&i);A(b,100,&i);b[i++]=1;A(b,35000,&i);
-    A(b,m?m->position_pid.kp:POSITION_PID_KP_CURRENT_PER_DEG,&i);A(b,m?m->position_pid.ki:POSITION_PID_KI_CURRENT_PER_DEG_S,&i);A(b,m?m->position_pid.kd:POSITION_PID_KD_CURRENT_PER_DEGPS,&i);A(b,0,&i);F(b,m?m->position_kd_filter:POSITION_PID_D_FILTER,10000,&i);A(b,1,&i);F(b,0,10,&i);A(b,0,&i);
+    A(b,mr?m->speed_pid.kp:SPEED_PID_KP,&i);A(b,mr?m->speed_pid.ki:SPEED_PID_KI,&i);A(b,mr?m->speed_pid.kd:SPEED_PID_KD,&i);F(b,mr?m->speed_kd_filter:SPEED_PID_D_FILTER,10000,&i);A(b,100,&i);b[i++]=1;A(b,35000,&i);
+    A(b,mr?m->position_pid.kp:POSITION_PID_KP_CURRENT_PER_DEG,&i);A(b,mr?m->position_pid.ki:POSITION_PID_KI_CURRENT_PER_DEG_S,&i);A(b,mr?m->position_pid.kd:POSITION_PID_KD_CURRENT_PER_DEGPS,&i);A(b,0,&i);F(b,mr?m->position_kd_filter:POSITION_PID_D_FILTER,10000,&i);A(b,1,&i);F(b,0,10,&i);A(b,0,&i);
     F(b,0,10000,&i);A(b,0,&i);A(b,1,&i);F(b,0.01f,10000,&i);vesc_buf_append_i32(b,500,&i);F(b,0.02f,10000,&i);A(b,1,&i);
-    vesc_buf_append_u32(b,(!right&&m)?m->encoder.cpr:0,&i); for(unsigned k=0;k<6;k++)F(b,0,1000,&i);
-    b[i++]=(!right&&m&&m->sensor_mode==SENSOR_MODE_ENCODER)?VESC_SENSOR_PORT_ABI:VESC_SENSOR_PORT_HALL; b[i++]=(m&&m->invert_direction)?1:0; b[i++]=0;b[i++]=0;
+    vesc_buf_append_u32(b,(!right&&mr)?m->encoder.cpr:(!right?LEFT_ENCODER_CPR:0U),&i); for(unsigned k=0;k<6;k++)F(b,0,1000,&i);
+    b[i++]=(!right&&mr&&m->sensor_mode==SENSOR_MODE_ENCODER)?VESC_SENSOR_PORT_ABI:VESC_SENSOR_PORT_HALL; b[i++]=(mr&&m->invert_direction)?1:0; b[i++]=0;b[i++]=0;
     A(b,PWM_FREQUENCY_HZ,&i);A(b,PWM_FREQUENCY_HZ,&i);A(b,PWM_FREQUENCY_HZ,&i);A(b,3435,&i);b[i++]=0;b[i++]=8;A(b,1,&i);F(b,10000,0.1f,&i);F(b,25,10,&i);b[i++]=0;b[i++]=8;
-    b[i++]=(uint8_t)((m?m->pole_pairs:15U)*2U); A(b,1,&i);A(b,0.1f,&i);b[i++]=0;b[i++]=10;A(b,10,&i);A(b,1,&i);b[i++]=0;b[i++]=0;F(b,60,100,&i);F(b,80,100,&i);F(b,0.8f,1000,&i);F(b,0.9f,1000,&i);b[i++]=0;
+    b[i++]=(uint8_t)((mr?m->pole_pairs:(right?RIGHT_POLE_PAIRS:LEFT_POLE_PAIRS))*2U); A(b,1,&i);A(b,0.1f,&i);b[i++]=0;b[i++]=10;A(b,10,&i);A(b,1,&i);b[i++]=0;b[i++]=0;F(b,60,100,&i);F(b,80,100,&i);F(b,0.8f,1000,&i);F(b,0.9f,1000,&i);b[i++]=0;
     return i==(int32_t)VESC6_MCCONF_WIRE_SIZE;
 }
 

@@ -15,7 +15,7 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
-volatile uint32_t g_adc_dual_dma[4] __attribute__((aligned(4)));
+volatile uint32_t g_adc_dual_dma[6] __attribute__((aligned(4)));
 
 static void Error_Handler_Local(void) {
     /* Motor-subsystem failure must not kill the UART communication stack.
@@ -151,23 +151,70 @@ static void init_timers(void) {
     __HAL_RCC_TIM2_CLK_ENABLE();
     __HAL_RCC_TIM4_CLK_ENABLE();
 
+    /* VESC dual-motor timing topology, ported to STM32F103 high density:
+     *
+     * TIM1 (RIGHT) : center-aligned physical master, TRGO = ENABLE
+     *      -> ITR0
+     * TIM8 (LEFT)  : center-aligned trigger slave, TRGO = UPDATE
+     *      -> ITR1
+     * TIM2         : free 16-bit upcounter reset by TIM8 update; CH2 PWM1
+     *                generates ADC1 external trigger and a tiny COM-sync IRQ.
+     *
+     * TIM8 update occurs at V0 and V7, so ADC is sampled twice per switching
+     * period. The ADC ISR services exactly one motor per event using TIM1 DIR,
+     * like upstream mcpwm_foc on dual-motor hardware. */
     init_pwm_timer(&htim1, TIM1);
     init_pwm_timer(&htim8, TIM8);
+
+    /* Capture/compare preload control: duty triplets are latched coherently by
+       COM/update events. */
+    TIM1->CR2 |= TIM_CR2_CCPC;
+    TIM8->CR2 |= TIM_CR2_CCPC;
+
+    /* TIM1 is master. MMS=ENABLE makes its CEN signal the internal trigger. */
+    TIM1->CR2 = (TIM1->CR2 & ~TIM_CR2_MMS) | TIM_TRGO_ENABLE;
+    TIM1->SMCR |= TIM_SMCR_MSM;
+
+    /* On F103 high-density, TIM8 ITR0 = TIM1. Start TIM8 from TIM1 trigger and
+       export TIM8 update as TRGO. */
+    TIM8->SMCR = (TIM8->SMCR & ~(TIM_SMCR_TS | TIM_SMCR_SMS)) |
+                 TIM_TS_ITR0 | TIM_SLAVEMODE_TRIGGER;
+    TIM8->CR2 = (TIM8->CR2 & ~TIM_CR2_MMS) | TIM_TRGO_UPDATE;
 
     htim2.Instance = TIM2;
     htim2.Init.Prescaler = 0;
     htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-    htim2.Init.Period = (2U * PWM_TIMER_ARR) - 1U;
+    htim2.Init.Period = 0xFFFFU;
     htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
-    if (HAL_TIM_OC_Init(&htim2) != HAL_OK) Error_Handler_Local();
+    if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) Error_Handler_Local();
+
     TIM_OC_InitTypeDef oc = {0};
-    oc.OCMode = TIM_OCMODE_TIMING;
-    oc.Pulse = PWM_TIMER_ARR + ADC_SAMPLE_DELAY_TICKS;
+    oc.OCMode = TIM_OCMODE_PWM1;
+    oc.Pulse = VESC_CURRENT_SAMP_OFFSET_TICKS / 2U;
     oc.OCPolarity = TIM_OCPOLARITY_HIGH;
-    if (HAL_TIM_OC_ConfigChannel(&htim2, &oc, TIM_CHANNEL_2) != HAL_OK) Error_Handler_Local();
-    TIM2->CCR2 = PWM_TIMER_ARR + ADC_SAMPLE_DELAY_TICKS;
+    oc.OCFastMode = TIM_OCFAST_DISABLE;
+    if (HAL_TIM_PWM_ConfigChannel(&htim2, &oc, TIM_CHANNEL_2) != HAL_OK) Error_Handler_Local();
+    TIM2->CCR2 = VESC_CURRENT_SAMP_OFFSET_TICKS / 2U;
+    TIM2->CCMR1 |= TIM_CCMR1_OC2PE;
+    TIM2->CR1 |= TIM_CR1_ARPE;
+    TIM2->CR2 |= TIM_CR2_CCPC;
+
+    /* Upstream explicitly enables the CC output because the compare event is
+       used as the ADC trigger source. No GPIO pin is needed for this internal
+       path. */
     TIM2->CCER |= TIM_CCER_CC2E;
+
+    /* F103 high-density mapping: TIM2 ITR1 = TIM8. Reset TIM2 on each TIM8
+       V0/V7 update so CC2 occurs at a deterministic offset from the zero
+       vector. */
+    TIM2->SMCR = (TIM2->SMCR & ~(TIM_SMCR_TS | TIM_SMCR_SMS)) |
+                 TIM_TS_ITR1 | TIM_SLAVEMODE_RESET;
+
+    __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_CC2);
+    __HAL_TIM_ENABLE_IT(&htim2, TIM_IT_CC2);
+    HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0); /* no RTOS API in handler */
+    HAL_NVIC_EnableIRQ(TIM2_IRQn);
 
     htim4.Instance = TIM4;
     htim4.Init.Prescaler = 0;
@@ -180,11 +227,11 @@ static void init_timers(void) {
     enc.IC1Polarity = TIM_ICPOLARITY_RISING;
     enc.IC1Selection = TIM_ICSELECTION_DIRECTTI;
     enc.IC1Prescaler = TIM_ICPSC_DIV1;
-    enc.IC1Filter = 4;
+    enc.IC1Filter = 6;
     enc.IC2Polarity = TIM_ICPOLARITY_RISING;
     enc.IC2Selection = TIM_ICSELECTION_DIRECTTI;
     enc.IC2Prescaler = TIM_ICPSC_DIV1;
-    enc.IC2Filter = 4;
+    enc.IC2Filter = 6;
     if (HAL_TIM_Encoder_Init(&htim4, &enc) != HAL_OK) Error_Handler_Local();
     __HAL_TIM_DISABLE(&htim4);
     __HAL_TIM_DISABLE_IT(&htim4, TIM_IT_UPDATE);
@@ -215,7 +262,7 @@ static void init_adc_dma(void) {
     hadc1.Init.DiscontinuousConvMode = DISABLE;
     hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_CC2;
     hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc1.Init.NbrOfConversion = 4;
+    hadc1.Init.NbrOfConversion = 6;
     if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler_Local();
 
     hadc2.Instance = ADC2;
@@ -224,23 +271,27 @@ static void init_adc_dma(void) {
     hadc2.Init.DiscontinuousConvMode = DISABLE;
     hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
     hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc2.Init.NbrOfConversion = 4;
+    hadc2.Init.NbrOfConversion = 6;
     if (HAL_ADC_Init(&hadc2) != HAL_OK) Error_Handler_Local();
 
-    /* ADC1 lower halfword, ADC2 upper halfword for each rank. */
-    /* Keep the four phase-current channels first and fast. At 12 MHz ADC,
-       1.5 + 12.5 = 14 ADC clocks per rank (~1.17 us). Rank 2 sample-and-hold
-       therefore still occurs inside the conservative zero-vector window. */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_0,  ADC_REGULAR_RANK_1, ADC_SAMPLETIME_1CYCLE_5); /* LEFT U PA0 */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_13, ADC_REGULAR_RANK_1, ADC_SAMPLETIME_1CYCLE_5); /* LEFT V PC3 */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_14, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_1CYCLE_5); /* RIGHT U PC4 */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_15, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_1CYCLE_5); /* RIGHT V PC5 */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_10, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_1CYCLE_5); /* LEFT DC PC0 */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_1CYCLE_5); /* RIGHT DC PC1 */
-    /* DC-link can use a longer aperture because it is not used for current
-       reconstruction at this exact instant. */
+    /* ADC1 lower halfword, ADC2 upper halfword for each rank.
+       Six dual ranks are intentional: DMA HT now occurs after rank 3. The
+       first THREE ranks are all current channels, exactly matching the VESC
+       rule for using half-transfer as the earliest safe current-loop entry.
+       The slower DCLINK ranks complete after HT and the ISR consumes the last
+       completed value from the previous scan. */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_0,  ADC_REGULAR_RANK_1, ADC_SAMPLETIME_7CYCLES_5); /* LEFT U PA0 */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_13, ADC_REGULAR_RANK_1, ADC_SAMPLETIME_7CYCLES_5); /* LEFT V PC3 */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_14, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT U PC4 */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_15, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT V PC5 */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_10, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* LEFT DC PC0 */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT DC PC1 */
     cfg_adc_channel(&hadc1, ADC_CHANNEL_12, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* DCLINK PC2 */
     cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* duplicate RIGHT DC */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_12, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_28CYCLES_5); /* DCLINK duplicate */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_28CYCLES_5); /* duplicate RIGHT DC */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_12, ADC_REGULAR_RANK_6, ADC_SAMPLETIME_28CYCLES_5); /* DCLINK duplicate */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_6, ADC_SAMPLETIME_28CYCLES_5); /* duplicate RIGHT DC */
 
     ADC_MultiModeTypeDef multi = {0};
     multi.Mode = ADC_DUALMODE_REGSIMULT;
@@ -273,21 +324,38 @@ void motor_hw_init(void) {
 
 void motor_hw_start_sampling(void) {
     memset((void *)g_adc_dual_dma, 0, sizeof(g_adc_dual_dma));
-    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)g_adc_dual_dma, 4U) != HAL_OK) {
+
+    /* STM32F1 multimode rule: ADC2 regular conversion uses ADC_SOFTWARE_START
+       and has no independent external trigger. ST HAL permits the slave to be
+       enabled preliminarily with HAL_ADC_Start(); then the master multimode
+       start arms DMA and ADC1 TIM2_CC2 launches each simultaneous pair. This
+       explicit pre-enable also makes ADC2 liveness visible in diagnostics. */
+    if (HAL_ADC_Start(&hadc2) != HAL_OK) {
         Error_Handler_Local();
     }
-    /* VESC-style latency reduction: FOC starts as soon as ranks 1..2 are in
-       RAM. Transfer-complete IRQ is unnecessary; ranks 3..4 remain available
-       from the previous cycle when the next half-transfer arrives. */
+    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)g_adc_dual_dma, 6U) != HAL_OK) {
+        (void)HAL_ADC_Stop(&hadc2);
+        Error_Handler_Local();
+    }
+
+    /* With six dual ranks, HT occurs after rank 3. All first three ranks are
+       current channels, so this follows the upstream VESC HT condition. TC
+       remains disabled; voltage/auxiliary ranks finish in the background. */
     __HAL_DMA_ENABLE_IT(&hdma_adc1, DMA_IT_HT);
     __HAL_DMA_DISABLE_IT(&hdma_adc1, DMA_IT_TC);
 
     __disable_irq();
+    TIM1->BDTR &= ~TIM_BDTR_MOE;
+    TIM8->BDTR &= ~TIM_BDTR_MOE;
     TIM1->CNT = 0U;
-    TIM8->CNT = 0U;
+    TIM8->CNT = TIM1->ARR; /* VESC dual-motor 180-degree counter phase */
     TIM2->CNT = 0U;
+    TIM2->CCR2 = VESC_CURRENT_SAMP_OFFSET_TICKS / 2U;
+    TIM2->SR = 0U;
+
+    /* Start the physical master and the sampling timer. TIM8 starts from the
+       TIM1 internal trigger because it is configured as a trigger slave. */
     TIM1->CR1 |= TIM_CR1_CEN;
-    TIM8->CR1 |= TIM_CR1_CEN;
     TIM2->CR1 |= TIM_CR1_CEN;
     __enable_irq();
 }

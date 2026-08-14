@@ -5,12 +5,18 @@
 #define CPU_CLOCK_HZ                    64000000UL
 #define PWM_FREQUENCY_HZ                16000UL
 #define PWM_TIMER_ARR                   (CPU_CLOCK_HZ / (2UL * PWM_FREQUENCY_HZ))
-#define PWM_DEADTIME_NS                 800UL
+#define PWM_DEADTIME_NS                 750UL
 #define PWM_MIN_DUTY                    0.10f
 #define PWM_MAX_DUTY                    0.90f
 #define PWM_MIN_DUTY_Q15                3277U
 #define PWM_MAX_DUTY_Q15                29491U
-#define ADC_SAMPLE_DELAY_TICKS          0UL
+/* VESC-style V0/V7 current sampling: TIM8 update resets TIM2 twice per
+ * center-aligned PWM period. TIM2 CC2 therefore produces 2 ADC events/PWM;
+ * each event services one motor according to TIM1 direction. */
+#define VESC_CURRENT_SAMP_OFFSET_TICKS  500UL
+#define FOC_SAMPLE_EVENTS_PER_PWM       2UL
+#define FOC_ISR_EVENT_HZ                (PWM_FREQUENCY_HZ * FOC_SAMPLE_EVENTS_PER_PWM)
+#define FOC_ISR_SLOT_CYCLES             (CPU_CLOCK_HZ / FOC_ISR_EVENT_HZ)
 #define FOC_DT_S                        (1.0f / (float)PWM_FREQUENCY_HZ)
 
 /* ===================== POWER-STAGE POLARITY =====================

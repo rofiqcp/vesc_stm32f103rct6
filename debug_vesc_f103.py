@@ -319,11 +319,24 @@ def parse_cal(p: bytes) -> dict:
     if len(p) < 2 or p[:2] != bytes((COMM_CUSTOM_APP_DATA, CUSTOM_CURRENT_CAL)):
         raise ValueError("bukan current-cal reply")
     r=Reader(p,2)
-    return {
+    d = {
         "done": bool(r.u8()), "valid": bool(r.u8()), "count": r.u32(), "target": r.u32(),
         "left_u": r.i32(), "left_v": r.i32(), "left_dc": r.i32(),
         "right_u": r.i32(), "right_v": r.i32(), "right_dc": r.i32(),
     }
+    if len(p) - r.i >= 12:
+        d["adc_isr_count"] = r.u32()
+        d["dma_cndtr"] = r.u16()
+        d["tim2_cnt"] = r.u16()
+        d["tim1_dir"] = r.u8()
+        d["tim1_running"] = bool(r.u8())
+        d["tim8_running"] = bool(r.u8())
+        d["tim2_running"] = bool(r.u8())
+    if len(p) - r.i >= 3:
+        d["adc1_enabled"] = bool(r.u8())
+        d["adc2_enabled"] = bool(r.u8())
+        d["dma1_ch1_enabled"] = bool(r.u8())
+    return d
 
 
 def get_cal(link: Link, trigger: bool = False) -> dict:
@@ -852,7 +865,7 @@ def self_test() -> int:
     samp=bytes((COMM_SAMPLE_PRINT,))+be_i16(3)+b''.join(struct.pack(">f",x) for x in vals)+bytes((0,123))+be_i32(3)
     idx,row=parse_sample_packet(samp)
     assert idx==3 and abs(row['current1']+2.0)<1e-6 and row['index_full']==3
-    print("SELF-TEST PASS: CRC, framing, V9 VESC-6.00 FW parser, virtual-CAN routing, standard sample parser")
+    print("SELF-TEST PASS: CRC, framing, VESC-6.00 FW parser, virtual-CAN routing, standard sample parser")
     return 0
 
 def add_live_args(p: argparse.ArgumentParser) -> None:

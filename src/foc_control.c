@@ -17,10 +17,11 @@ static uint64_t s_sq_lu = 0U, s_sq_lv = 0U, s_sq_ldc = 0U;
 static uint64_t s_sq_ru = 0U, s_sq_rv = 0U, s_sq_rdc = 0U;
 static uint16_t s_min_lu, s_min_lv, s_min_ldc, s_min_ru, s_min_rv, s_min_rdc;
 static uint16_t s_max_lu, s_max_lv, s_max_ldc, s_max_ru, s_max_rv, s_max_rdc;
-static uint32_t s_overrun_consecutive = 0U;
+static uint8_t s_overrun_consecutive[2] = {0U, 0U};
 static int32_t s_inv_vbus_q30 = 0;
 static int32_t s_inv_vbus_last_q15 = 0;
 static uint8_t s_inv_vbus_age = 0U;
+static volatile uint32_t s_adc_isr_count = 0U;
 
 static int32_t s_vbus_scale_q16;
 static int32_t s_vbus_min_q15;
@@ -52,6 +53,8 @@ static void cal_reset_isr(void) {
 bool foc_calibration_done(void) { return s_cal_done; }
 bool foc_calibration_valid(void) { return s_cal_done && s_cal_valid; }
 
+uint32_t foc_adc_isr_count(void) { return s_adc_isr_count; }
+
 void foc_get_calibration_progress(uint32_t *count, uint32_t *target) {
     if (count != NULL) *count = s_cal_count;
     if (target != NULL) *target = ADC_OFFSET_CAL_SAMPLES;
@@ -66,8 +69,10 @@ void foc_request_recalibration(void) {
 
 void foc_control_init(void) {
     cal_reset_isr();
-    s_overrun_consecutive = 0U;
+    s_overrun_consecutive[0] = 0U;
+    s_overrun_consecutive[1] = 0U;
     s_inv_vbus_q30 = 0; s_inv_vbus_last_q15 = 0; s_inv_vbus_age = 0U;
+    s_adc_isr_count = 0U;
     s_vbus_scale_q16 = (int32_t)((DCLINK_V_PER_COUNT / FOC_VOLTAGE_Q_BASE_V) * 32768.0f * 65536.0f);
     s_vbus_min_q15 = (int32_t)((VBUS_MIN_RUN_V / FOC_VOLTAGE_Q_BASE_V) * 32768.0f);
     s_vbus_max_q15 = (int32_t)((VBUS_MAX_RUN_V / FOC_VOLTAGE_Q_BASE_V) * 32768.0f);
@@ -301,45 +306,9 @@ static void calibration_zero_fast_states(MotorRuntime *m) {
 }
 
 
-void foc_adc_dma_quick_guard_isr(const volatile uint32_t adc_words[4]) {
-    /* Liveness-shed path: keep only hard electrical protection and leave the
-     * previous PWM vector in place for one sample. No trigonometry, PI or
-     * telemetry is executed here. */
-    if (!s_cal_done || !s_cal_valid) return;
-
-    MotorRuntime *l = &g_motor_left;
-    MotorRuntime *r = &g_motor_right;
-    uint16_t l_u = low16(adc_words[0]), l_v = high16(adc_words[0]);
-    uint16_t r_u = low16(adc_words[1]), r_v = high16(adc_words[1]);
-    uint16_t vraw = low16(adc_words[3]);
-
-    int32_t lia = adc_current_to_q15(l_u, l->current_offset_u_counts, l->current_scale_q16);
-    int32_t lib = adc_current_to_q15(l_v, l->current_offset_v_counts, l->current_scale_q16);
-    int32_t lic = -(lia + lib);
-    int32_t ria = adc_current_to_q15(r_u, r->current_offset_u_counts, r->current_scale_q16);
-    int32_t rib = adc_current_to_q15(r_v, r->current_offset_v_counts, r->current_scale_q16);
-    int32_t ric = -(ria + rib);
-
-    int32_t l_trip = (l->abs_current_trip_q15 > 0) ? l->abs_current_trip_q15 : s_current_trip_q15;
-    int32_t r_trip = (r->abs_current_trip_q15 > 0) ? r->abs_current_trip_q15 : s_current_trip_q15;
-    if (iabs32(lia) > l_trip || iabs32(lib) > l_trip ||
-        iabs32(lic) > l_trip) {
-        motor_request_fault_from_isr(l, MOTOR_FAULT_ABS_OVER_CURRENT);
-    }
-    if (iabs32(ria) > r_trip || iabs32(rib) > r_trip ||
-        iabs32(ric) > r_trip) {
-        motor_request_fault_from_isr(r, MOTOR_FAULT_ABS_OVER_CURRENT);
-    }
-
-    int32_t vbus_q15 = (int32_t)(((int64_t)vraw * (int64_t)s_vbus_scale_q16) >> 16);
-    if (l->pwm_enabled && vbus_q15 > s_vbus_max_q15) motor_request_fault_from_isr(l, MOTOR_FAULT_OVER_VOLTAGE);
-    if (l->pwm_enabled && vbus_q15 < s_vbus_min_q15) motor_request_fault_from_isr(l, MOTOR_FAULT_UNDER_VOLTAGE);
-    if (r->pwm_enabled && vbus_q15 > s_vbus_max_q15) motor_request_fault_from_isr(r, MOTOR_FAULT_OVER_VOLTAGE);
-    if (r->pwm_enabled && vbus_q15 < s_vbus_min_q15) motor_request_fault_from_isr(r, MOTOR_FAULT_UNDER_VOLTAGE);
-}
-
-void foc_adc_dma_isr(const volatile uint32_t adc_words[4]) {
+void foc_adc_dma_isr(const volatile uint32_t adc_words[6]) {
     uint32_t start = DWT->CYCCNT;
+    s_adc_isr_count++;
     if (s_cal_request) cal_reset_isr();
 
     uint16_t l_u = low16(adc_words[0]), l_v = high16(adc_words[0]);
@@ -383,7 +352,7 @@ void foc_adc_dma_isr(const volatile uint32_t adc_words[4]) {
 
     int32_t vbus_q15 = (int32_t)(((int64_t)vraw * (int64_t)s_vbus_scale_q16) >> 16);
     /* Cortex-M3 integer divide is expensive. Vbus moves slowly relative to
-       16 kHz, so update its reciprocal only on meaningful change or timeout. */
+       the current loop, so cache its reciprocal and refresh only when needed. */
     int32_t dv = vbus_q15 - s_inv_vbus_last_q15; if (dv < 0) dv=-dv;
     if (vbus_q15 <= 256) { s_inv_vbus_q30=0; s_inv_vbus_last_q15=vbus_q15; s_inv_vbus_age=0U; }
     else if (s_inv_vbus_q30==0 || dv > 48 || ++s_inv_vbus_age >= 32U) {
@@ -391,31 +360,43 @@ void foc_adc_dma_isr(const volatile uint32_t adc_words[4]) {
         s_inv_vbus_last_q15=vbus_q15; s_inv_vbus_age=0U;
     }
     int32_t inv_vbus_q30=s_inv_vbus_q30;
-    foc_one_motor_isr(&g_motor_left,l_u,l_v,l_dc,vbus_q15,inv_vbus_q30);
-    foc_one_motor_isr(&g_motor_right,r_u,r_v,r_dc,vbus_q15,inv_vbus_q30);
-    debug_sample_capture_isr(&g_motor_left,&g_motor_right);
+
+    /* Current VESC dual-motor semantics: ADC fires in both V0/V7 halves and
+       only one motor executes the full FOC path per event. Upstream derives
+       the active motor from TIM1 direction. In this board TIM1=RIGHT and
+       TIM8=LEFT, therefore DIR=0 selects LEFT/TIM8 and DIR=1 RIGHT/TIM1. */
+    bool sample_left = (TIM1->CR1 & TIM_CR1_DIR) == 0U;
+    MotorRuntime *active;
+    if (sample_left) {
+        active = &g_motor_left;
+        foc_one_motor_isr(active,l_u,l_v,l_dc,vbus_q15,inv_vbus_q30);
+    } else {
+        active = &g_motor_right;
+        foc_one_motor_isr(active,r_u,r_v,r_dc,vbus_q15,inv_vbus_q30);
+    }
+    debug_sample_capture_isr(active);
 
     uint32_t cycles = DWT->CYCCNT - start;
-    if (cycles > g_motor_left.isr_max_cycles) g_motor_left.isr_max_cycles = cycles;
-    if (cycles > g_motor_right.isr_max_cycles) g_motor_right.isr_max_cycles = cycles;
-    /* One 16 kHz ADC/FOC update has CPU_CLOCK/PWM cycles available. At
-       64 MHz that is 4000 cycles. Previous revisions incorrectly divided by
-       two again and could report overrun at only ~2000 cycles. */
-    const uint32_t deadline_cycles = CPU_CLOCK_HZ / PWM_FREQUENCY_HZ;
-    if (cycles > (deadline_cycles * 85U) / 100U) {
-        g_motor_left.isr_overruns++;
-        g_motor_right.isr_overruns++;
+    if (cycles > active->isr_max_cycles) active->isr_max_cycles = cycles;
+
+    /* There are two ADC/FOC events per 16-kHz center-aligned PWM period, so
+       the hard return budget is 64MHz/32kHz = 2000 cycles. Each individual
+       motor is still updated at 16 kHz. */
+    const uint32_t slot_cycles = FOC_ISR_SLOT_CYCLES;
+    uint8_t mi = (active->id == MOTOR_RIGHT) ? 1U : 0U;
+    if (cycles > (slot_cycles * 85U) / 100U) {
+        active->isr_overruns++;
     }
 
-    /* The caller provides a one-sample liveness shed when the next DMA event
-       is already pending. Only an extreme >2-period execution is promoted to
-       a sticky internal fault. */
-    if (cycles > (deadline_cycles * 2U)) {
-        if (++s_overrun_consecutive >= 8U) {
-            motor_request_fault_from_isr(&g_motor_left, MOTOR_FAULT_FOC_ISR_OVERRUN);
-            motor_request_fault_from_isr(&g_motor_right, MOTOR_FAULT_FOC_ISR_OVERRUN);
+    /* Never intentionally skip a current-control event. Persistent >slot
+       execution is a real deadline fault, not something to hide with a shed
+       pass. Keep a short consecutive filter for occasional IRQ jitter. */
+    if (cycles > slot_cycles) {
+        if (s_overrun_consecutive[mi] < 255U) s_overrun_consecutive[mi]++;
+        if (s_overrun_consecutive[mi] >= 8U) {
+            motor_request_fault_from_isr(active, MOTOR_FAULT_FOC_ISR_OVERRUN);
         }
     } else {
-        s_overrun_consecutive = 0U;
+        s_overrun_consecutive[mi] = 0U;
     }
 }

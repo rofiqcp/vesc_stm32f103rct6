@@ -20,7 +20,6 @@ void SysTick_Handler(void) {
 }
 
 void DMA1_Channel1_IRQHandler(void) {
-    static bool shed_next = false;
     uint32_t isr = DMA1->ISR;
 
     if ((isr & DMA_ISR_TEIF1) != 0U) {
@@ -31,26 +30,23 @@ void DMA1_Channel1_IRQHandler(void) {
         return;
     }
 
-    /* The hard-real-time FOC loop executes at DMA half-transfer. No RTOS,
-       UART, printf or blocking HAL call is allowed in this path. */
+    /* VESC-style fast path: phase-current ranks are first in the circular DMA
+       buffer, so half-transfer is the earliest deterministic current-loop
+       entry. This ISR never calls kernel, UART, formatted-output, flash, or blocking HAL code. */
     if ((isr & DMA_ISR_HTIF1) != 0U) {
-        DMA1->IFCR = DMA_IFCR_CHTIF1 | DMA_IFCR_CTCIF1;
-
-        if (shed_next) {
-            shed_next = false;
-            foc_adc_dma_quick_guard_isr(g_adc_dual_dma);
-            return;
-        }
-
+        DMA1->IFCR = DMA_IFCR_CHTIF1;
         foc_adc_dma_isr(g_adc_dual_dma);
+    }
+}
 
-        /* If another half-transfer arrived while the full dual-motor FOC was
-         * still executing, the next immediate IRQ is intentionally shortened.
-         * This mirrors the liveness relief that fixed no-connect starvation in
-         * the known-working hoverboard VESC lineage. */
-        if ((DMA1->ISR & DMA_ISR_HTIF1) != 0U) {
-            shed_next = true;
-        }
+void TIM2_IRQHandler(void) {
+    /* Upstream mcpwm_foc uses the sampling timer CC2 interrupt only to generate
+       COM events for coherent TIM1/TIM8 compare preload transfer. Keep this
+       handler tiny and kernel-independent. */
+    if (((TIM2->SR & TIM_SR_CC2IF) != 0U) && ((TIM2->DIER & TIM_DIER_CC2IE) != 0U)) {
+        TIM1->EGR = TIM_EGR_COMG;
+        TIM8->EGR = TIM_EGR_COMG;
+        TIM2->SR &= ~TIM_SR_CC2IF;
     }
 }
 

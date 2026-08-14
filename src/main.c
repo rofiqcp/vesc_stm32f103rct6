@@ -8,6 +8,7 @@
 #include "debug_sample.h"
 #include "vesc_comm.h"
 #include "config_store.h"
+#include "vesc_config.h"
 #include "status_io.h"
 
 static void SystemClock_Config(void);
@@ -49,7 +50,7 @@ int main(void) {
     const osThreadAttr_t boot_attr = {
         .name = "motor_boot_thread",
         .priority = osPriorityBelowNormal,
-        .stack_size = 1024U
+        .stack_size = 2048U
     };
     if (osThreadNew(motor_boot_thread, NULL, &boot_attr) == NULL) {
         early_fatal();
@@ -70,9 +71,22 @@ static void motor_boot_thread(void *argument) {
      * this thread and must not globally disable USART interrupts. */
     motor_hw_init();
     motor_control_init();
-    /* V10 recovery rule: do not import the experimental V9 full-wire config
-     * during boot. The known-good V8 communication path must come up from
-     * compiled safe defaults first. Existing flash records are left untouched. */
+
+    /* V11 configuration is version-isolated from the experimental V9 record.
+     * Build the exact VESC-6.00 wire defaults, then import only a V11 CRC-valid
+     * record. Failure simply keeps compiled safe defaults; communication is
+     * already alive in the higher-priority packet thread. */
+    vesc_config_init_defaults();
+    bool loaded_cfg = config_store_load_apply();
+    if (!loaded_cfg) {
+        /* GET_MCCONF can legally arrive before this boot thread runs. In that
+           case vesc_config_init_defaults() intentionally built a safe wire
+           image without reading zeroed MotorRuntime. Now publish the actual
+           initialized runtime defaults before motor control is enabled. */
+        vesc_config_sync_motor_runtime(MOTOR_LEFT);
+        vesc_config_sync_motor_runtime(MOTOR_RIGHT);
+    }
+
     telemetry_init();
     debug_sample_init();
     motor_threads_init();

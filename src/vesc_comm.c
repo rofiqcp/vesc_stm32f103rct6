@@ -12,6 +12,7 @@
 #include "app_adc_port.h"
 #include "vesc_timeout.h"
 #include "config_store.h"
+#include "vesc_config.h"
 #include "cmsis_os2.h"
 #include <string.h>
 #include <math.h>
@@ -401,6 +402,18 @@ static void reply_current_cal(void) {
     put_i32(p, &i, g_motor_left.current_offset_u_counts); put_i32(p, &i, g_motor_left.current_offset_v_counts);
     put_i32(p, &i, g_motor_left.dc_current_offset_counts); put_i32(p, &i, g_motor_right.current_offset_u_counts);
     put_i32(p, &i, g_motor_right.current_offset_v_counts); put_i32(p, &i, g_motor_right.dc_current_offset_counts);
+    /* Optional V11 hardware-timing diagnostics. They are after the legacy
+       current-cal fields so older host tools can ignore them safely. */
+    put_u32(p, &i, foc_adc_isr_count());
+    put_u16(p, &i, (uint16_t)DMA1_Channel1->CNDTR);
+    put_u16(p, &i, (uint16_t)TIM2->CNT);
+    p[i++] = (TIM1->CR1 & TIM_CR1_DIR) ? 1U : 0U;
+    p[i++] = (TIM1->CR1 & TIM_CR1_CEN) ? 1U : 0U;
+    p[i++] = (TIM8->CR1 & TIM_CR1_CEN) ? 1U : 0U;
+    p[i++] = (TIM2->CR1 & TIM_CR1_CEN) ? 1U : 0U;
+    p[i++] = (ADC1->CR2 & ADC_CR2_ADON) ? 1U : 0U;
+    p[i++] = (ADC2->CR2 & ADC_CR2_ADON) ? 1U : 0U;
+    p[i++] = ((DMA1_Channel1->CCR & DMA_CCR_EN) != 0U) ? 1U : 0U;
     payload_end(i);
 }
 
@@ -466,6 +479,8 @@ static bool is_blocking_command(uint8_t cmd) {
         case COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP:
         case COMM_DETECT_APPLY_ALL_FOC:
         case COMM_PING_CAN:
+        case COMM_SET_MCCONF:
+        case COMM_SET_APPCONF:
             return true;
         default:
             return false;
@@ -482,6 +497,30 @@ static bool queue_blocking_job(const uint8_t *data, uint16_t len, motor_id_t id)
         return false;
     }
     return true;
+}
+
+static void reply_config_wire(uint8_t cmd, motor_id_t id, bool defaults) {
+    uint8_t *p = payload_begin();
+    if (p == NULL) return;
+    p[0] = cmd;
+    if (cmd == COMM_GET_MCCONF || cmd == COMM_GET_MCCONF_DEFAULT) {
+        const uint8_t *w = vesc_config_mc_wire(id, defaults);
+        memcpy(&p[1], w, VESC6_MCCONF_WIRE_SIZE);
+        payload_end((uint16_t)(1U + VESC6_MCCONF_WIRE_SIZE));
+    } else {
+        const uint8_t *w = vesc_config_app_wire(defaults);
+        memcpy(&p[1], w, VESC6_APPCONF_WIRE_SIZE);
+        /* VESC dual-motor semantics expose the second motor with its own
+           controller ID even though this port has one physical app instance.
+           APPCONF signature occupies bytes 0..3 and controller_id is byte 4. */
+        if (id == MOTOR_RIGHT) p[1U + 4U] = VESC_VIRTUAL_CAN_RIGHT_ID;
+        payload_end((uint16_t)(1U + VESC6_APPCONF_WIRE_SIZE));
+    }
+}
+
+static void reply_ack(uint8_t cmd) {
+    uint8_t p[1] = {cmd};
+    vesc_comm_send_payload(p, 1U);
 }
 
 static void reply_standard_detect(MotorRuntime *m, uint8_t command) {
@@ -523,6 +562,19 @@ static void reply_unsupported_detect(uint8_t cmd) {
     send_print("F103 V8: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
 }
 
+static bool ensure_current_calibration_valid(uint32_t timeout_ms) {
+    /* VESC detect-all performs DC offset calibration before reading/applying
+       motor parameters. Do the same for every motor-moving detect job. */
+    if (foc_calibration_valid()) return true;
+    if (foc_calibration_done()) foc_request_recalibration();
+    uint32_t start = osKernelGetTickCount();
+    while ((uint32_t)(osKernelGetTickCount() - start) < timeout_ms) {
+        if (foc_calibration_done()) return foc_calibration_valid();
+        osDelay(5U);
+    }
+    return false;
+}
+
 static bool wait_sensor_detect(MotorRuntime *m, uint32_t timeout_ms) {
     uint32_t start = osKernelGetTickCount();
     while ((uint32_t)(osKernelGetTickCount() - start) < timeout_ms) {
@@ -542,26 +594,60 @@ static void blocking_thread(void *argument) {
         if (job.cmd == COMM_PING_CAN) {
             uint8_t p[2] = {COMM_PING_CAN, VESC_VIRTUAL_CAN_RIGHT_ID};
             vesc_comm_send_payload(p, sizeof(p));
+        } else if (job.cmd == COMM_SET_MCCONF) {
+            bool ok = job.len == (1U + VESC6_MCCONF_WIRE_SIZE) &&
+                      vesc_config_set_mc_wire(m->id, &job.data[1],
+                                              (uint16_t)(job.len - 1U), true);
+            if (ok) reply_ack(COMM_SET_MCCONF);
+            else send_print("F103 V11: MCCONF rejected; motor must be OFF and VESC6 signature/layout valid.");
+        } else if (job.cmd == COMM_SET_APPCONF) {
+            bool ok = false;
+            if (job.len == (1U + VESC6_APPCONF_WIRE_SIZE)) {
+                uint8_t app_wire[VESC6_APPCONF_WIRE_SIZE];
+                memcpy(app_wire, &job.data[1], sizeof(app_wire));
+                /* Upstream ignores controller_id when APPCONF is written in
+                   second-motor context. Preserve physical local ID=1. */
+                if (m->id == MOTOR_RIGHT) app_wire[4] = VESC_CONTROLLER_ID_LEFT;
+                ok = vesc_config_set_app_wire(app_wire, sizeof(app_wire), true);
+            }
+            if (ok) reply_ack(COMM_SET_APPCONF);
+            else send_print("F103 V11: APPCONF rejected; VESC6 signature/layout invalid.");
         } else if (job.cmd == COMM_DETECT_ENCODER) {
             float current = (job.len >= 5U) ? (float)get_i32_be(&job.data[1]) / 1000.0f : SENSOR_DETECT_CURRENT_A;
-            bool started = (m->id == MOTOR_LEFT) && sensor_detect_request_current(m, SENSOR_MODE_ENCODER, fabsf(current));
+            bool cal_ok = ensure_current_calibration_valid(10000U);
+            bool started = cal_ok && (m->id == MOTOR_LEFT) && sensor_detect_request_current(m, SENSOR_MODE_ENCODER, fabsf(current));
             if (started) (void)wait_sensor_detect(m, 30000U);
             reply_standard_detect(m, COMM_DETECT_ENCODER);
         } else if (job.cmd == COMM_DETECT_HALL_FOC) {
             float current = (job.len >= 5U) ? (float)get_i32_be(&job.data[1]) / 1000.0f : SENSOR_DETECT_CURRENT_A;
-            bool started = sensor_detect_request_current(m, SENSOR_MODE_HALL, fabsf(current));
+            bool cal_ok = ensure_current_calibration_valid(10000U);
+            bool started = cal_ok && sensor_detect_request_current(m, SENSOR_MODE_HALL, fabsf(current));
             if (started) (void)wait_sensor_detect(m, 30000U);
             reply_standard_detect(m, COMM_DETECT_HALL_FOC);
+        } else if (job.cmd == COMM_DETECT_APPLY_ALL_FOC) {
+            /* Standards-correct VESC detect-all semantics:
+             * conf_general_detect_apply_all_foc() first measures real motor R/L
+             * and flux linkage, then applies current gains/limits and finally
+             * runs sensor detection. This reduced F103 port does not yet have
+             * validated physical R/L/flux measurement routines, so it MUST NOT
+             * report a Hall/encoder-only transaction as detect-all success.
+             * Upstream uses -10 for flux-linkage detection failure. Individual
+             * COMM_DETECT_HALL_FOC / COMM_DETECT_ENCODER below are fully usable
+             * and use forced-angle sensor-independent SVPWM. */
+            int16_t result = -10;
+            if (!ensure_current_calibration_valid(10000U)) {
+                result = -1;
+            } else {
+                send_print("F103 V11: full VESC Detect All requires validated R/L/flux measurement; use Hall/Encoder detect meanwhile.");
+            }
+            uint8_t p[3]; uint16_t i=0U; p[i++]=COMM_DETECT_APPLY_ALL_FOC; put_i16(p,&i,result);
+            vesc_comm_send_payload(p,i);
         } else {
             reply_unsupported_detect(job.cmd);
         }
     }
 }
 
-static void unsupported_config_command(uint8_t cmd) {
-    (void)cmd;
-    send_print("F103 V8: full VESC confgenerator MCCONF/APPCONF schema not present; config not acknowledged.");
-}
 
 static bool command_requires_motor_ready(uint8_t cmd) {
     switch (cmd) {
@@ -572,6 +658,8 @@ static bool command_requires_motor_ready(uint8_t cmd) {
         case COMM_SET_POS:
         case COMM_SET_HANDBRAKE:
         case COMM_SET_CURRENT_REL:
+        case COMM_SET_MCCONF:
+        case COMM_SET_APPCONF:
         case COMM_SAMPLE_PRINT:
         case COMM_DETECT_MOTOR_PARAM:
         case COMM_DETECT_MOTOR_R_L:
@@ -683,14 +771,20 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
                 else process_custom(&data[1], (uint16_t)(len - 1U), id);
             }
             break;
-        case COMM_SET_MCCONF:
         case COMM_GET_MCCONF:
-        case COMM_GET_MCCONF_DEFAULT:
-        case COMM_SET_APPCONF:
-        case COMM_GET_APPCONF:
-        case COMM_GET_APPCONF_DEFAULT:
-            unsupported_config_command(cmd);
+            reply_config_wire(COMM_GET_MCCONF, id, false);
             break;
+        case COMM_GET_MCCONF_DEFAULT:
+            reply_config_wire(COMM_GET_MCCONF_DEFAULT, id, true);
+            break;
+        case COMM_GET_APPCONF:
+            reply_config_wire(COMM_GET_APPCONF, id, false);
+            break;
+        case COMM_GET_APPCONF_DEFAULT:
+            reply_config_wire(COMM_GET_APPCONF_DEFAULT, id, true);
+            break;
+        /* SET_MCCONF/SET_APPCONF are queued above and handled by the blocking
+           worker because flash programming must never stall uartcomm parsing. */
         default:
             break;
     }
@@ -830,7 +924,7 @@ bool vesc_comm_task_init(void) {
         .name="packet_process_thread", .priority=osPriorityAboveNormal, .stack_size=1536U
     };
     const osThreadAttr_t block_attr = {
-        .name="blocking_thread", .priority=osPriorityNormal, .stack_size=1536U
+        .name="blocking_thread", .priority=osPriorityNormal, .stack_size=3072U
     };
 
     osThreadId_t packet_tp = osThreadNew(packet_process_thread, NULL, &packet_attr);

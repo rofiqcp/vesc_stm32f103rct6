@@ -177,12 +177,13 @@ static void periodic_thread(void *arg) {
     }
 }
 
-/* PB2 status patterns. This thread is created before motor_boot_thread, so it
- * proves that the MCU, 64 MHz clock and RTOS scheduler are alive even if the
- * ADC/PWM subsystem later fails.
- *   normal, no VESC packets : 1 Hz square heartbeat
- *   valid VESC traffic      : double-flash every second
- *   any motor fault         : fast 5 Hz blink
+/* PB2 status is motor/system state only. VESC traffic no longer changes the
+ * steady LED pattern; that V8/V10 diagnostic double-flash confused a healthy
+ * communication request with a fault/status condition.
+ *   boot/calibration or stopped-ready : 1 Hz heartbeat
+ *   motor running                     : 2 Hz heartbeat
+ *   detect/calibrate                  : double flash
+ *   any motor fault                   : fast 5 Hz blink
  */
 static void led_thread(void *arg) {
     (void)arg;
@@ -190,15 +191,18 @@ static void led_thread(void *arg) {
     for (;;) {
         bool fault = (g_motor_left.fault != MOTOR_FAULT_NONE) ||
                      (g_motor_right.fault != MOTOR_FAULT_NONE);
-        bool linked = status_io_vesc_link_recent(1500U);
+        bool detecting = g_motor_left.detect.busy || g_motor_right.detect.busy;
+        bool running = g_motor_left.pwm_enabled || g_motor_right.pwm_enabled;
         bool on;
 
         if (fault) {
-            on = (phase & 1U) == 0U;
-        } else if (linked) {
-            on = (phase == 0U || phase == 2U);
+            on = (phase & 1U) == 0U;                  /* 5 Hz */
+        } else if (detecting) {
+            on = (phase == 0U || phase == 2U);       /* double flash */
+        } else if (running) {
+            on = (phase < 2U) || (phase >= 5U && phase < 7U); /* 2 Hz-ish */
         } else {
-            on = phase < 5U;
+            on = phase < 5U;                         /* 1 Hz, 50% */
         }
 
         status_io_led(on);

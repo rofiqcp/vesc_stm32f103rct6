@@ -53,7 +53,7 @@ void debug_sample_start(motor_id_t motor, uint16_t len, uint16_t decimation) {
     debug_sample_start_ex(motor, len, decimation, false);
 }
 
-void debug_sample_capture_isr(MotorRuntime *left, MotorRuntime *right) {
+void debug_sample_capture_isr(MotorRuntime *active) {
     if (!s_active || s_ready) {
         return;
     }
@@ -61,7 +61,8 @@ void debug_sample_capture_isr(MotorRuntime *left, MotorRuntime *right) {
         return;
     }
     s_decim_count = 0U;
-    MotorRuntime *m = (s_motor == MOTOR_RIGHT) ? right : left;
+    if (active == NULL || active->id != s_motor) return;
+    MotorRuntime *m = active;
     uint16_t i = s_wr;
     if (i >= s_target_len) {
         s_active = false;
