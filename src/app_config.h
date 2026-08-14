@@ -68,10 +68,19 @@
 
 /* VESC-style boot current-offset calibration. */
 #define ADC_OFFSET_CAL_SAMPLES          4096U
-#define ADC_OFFSET_VALID_MIN_COUNT      500
-#define ADC_OFFSET_VALID_MAX_COUNT      3595
-#define ADC_OFFSET_MAX_SPREAD_COUNT     200U
-#define ADC_OFFSET_MAX_STDDEV_COUNT     12U
+/* V12 calibration policy:
+ * - VESC upstream calibrates by averaging current offsets and does not reject
+ *   a board merely because the raw ADC has modest PWM-synchronous noise.
+ * - Keep broad 12-bit rail/saturation and extreme-noise checks as HARD safety.
+ * - Keep tighter noise limits as WARNING diagnostics only.
+ * This avoids the V11 false-negative caused by stddev <= 12 counts while still
+ * refusing a disconnected/railed/violently noisy current-sense channel. */
+#define ADC_OFFSET_HARD_MIN_COUNT       128
+#define ADC_OFFSET_HARD_MAX_COUNT       3967
+#define ADC_OFFSET_WARN_SPREAD_COUNT    160U
+#define ADC_OFFSET_WARN_STDDEV_COUNT    16U
+#define ADC_OFFSET_HARD_SPREAD_COUNT    800U
+#define ADC_OFFSET_HARD_STDDEV_COUNT    80U
 #define ADC_OFFSET_TRACK_SHIFT          12U /* only when motor is OFF: 1/4096 */
 
 /* Low-pass only for telemetry/slow functions. The raw Id/Iq values remain the

@@ -9,11 +9,14 @@ Passive tests never command PWM. Motor-moving tests require --yes explicitly.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
+from datetime import datetime
 import math
 import struct
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -336,6 +339,39 @@ def parse_cal(p: bytes) -> dict:
         d["adc1_enabled"] = bool(r.u8())
         d["adc2_enabled"] = bool(r.u8())
         d["dma1_ch1_enabled"] = bool(r.u8())
+    # V12 detailed calibration diagnostics, appended after all legacy fields.
+    if len(p) - r.i >= 7:
+        d["cal_diag_revision"] = r.u8()
+        d["warn_mask"] = r.u16()
+        d["fail_range_mask"] = r.u16()
+        d["fail_noise_mask"] = r.u16()
+        names=["left_u","left_v","left_dc","right_u","right_v","right_dc"]
+        channels={}
+        for name in names:
+            if len(p) - r.i < 12: break
+            mean=r.i32(); mn=r.u16(); mx=r.u16(); var_x100=r.u32()
+            channels[name]={"mean":mean,"min":mn,"max":mx,"spread":mx-mn,
+                            "variance":var_x100/100.0,"stddev":math.sqrt(max(0.0,var_x100/100.0))}
+        d["channels"] = channels
+        reg_names=[
+            "rcc_cfgr",
+            "adc1_cr1","adc1_cr2","adc1_sqr1","adc1_sqr3",
+            "adc2_cr1","adc2_cr2","adc2_sqr1","adc2_sqr3",
+            "dma1_ch1_ccr","dma1_ch1_cndtr32","dma1_isr",
+            "tim1_cr1","tim1_arr","tim1_cnt","tim1_bdtr",
+            "tim8_cr1","tim8_arr","tim8_cnt","tim8_bdtr",
+            "tim2_cr1","tim2_smcr","tim2_ccr2","tim2_cnt32",
+        ]
+        regs={}
+        for name in reg_names:
+            if len(p)-r.i < 4: break
+            regs[name]=r.u32()
+        d["registers"] = regs
+        dma_words=[]
+        for _ in range(6):
+            if len(p)-r.i < 4: break
+            w=r.u32(); dma_words.append({"word":w,"adc1":w & 0xFFFF,"adc2":(w>>16)&0xFFFF})
+        if dma_words: d["dma_words"] = dma_words
     return d
 
 
@@ -502,31 +538,149 @@ def cmd_status(link: Link, args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_calibrate(link: Link, args: argparse.Namespace) -> int:
+def _calibration_channel_status(d: dict, idx: int, name: str) -> str:
+    bit=1<<idx
+    if d.get("fail_range_mask",0) & bit: return "FAIL_RANGE"
+    if d.get("fail_noise_mask",0) & bit: return "FAIL_NOISE"
+    if d.get("warn_mask",0) & bit: return "WARN_NOISE"
+    return "PASS"
+
+
+def _print_calibration_diagnostics(d: dict) -> None:
+    print("\n=== CURRENT CALIBRATION RESULT ===")
+    for k in ("done","valid","count","target","left_u","left_v","left_dc","right_u","right_v","right_dc"):
+        if k in d: print(f"{k:24s}: {d[k]}")
+    print("\n=== HARDWARE LIVENESS ===")
+    for k in ("adc_isr_count","dma_cndtr","tim2_cnt","tim1_dir","tim1_running","tim8_running","tim2_running",
+              "adc1_enabled","adc2_enabled","dma1_ch1_enabled"):
+        if k in d: print(f"{k:24s}: {d[k]}")
+    if "cal_diag_revision" in d:
+        print("\n=== V12 CALIBRATION STATISTICS ===")
+        print(f"diag_revision           : {d['cal_diag_revision']}")
+        print(f"warn_mask               : 0x{d.get('warn_mask',0):04X}")
+        print(f"fail_range_mask         : 0x{d.get('fail_range_mask',0):04X}")
+        print(f"fail_noise_mask         : 0x{d.get('fail_noise_mask',0):04X}")
+        print("channel      mean   min   max spread  stddev      status")
+        names=["left_u","left_v","left_dc","right_u","right_v","right_dc"]
+        for idx,name in enumerate(names):
+            c=d.get("channels",{}).get(name)
+            if not c: continue
+            print(f"{name:10s} {c['mean']:5d} {c['min']:5d} {c['max']:5d} {c['spread']:6d} {c['stddev']:8.3f}  {_calibration_channel_status(d,idx,name)}")
+        print("\nThreshold policy V12:")
+        print("  hard mean range       : 128..3967 ADC counts")
+        print("  warning noise         : spread >160 OR stddev >16 counts")
+        print("  hard noise failure    : spread >800 OR stddev >80 counts")
+        print("  warning does NOT inhibit PWM; hard failure does.")
+    regs=d.get("registers",{})
+    if regs:
+        print("\n=== RAW PERIPHERAL REGISTERS ===")
+        for k,v in regs.items(): print(f"{k:24s}: 0x{v:08X} ({v})")
+    if d.get("dma_words"):
+        print("\n=== ADC DUAL DMA RAW WORDS ===")
+        for idx,w in enumerate(d["dma_words"],1):
+            print(f"rank{idx}: word=0x{w['word']:08X} ADC1={w['adc1']:4d} ADC2={w['adc2']:4d}")
+
+
+def _cmd_calibrate_body(link: Link,args: argparse.Namespace)->int:
+    print(f"timestamp               : {datetime.now().isoformat(timespec='seconds')}")
+    print(f"port                    : {link.ser.port}")
+    print(f"baud                    : {link.ser.baudrate}")
     link.stop(0); link.stop(1); time.sleep(0.1)
     d=get_cal(link,trigger=True)
-    print("Kalibrasi dimulai; PWM kedua motor OFF.")
+    print("Calibration started; both motor PWM commands stopped.")
     deadline=time.monotonic()+args.timeout
+    history=[]
     while time.monotonic()<deadline:
         time.sleep(0.1)
         d=get_cal(link,False)
-        print(f"\rprogress {d['count']}/{d['target']} valid={d['valid']}",end='',flush=True)
+        history.append((time.monotonic(),d.get('adc_isr_count',0),d.get('dma_cndtr',-1),d.get('tim2_cnt',-1),d.get('count',0)))
         if d['done']: break
-    print()
-    print(d)
+    _print_calibration_diagnostics(d)
+    print("\n=== LIVENESS SAMPLES DURING CALIBRATION ===")
+    for j,(ts,isrc,cndtr,t2,cnt) in enumerate(history[-12:]):
+        print(f"sample[{j:02d}] cal={cnt:4d} adc_isr={isrc:10d} dma_cndtr={cndtr:3d} tim2_cnt={t2:5d}")
+    if len(history)>=2:
+        delta=history[-1][1]-history[0][1]
+        print(f"adc_isr_delta            : {delta}")
     if not d['done'] or not d['valid']:
-        print("FAIL: offset current tidak lolos validasi noise/range.")
+        print("\nRESULT: FAIL - calibration hard sanity check failed.")
         return 2
     time.sleep(0.4)
     ok=True
+    print("\n=== ZERO-CURRENT TELEMETRY AFTER CALIBRATION ===")
     for m in (0,1):
-        v=get_values(link,m)
-        print_values(m,v)
-        # This validates zero-current result, independent of the exact A/count gain.
-        if abs(v.id)>args.zero_limit or abs(v.iq)>args.zero_limit or abs(v.imotor)>args.zero_limit*1.5:
-            ok=False
-    print("PASS zero-current" if ok else "WARN/FAIL zero-current residual di atas limit")
+        try:
+            v=get_values(link,m); print_values(m,v)
+            e=get_extended(link,m); print("EXT:",e)
+            if abs(v.id)>args.zero_limit or abs(v.iq)>args.zero_limit or abs(v.imotor)>args.zero_limit*1.5:
+                ok=False
+        except Exception as exc:
+            ok=False; print(f"M{m} telemetry error: {exc}")
+    print("\nRESULT:", "PASS zero-current" if ok else "WARN/FAIL zero-current residual/telemetry")
     return 0 if ok else 3
+
+
+def _default_txt(prefix: str) -> Path:
+    return Path(f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+
+
+def cmd_calibrate(link: Link,args: argparse.Namespace)->int:
+    path=Path(getattr(args,"out",None) or _default_txt("v12_calibration_debug"))
+    path.parent.mkdir(parents=True,exist_ok=True)
+    rc=1
+    with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
+        try:
+            rc=_cmd_calibrate_body(link,args)
+        except Exception:
+            print("\n=== EXCEPTION ===")
+            traceback.print_exc()
+            rc=1
+    print(f"DEBUG TXT: {path.resolve()}")
+    print(f"RESULT CODE: {rc}")
+    return rc
+
+
+def cmd_diagnose(link: Link,args: argparse.Namespace)->int:
+    path=Path(getattr(args,"out",None) or _default_txt("v12_full_debug"))
+    path.parent.mkdir(parents=True,exist_ok=True)
+    rc=0
+    with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
+        try:
+            print("V12 STM32F103RCT6 FULL PASSIVE DEBUG REPORT")
+            print("timestamp:",datetime.now().isoformat(timespec='seconds'))
+            print("port:",link.ser.port,"baud:",link.ser.baudrate)
+            print("\n=== FIRMWARE ===")
+            cmd_info(link,args)
+            print("\n=== COMM DMA ===")
+            cmd_comm_diag(link,args)
+            print("\n=== PRE-CAL HARDWARE SNAPSHOT ===")
+            pre=get_cal(link,False); _print_calibration_diagnostics(pre)
+            print("\n=== RECALIBRATION ===")
+            cal_args=argparse.Namespace(timeout=args.timeout,zero_limit=args.zero_limit,out=None)
+            # Call the body directly so the whole report stays in this one TXT.
+            cr=_cmd_calibrate_body(link,cal_args)
+            if cr != 0: rc=cr
+            print("\n=== SENSOR STATE ===")
+            for m in (0,1):
+                try:
+                    print(("LEFT" if m==0 else "RIGHT"),get_sensor(link,m))
+                except Exception as exc: print(f"sensor M{m} error: {exc}")
+            print("\n=== FINAL TELEMETRY SNAPSHOTS ===")
+            for sample in range(5):
+                print(f"-- snapshot {sample} --")
+                for m in (0,1):
+                    try:
+                        print_values(m,get_values(link,m)); print("EXT:",get_extended(link,m))
+                    except Exception as exc: print(f"M{m}: {exc}")
+                time.sleep(0.2)
+            print("\n=== FINAL COMM DMA ===")
+            cmd_comm_diag(link,args)
+        except Exception:
+            print("\n=== EXCEPTION ===")
+            traceback.print_exc(); rc=1
+    print(f"DEBUG TXT: {path.resolve()}")
+    print(f"RESULT CODE: {rc}")
+    return rc
 
 
 def cmd_sensor_info(link: Link,args: argparse.Namespace)->int:
@@ -856,11 +1010,11 @@ def self_test() -> int:
     assert Link.standard_route(0,payload)==payload
     assert Link.standard_route(1,payload)==bytes((COMM_FORWARD_CAN,2))+payload
     fw=(bytes((COMM_FW_VERSION,6,0))+b"HOVERBOARD_DUAL_FOC\x00"+bytes(range(12))+
-        bytes((1,0,0,0,0,0,0,0))+b"hoverboard-vesc6-rtos-v9\x00")
+        bytes((1,0,0,0,0,0,0,0))+b"hoverboard-vesc6-rtos-v12\x00")
     fwd=parse_fw_version(fw)
     assert fwd["major"]==6 and fwd["minor"]==0
     assert fwd["hw_name"]=="HOVERBOARD_DUAL_FOC"
-    assert fwd["fw_name"].endswith("v9") and fwd["hw_crc"] is None
+    assert fwd["fw_name"].endswith("v12") and fwd["hw_crc"] is None
     vals=[1.0,-2.0,3.25,4.0,5.0,6.0,7.0,8.0,16000.0]
     samp=bytes((COMM_SAMPLE_PRINT,))+be_i16(3)+b''.join(struct.pack(">f",x) for x in vals)+bytes((0,123))+be_i32(3)
     idx,row=parse_sample_packet(samp)
@@ -890,7 +1044,8 @@ def main() -> int:
     sp("config-save",cmd_config_save,"save runtime Hall/encoder/PID/timeout config to flash")
     p=sp("status",cmd_status,"standard VESC telemetry + extended telemetry"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("monitor",cmd_monitor,"monitor both motors"); p.add_argument("--hz",type=float,default=5); p.add_argument("--seconds",type=float,default=10)
-    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--zero-limit",type=float,default=0.30)
+    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration and write TXT only"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v12_calibration_debug_TIMESTAMP.txt")
+    p=sp("diagnose",cmd_diagnose,"full passive V12 diagnostic; writes one TXT report"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v12_full_debug_TIMESTAMP.txt")
     p=sp("sensor-info",cmd_sensor_info,"show runtime Hall/encoder state"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("sensor-select",cmd_sensor_select,"live switch Hall/encoder while stopped"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["hall","encoder"],required=True)
     p=sp("sensor-detect",cmd_sensor_detect,"forced-angle Hall/encoder autodetect"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto"); p.add_argument("--timeout",type=float,default=15); p.add_argument("--yes",action="store_true")

@@ -414,6 +414,28 @@ static void reply_current_cal(void) {
     p[i++] = (ADC1->CR2 & ADC_CR2_ADON) ? 1U : 0U;
     p[i++] = (ADC2->CR2 & ADC_CR2_ADON) ? 1U : 0U;
     p[i++] = ((DMA1_Channel1->CCR & DMA_CCR_EN) != 0U) ? 1U : 0U;
+
+    /* V12 detailed calibration diagnostics. Keep legacy fields first. */
+    foc_cal_diag_t cd; foc_get_calibration_diag(&cd);
+    p[i++] = 12U; /* calibration diagnostic revision */
+    put_u16(p, &i, cd.warn_mask);
+    put_u16(p, &i, cd.fail_range_mask);
+    put_u16(p, &i, cd.fail_noise_mask);
+    for (uint8_t k=0U;k<6U;k++) {
+        put_i32(p, &i, cd.ch[k].mean);
+        put_u16(p, &i, cd.ch[k].min);
+        put_u16(p, &i, cd.ch[k].max);
+        put_u32(p, &i, cd.ch[k].variance_x100);
+    }
+    /* Register snapshots make TIM2/ADC/DMA activity auditable from one txt. */
+    put_u32(p, &i, RCC->CFGR);
+    put_u32(p, &i, ADC1->CR1); put_u32(p, &i, ADC1->CR2); put_u32(p, &i, ADC1->SQR1); put_u32(p, &i, ADC1->SQR3);
+    put_u32(p, &i, ADC2->CR1); put_u32(p, &i, ADC2->CR2); put_u32(p, &i, ADC2->SQR1); put_u32(p, &i, ADC2->SQR3);
+    put_u32(p, &i, DMA1_Channel1->CCR); put_u32(p, &i, DMA1_Channel1->CNDTR); put_u32(p, &i, DMA1->ISR);
+    put_u32(p, &i, TIM1->CR1); put_u32(p, &i, TIM1->ARR); put_u32(p, &i, TIM1->CNT); put_u32(p, &i, TIM1->BDTR);
+    put_u32(p, &i, TIM8->CR1); put_u32(p, &i, TIM8->ARR); put_u32(p, &i, TIM8->CNT); put_u32(p, &i, TIM8->BDTR);
+    put_u32(p, &i, TIM2->CR1); put_u32(p, &i, TIM2->SMCR); put_u32(p, &i, TIM2->CCR2); put_u32(p, &i, TIM2->CNT);
+    for (uint8_t k=0U;k<6U;k++) put_u32(p, &i, g_adc_dual_dma[k]);
     payload_end(i);
 }
 

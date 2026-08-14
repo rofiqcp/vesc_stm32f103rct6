@@ -1,6 +1,6 @@
-# V11 — VESC Timing / ADC-DMA Recovery for STM32F103RCT6
+# V12 — VESC Timing / ADC-DMA Recovery for STM32F103RCT6
 
-V11 keeps the **known-working V8 VESC Tool transport frozen** and repairs the motor-side timing and data path to follow the current VESC FOC execution model as closely as practical on STM32F103RCT6 + STM32 HAL + CMSIS-RTOS2.
+V12 keeps the **known-working V8 VESC Tool transport frozen** and repairs the motor-side timing and data path to follow the current VESC FOC execution model as closely as practical on STM32F103RCT6 + STM32 HAL + CMSIS-RTOS2.
 
 ## Frozen communication path
 
@@ -12,7 +12,7 @@ V11 keeps the **known-working V8 VESC Tool transport frozen** and repairs the mo
 
 The four V8 transport files are protected by `audit/V8_TRANSPORT_FROZEN.sha256`.
 
-## V11 motor timing path
+## V12 motor timing path
 
 ```
 TIM1 RIGHT, center aligned 16 kHz, master TRGO=ENABLE
@@ -67,4 +67,4 @@ python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0 --baud 115200 --timeout
 
 The calibration diagnostic reports ADC-FOC ISR count, DMA CNDTR, TIM1/TIM8/TIM2 running state, ADC1/ADC2 enable and DMA1_CH1 enable. `adc_isr_count` must continuously increase before motor commands can be expected to produce torque.
 
-See `V11_VESC_F103_TIMING.md` and `FIRST_POWER_TEST.md` before applying motor power.
+See `V12_VESC_F103_TIMING.md` and `FIRST_POWER_TEST.md` before applying motor power.

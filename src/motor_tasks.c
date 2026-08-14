@@ -69,6 +69,11 @@ static void current_cal_thread(void *arg) {
             }
             if (foc_calibration_valid()) {
                 fault_reported = false;
+                /* CURRENT_OFFSET is recoverable. V11 left this fault latched
+                   after a successful re-calibration, which could keep MOE
+                   inhibited forever. Never clear unrelated electrical faults. */
+                if (g_motor_left.fault == MOTOR_FAULT_CURRENT_OFFSET) motor_clear_fault(&g_motor_left);
+                if (g_motor_right.fault == MOTOR_FAULT_CURRENT_OFFSET) motor_clear_fault(&g_motor_right);
             }
         }
         osDelayUntil(next);
