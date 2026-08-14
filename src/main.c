@@ -8,7 +8,6 @@
 #include "debug_sample.h"
 #include "vesc_comm.h"
 #include "config_store.h"
-#include "vesc_config.h"
 #include "status_io.h"
 
 static void SystemClock_Config(void);
@@ -71,8 +70,9 @@ static void motor_boot_thread(void *argument) {
      * this thread and must not globally disable USART interrupts. */
     motor_hw_init();
     motor_control_init();
-    vesc_config_init_defaults();
-    (void)config_store_load_apply();
+    /* V10 recovery rule: do not import the experimental V9 full-wire config
+     * during boot. The known-good V8 communication path must come up from
+     * compiled safe defaults first. Existing flash records are left untouched. */
     telemetry_init();
     debug_sample_init();
     motor_threads_init();

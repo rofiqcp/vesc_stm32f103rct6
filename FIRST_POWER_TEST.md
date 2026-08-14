@@ -1,22 +1,78 @@
-# V9 first controlled motor test
+# First Power / VESC Connection Test — V8
 
-Communication is the proven V8 path. Do not start with high current.
-
-1. Flash V9, power the board current-limited if possible.
-2. Confirm PB2 heartbeat and the startup buzzer melody.
-3. Confirm VESC Tool connects at 115200 and reads FW 6.00 / `HOVERBOARD_DUAL_FOC`.
-4. With wheels lifted, confirm RT data Vbus and zero-current offsets look plausible.
-5. For Hall mode, rotate each wheel by hand and verify six Hall states before torque.
-6. For LEFT Encoder AB, configure the correct **quadrature CPR**, then run encoder detection/alignment. Do not use encoder torque until sync succeeds.
-7. Test command order at low limits: CURRENT -> DUTY -> RPM -> POS. Position is meaningful only with a valid position source; LEFT AB needs the current boot's alignment.
-8. Read Motor Config back in VESC Tool after Write, power-cycle, reconnect, and confirm the saved fields return.
-9. Repeat for App Config. UART transport intentionally remains fixed at USART3/115200 DMA even if an APPCONF field requests another UART mode.
-10. Verify RIGHT through virtual CAN ID 2 separately.
-
-Recommended debug command:
+## 1. Build
 
 ```bash
-python3 debug_vesc_f103.py motor-test --port /dev/ttyUSB0 --motor 0 --mode current --value 1.0 --seconds 2 --yes
+pio run -t clean
+pio run
 ```
 
-Then low duty/RPM only after current and sensor direction are verified. Always scope complementary PWM/dead-time and confirm current polarity before increasing limits.
+## 2. Flash with motors unloaded/current-limited
+
+```bash
+pio run -t upload
+```
+
+## 3. Observe PB2 and PA4 before connecting VESC Tool
+
+Expected sequence:
+
+- PB2 LED turns ON very early after reset.
+- After the RTOS scheduler starts, PA4 buzzer plays 3 ascending notes.
+- PB2 becomes a 1 Hz heartbeat (500 ms ON / 500 ms OFF).
+
+Interpretation:
+
+- no PB2 at all: wrong firmware/flash/reset/power/pin issue before normal boot;
+- PB2 solid but no melody/heartbeat: firmware reached early GPIO but failed before scheduler/status threads;
+- melody + heartbeat: MCU clock, RTOS and status subsystem are running.
+
+## 4. Raw handshake first
+
+Close VESC Tool so the serial port is free, then run:
+
+```bash
+python3 debug_vesc_f103.py handshake \
+  --port /dev/ttyUSB0 \
+  --baud 115200 \
+  --attempts 10
+```
+
+Exact host request is:
+
+```text
+02 01 00 00 00 03
+```
+
+Expected V8 response payload begins with:
+
+```text
+00 06 00 48 4F 56 45 52 42 4F 41 52 44 5F 44 55 41 4C 5F 46 4F 43 00 ...
+```
+
+When a valid VESC frame is decoded, PB2 changes temporarily to the double-flash link pattern. This creates a useful split diagnosis:
+
+- heartbeat stays normal during handshake attempts: RX DMA / PB11 / port / baud path did not produce a valid frame;
+- PB2 double-flashes but PC receives no frame: RX + framing already work; focus on TX queue / DMA1_CH2 / PB10 / USB-UART RX;
+- script prints PASS: physical UART + packet + CRC + FW_VERSION round trip works.
+
+## 5. Only after raw handshake PASS, open VESC Tool
+
+Use the same serial port at 115200 baud.
+
+## 6. Verify virtual CAN RIGHT
+
+```bash
+python3 debug_vesc_f103.py can-scan --port /dev/ttyUSB0
+```
+
+Expected: virtual node 2 and forwarded RIGHT `COMM_FW_VERSION` reply.
+
+## 7. Passive motor checks
+
+```bash
+python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0
+python3 debug_vesc_f103.py status --port /dev/ttyUSB0
+```
+
+Then sensor detect/save/sample can be tested only after passive values are sane.
