@@ -78,3 +78,22 @@ The V7 audit verifies:
 - LEFT local / RIGHT virtual CAN routing remains present.
 
 Hardware waveform validation on PB10/PB11 is still required after flashing.
+
+## V8 hoverboard-proven transport validation
+
+Host validation command:
+
+```bash
+./tests/host/run_v8.sh
+```
+
+Expected:
+
+```text
+test_packet_v8: PASS
+audit_v8_rofiq_transport: PASS
+SELF-TEST PASS: CRC, framing, V8 VESC-6.00 FW parser, virtual-CAN routing, standard sample parser
+V8 host/audit tests: ALL PASS
+```
+
+The V8 audit checks 64 MHz HSI PLL, PB10/PB11 USART3, RX DMA1_CH3 circular, TX DMA1_CH2 queue, USART3 IRQ disabled in the normal path, known VESC-6.00 FW_VERSION layout, virtual CAN RIGHT ID 2, PB2/PA4/PA5 status hardware, ADC/FOC DMA1_CH1 retention, and ISR liveness relief.

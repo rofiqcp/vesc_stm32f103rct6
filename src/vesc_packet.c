@@ -45,8 +45,8 @@ static int try_decode(const uint8_t *b, uint16_t available,
         }
         payload_len = ((uint32_t)b[1] << 8) | b[2];
         header = 3U;
-        /* Current upstream packet.c rejects non-canonical long headers. */
-        if (payload_len < 255U) return -1;
+        /* The proven hoverboard VESC transport accepts either valid 16-bit
+         * length prefix form as long as payload size is in range. */
     } else {
         /* PACKET_MAX_PL_LEN is 512, therefore upstream compiles support for
          * 8-bit and 16-bit length prefixes only; start byte 4 is not valid. */

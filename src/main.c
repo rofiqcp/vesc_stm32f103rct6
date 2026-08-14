@@ -8,6 +8,7 @@
 #include "debug_sample.h"
 #include "vesc_comm.h"
 #include "config_store.h"
+#include "status_io.h"
 
 static void SystemClock_Config(void);
 static void dwt_init(void);
@@ -17,8 +18,13 @@ static void motor_boot_thread(void *argument);
 int main(void) {
     HAL_Init();
     HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
+
+    /* PB2 LED + PA4 buzzer + PA5 power-hold are alive before PLL/motor init. */
+    status_io_early_gpio_init();
+
     SystemClock_Config();
     dwt_init();
+    status_io_tone_timer_init();
 
     /* Handshake-first boot architecture.
      *
@@ -28,6 +34,11 @@ int main(void) {
      * all motor hardware startup from a lower-priority boot thread after the
      * scheduler is already running. */
     if (osKernelInitialize() != osOK) {
+        early_fatal();
+    }
+
+    /* LED and buzzer threads start independently of motor/ADC startup. */
+    if (!status_threads_init()) {
         early_fatal();
     }
 
@@ -82,13 +93,14 @@ static void SystemClock_Config(void) {
     RCC_OscInitTypeDef osc = {0};
     RCC_ClkInitTypeDef clk = {0};
 
-    osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-    osc.HSEState = RCC_HSE_ON;
-    osc.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+    /* Hoverboard mainboard reference clock: internal HSI / 2 * 16 = 64 MHz.
+     * Do not depend on an external HSE crystal that may not exist on the board. */
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSI;
     osc.HSIState = RCC_HSI_ON;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
     osc.PLL.PLLState = RCC_PLL_ON;
-    osc.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-    osc.PLL.PLLMUL = RCC_PLL_MUL9;
+    osc.PLL.PLLSource = RCC_PLLSOURCE_HSI_DIV2;
+    osc.PLL.PLLMUL = RCC_PLL_MUL16;
     if (HAL_RCC_OscConfig(&osc) != HAL_OK) {
         early_fatal();
     }
@@ -102,9 +114,11 @@ static void SystemClock_Config(void) {
     if (HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_2) != HAL_OK) {
         early_fatal();
     }
+
+    SystemCoreClockUpdate();
 }
 
 static void early_fatal(void) {
-    __disable_irq();
-    while (1) { }
+    /* Keep interrupts/tick alive so PB2/PA4 visibly report an early failure. */
+    status_io_early_fatal_loop();
 }

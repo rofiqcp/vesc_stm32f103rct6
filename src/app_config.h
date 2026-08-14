@@ -2,7 +2,7 @@
 
 
 /* ===================== CLOCK / PWM ===================== */
-#define CPU_CLOCK_HZ                    72000000UL
+#define CPU_CLOCK_HZ                    64000000UL
 #define PWM_FREQUENCY_HZ                16000UL
 #define PWM_TIMER_ARR                   (CPU_CLOCK_HZ / (2UL * PWM_FREQUENCY_HZ))
 #define PWM_DEADTIME_NS                 800UL
@@ -120,8 +120,10 @@
 #define SAMPLE_BUFFER_LEN               256U
 #define SAMPLE_DEFAULT_DECIMATION       8U
 
-/* OFF pin is assumed ACTIVE-HIGH: HIGH disables gate-power, LOW enables. */
-#define OFF_PIN_ACTIVE_HIGH             1
+/* PA5 is the hoverboard power-latch/OFF control. HIGH keeps the controller
+ * powered, as in the known-working hoverboard firmware. Bridge enable/disable
+ * is performed only with TIM1/TIM8 MOE. */
+#define OFF_PIN_POWER_HOLD_HIGH          1
 
 /* ===================== VESC DUAL-MOTOR IDENTITY =====================
  * UART is always motor-left/local. Motor-right is exposed through the exact

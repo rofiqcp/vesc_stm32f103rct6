@@ -67,16 +67,9 @@ static void init_gpio(void) {
             RIGHT_U_CUR_PIN | RIGHT_V_CUR_PIN | DCLINK_PIN;
     HAL_GPIO_Init(GPIOC, &g);
 
-    /* LED, buzzer, OFF */
-    g.Mode = GPIO_MODE_OUTPUT_PP;
-    g.Speed = GPIO_SPEED_FREQ_LOW;
-    g.Pin = LED_PIN;
-    HAL_GPIO_Init(LED_PORT, &g);
-    g.Pin = BUZZER_PIN | OFF_PIN;
-    HAL_GPIO_Init(GPIOA, &g);
-    motor_hw_led(false);
-    motor_hw_buzzer(false);
-    motor_hw_gate_global(false);
+    /* PB2 LED, PA4 buzzer and PA5 power-hold are initialized before the
+       RTOS/motor subsystem by status_io_early_gpio_init(). Do not reset them
+       here; they are our boot-liveness indicators. */
 
     /* Button */
     g.Mode = GPIO_MODE_INPUT;
@@ -213,7 +206,7 @@ static void init_adc_dma(void) {
     __HAL_RCC_ADC2_CLK_ENABLE();
     __HAL_RCC_DMA1_CLK_ENABLE();
 
-    /* 72 MHz / 6 = 12 MHz ADC clock, within STM32F103 specification. */
+    /* 64 MHz / 6 = 10.67 MHz ADC clock, within STM32F103 specification. */
     __HAL_RCC_ADC_CONFIG(RCC_ADCPCLK2_DIV6);
 
     hadc1.Instance = ADC1;
@@ -348,11 +341,11 @@ void motor_hw_set_pwm_duty(MotorRuntime *m, float du, float dv, float dw) {
 }
 
 void motor_hw_gate_global(bool enable) {
-#if OFF_PIN_ACTIVE_HIGH
-    HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, enable ? GPIO_PIN_RESET : GPIO_PIN_SET);
-#else
-    HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, enable ? GPIO_PIN_SET : GPIO_PIN_RESET);
-#endif
+    (void)enable;
+    /* PA5 is NOT the MOSFET gate-enable on this hoverboard mainboard. Holding
+     * it HIGH keeps board power latched. TIM1/TIM8 MOE is the only bridge gate
+     * enable used by this firmware. */
+    HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
 }
 
 uint8_t motor_hw_read_hall_raw(motor_id_t id) {

@@ -10,6 +10,7 @@
 #include "app_config.h"
 #include "app_adc_port.h"
 #include "vesc_timeout.h"
+#include "status_io.h"
 #include <stddef.h>
 
 /* CMSIS-RTOS2 equivalents of the requested VESC-style threads.
@@ -24,6 +25,8 @@ static osThreadId_t fault_stop_tp;
 static osThreadId_t stat_thread_tp;
 static osThreadId_t periodic_thread_tp;
 static osThreadId_t led_thread_tp;
+static osThreadId_t buzzer_thread_tp;
+static bool status_threads_started = false;
 
 static void current_cal_thread(void *arg);
 static void timer_thread(void *arg);
@@ -34,6 +37,7 @@ static void fault_stop_thread(void *arg);
 static void stat_thread(void *arg);
 static void periodic_thread(void *arg);
 static void led_thread(void *arg);
+static void buzzer_thread(void *arg);
 
 void motor_threads_fault_signal(motor_id_t id) {
     if (fault_stop_tp != NULL) {
@@ -136,7 +140,8 @@ static void sample_send_thread(void *arg) {
 }
 
 /* Software side of fault handling. Hardware MOE is already dropped from the
- * fault/FOC path before this thread runs. */
+ * fault/FOC path before this thread runs. Audible reporting is owned by the
+ * independent buzzer_thread so fault handling itself never blocks on beeps. */
 static void fault_stop_thread(void *arg) {
     (void)arg;
     const uint32_t mask = (1UL << MOTOR_LEFT) | (1UL << MOTOR_RIGHT);
@@ -145,9 +150,6 @@ static void fault_stop_thread(void *arg) {
         if ((f & osFlagsError) != 0U) continue;
         if ((f & (1UL << MOTOR_LEFT)) != 0U) motor_hw_set_pwm_enabled(&g_motor_left, false);
         if ((f & (1UL << MOTOR_RIGHT)) != 0U) motor_hw_set_pwm_enabled(&g_motor_right, false);
-        motor_hw_buzzer(true);
-        osDelay(40U);
-        motor_hw_buzzer(false);
     }
 }
 
@@ -175,17 +177,123 @@ static void periodic_thread(void *arg) {
     }
 }
 
-/* Dedicated status LED thread, kept separate as requested. */
+/* PB2 status patterns. This thread is created before motor_boot_thread, so it
+ * proves that the MCU, 64 MHz clock and RTOS scheduler are alive even if the
+ * ADC/PWM subsystem later fails.
+ *   normal, no VESC packets : 1 Hz square heartbeat
+ *   valid VESC traffic      : double-flash every second
+ *   any motor fault         : fast 5 Hz blink
+ */
 static void led_thread(void *arg) {
     (void)arg;
-    bool state = false;
+    uint8_t phase = 0U;
     for (;;) {
         bool fault = (g_motor_left.fault != MOTOR_FAULT_NONE) ||
                      (g_motor_right.fault != MOTOR_FAULT_NONE);
-        state = !state;
-        motor_hw_led(state);
-        osDelay(fault ? 100U : 500U);
+        bool linked = status_io_vesc_link_recent(1500U);
+        bool on;
+
+        if (fault) {
+            on = (phase & 1U) == 0U;
+        } else if (linked) {
+            on = (phase == 0U || phase == 2U);
+        } else {
+            on = phase < 5U;
+        }
+
+        status_io_led(on);
+        phase++;
+        if (phase >= 10U) phase = 0U;
+        osDelay(100U);
     }
+}
+
+static motor_fault_t audible_fault(void) {
+    motor_fault_t a = g_motor_left.fault;
+    motor_fault_t b = g_motor_right.fault;
+    /* Prefer safety-critical faults when both sides report something. */
+    motor_fault_t order[] = {
+        MOTOR_FAULT_ABS_OVER_CURRENT,
+        MOTOR_FAULT_ADC_DMA,
+        MOTOR_FAULT_FOC_ISR_OVERRUN,
+        MOTOR_FAULT_OVER_VOLTAGE,
+        MOTOR_FAULT_UNDER_VOLTAGE,
+        MOTOR_FAULT_CURRENT_OFFSET,
+        MOTOR_FAULT_HALL_INVALID,
+        MOTOR_FAULT_SENSOR_DETECT,
+        MOTOR_FAULT_COMMAND_TIMEOUT
+    };
+    for (uint8_t i = 0U; i < (uint8_t)(sizeof(order) / sizeof(order[0])); i++) {
+        if (a == order[i] || b == order[i]) return order[i];
+    }
+    return MOTOR_FAULT_NONE;
+}
+
+static void beep_once(uint16_t hz, uint32_t on_ms, uint32_t off_ms) {
+    status_io_tone_start(hz);
+    osDelay(on_ms);
+    status_io_tone_stop();
+    if (off_ms != 0U) osDelay(off_ms);
+}
+
+static void startup_melody(void) {
+    /* Three ascending notes: unmistakable indication that the scheduler and
+     * dedicated buzzer thread are running. */
+    beep_once(900U, 90U, 45U);
+    beep_once(1350U, 90U, 45U);
+    beep_once(1900U, 140U, 0U);
+}
+
+static void fault_pattern(motor_fault_t f) {
+    uint8_t count = 1U;
+    uint16_t hz = 1200U;
+    switch (f) {
+        case MOTOR_FAULT_UNDER_VOLTAGE:    count = 2U; hz = 900U;  break;
+        case MOTOR_FAULT_OVER_VOLTAGE:     count = 2U; hz = 2600U; break;
+        case MOTOR_FAULT_ABS_OVER_CURRENT: count = 3U; hz = 3000U; break;
+        case MOTOR_FAULT_HALL_INVALID:
+        case MOTOR_FAULT_SENSOR_DETECT:    count = 4U; hz = 1700U; break;
+        case MOTOR_FAULT_CURRENT_OFFSET:
+        case MOTOR_FAULT_ADC_DMA:          count = 5U; hz = 1200U; break;
+        case MOTOR_FAULT_FOC_ISR_OVERRUN:  count = 6U; hz = 2200U; break;
+        case MOTOR_FAULT_COMMAND_TIMEOUT:  count = 1U; hz = 1100U; break;
+        default:                           count = 1U; hz = 1500U; break;
+    }
+    for (uint8_t i = 0U; i < count; i++) {
+        beep_once(hz, 120U, 120U);
+    }
+}
+
+static void buzzer_thread(void *arg) {
+    (void)arg;
+    startup_melody();
+    for (;;) {
+        motor_fault_t f = audible_fault();
+        if (f == MOTOR_FAULT_NONE) {
+            status_io_tone_stop();
+            osDelay(100U);
+            continue;
+        }
+        fault_pattern(f);
+        osDelay(1800U);
+    }
+}
+
+bool status_threads_init(void) {
+    if (status_threads_started) return led_thread_tp != NULL && buzzer_thread_tp != NULL;
+    status_threads_started = true;
+
+    const osThreadAttr_t led_attr = {
+        .name="led_thread", .priority=osPriorityNormal, .stack_size=384U
+    };
+    const osThreadAttr_t buzzer_attr = {
+        .name="buzzer_thread", .priority=osPriorityNormal, .stack_size=448U
+    };
+    led_thread_tp = osThreadNew(led_thread, NULL, &led_attr);
+    buzzer_thread_tp = osThreadNew(buzzer_thread, NULL, &buzzer_attr);
+    (void)led_thread_tp;
+    (void)buzzer_thread_tp;
+    return led_thread_tp != NULL && buzzer_thread_tp != NULL;
 }
 
 void motor_threads_init(void) {
@@ -197,7 +305,6 @@ void motor_threads_init(void) {
     const osThreadAttr_t fault_attr    = {.name="fault_stop_thread",  .priority=osPriorityHigh,        .stack_size=512U};
     const osThreadAttr_t stat_attr     = {.name="stat_thread",        .priority=osPriorityNormal,      .stack_size=512U};
     const osThreadAttr_t periodic_attr = {.name="periodic_thread",    .priority=osPriorityNormal,      .stack_size=640U};
-    const osThreadAttr_t led_attr      = {.name="led_thread",         .priority=osPriorityLow,         .stack_size=384U};
 
     current_cal_thread_tp = osThreadNew(current_cal_thread, NULL, &cal_attr);
     timer_thread_tp    = osThreadNew(timer_thread, NULL, &timer_attr);
@@ -207,12 +314,11 @@ void motor_threads_init(void) {
     fault_stop_tp      = osThreadNew(fault_stop_thread, NULL, &fault_attr);
     stat_thread_tp     = osThreadNew(stat_thread, NULL, &stat_attr);
     periodic_thread_tp = osThreadNew(periodic_thread, NULL, &periodic_attr);
-    led_thread_tp      = osThreadNew(led_thread, NULL, &led_attr);
 
     app_adc_port_init();
     vesc_timeout_init();
 
     (void)current_cal_thread_tp; (void)timer_thread_tp; (void)pid_thread_tp;
     (void)rpm_thread_tp; (void)sample_send_tp; (void)fault_stop_tp;
-    (void)stat_thread_tp; (void)periodic_thread_tp; (void)led_thread_tp;
+    (void)stat_thread_tp; (void)periodic_thread_tp;
 }

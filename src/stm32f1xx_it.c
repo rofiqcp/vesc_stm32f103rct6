@@ -8,6 +8,7 @@
 #include "vesc_uart.h"
 #include "app_config.h"
 #include "board_pins.h"
+#include "status_io.h"
 
 extern void xPortSysTickHandler(void);
 
@@ -19,6 +20,7 @@ void SysTick_Handler(void) {
 }
 
 void DMA1_Channel1_IRQHandler(void) {
+    static bool shed_next = false;
     uint32_t isr = DMA1->ISR;
 
     if ((isr & DMA_ISR_TEIF1) != 0U) {
@@ -33,53 +35,43 @@ void DMA1_Channel1_IRQHandler(void) {
        UART, printf or blocking HAL call is allowed in this path. */
     if ((isr & DMA_ISR_HTIF1) != 0U) {
         DMA1->IFCR = DMA_IFCR_CHTIF1 | DMA_IFCR_CTCIF1;
+
+        if (shed_next) {
+            shed_next = false;
+            foc_adc_dma_quick_guard_isr(g_adc_dual_dma);
+            return;
+        }
+
         foc_adc_dma_isr(g_adc_dual_dma);
+
+        /* If another half-transfer arrived while the full dual-motor FOC was
+         * still executing, the next immediate IRQ is intentionally shortened.
+         * This mirrors the liveness relief that fixed no-connect starvation in
+         * the known-working hoverboard VESC lineage. */
+        if ((DMA1->ISR & DMA_ISR_HTIF1) != 0U) {
+            shed_next = true;
+        }
     }
 }
 
+void DMA1_Channel2_IRQHandler(void) {
+    /* USART3 TX DMA completion. Priority 0 is safe because this handler never
+     * calls FreeRTOS/CMSIS-RTOS2. */
+    vesc_uart_tx_dma_irq_handler();
+}
+
+void DMA1_Channel3_IRQHandler(void) {
+    /* RX DMA runs circular with its NVIC line disabled; defensive only. */
+    vesc_uart_rx_dma_irq_handler();
+}
+
 void USART3_IRQHandler(void) {
-    /* Mirror the RX/TX servicing order in the upstream ChibiOS serial_lld.c
-     * serve_interrupt(): one SR snapshot, drain RX/error conditions in a loop,
-     * feed TXE from the output queue, then finish on TC. */
-    uint16_t cr1 = (uint16_t)VESC_UART->CR1;
-    uint16_t sr = (uint16_t)VESC_UART->SR;
+    /* Normal VESC transport does not use USART3 IRQ. */
+    vesc_uart_usart_defensive_irq_handler();
+}
 
-    if ((sr & USART_SR_LBD) != 0U) {
-        VESC_UART->SR = (uint16_t)~USART_SR_LBD;
-    }
-
-    while ((sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_NE |
-                  USART_SR_FE | USART_SR_PE)) != 0U) {
-        if ((sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) != 0U) {
-            vesc_uart_error_isr();
-        }
-
-        /* Important: upstream reads DR exactly once for this SR snapshot.
-         * A second SR->DR read here could consume the next byte after ORE. */
-        uint8_t b = (uint8_t)VESC_UART->DR;
-        if ((sr & USART_SR_RXNE) != 0U) {
-            vesc_uart_rx_isr_put(b);
-        }
-        sr = (uint16_t)VESC_UART->SR;
-    }
-
-    if (((cr1 & USART_CR1_TXEIE) != 0U) && ((sr & USART_SR_TXE) != 0U)) {
-        uint8_t b;
-        if (vesc_uart_tx_isr_get(&b)) {
-            VESC_UART->DR = b;
-        } else {
-            VESC_UART->CR1 = (cr1 & (uint16_t)~USART_CR1_TXEIE) | USART_CR1_TCIE;
-        }
-    }
-
-    if ((sr & USART_SR_TC) != 0U) {
-        bool tc_irq_was_enabled = (VESC_UART->CR1 & USART_CR1_TCIE) != 0U;
-        VESC_UART->CR1 = cr1 & (uint16_t)~USART_CR1_TCIE;
-        VESC_UART->SR = (uint16_t)~USART_SR_TC;
-        if (tc_irq_was_enabled) {
-            vesc_uart_tx_complete_isr();
-        }
-    }
+void TIM3_IRQHandler(void) {
+    status_io_tim3_irq_handler();
 }
 
 void EXTI9_5_IRQHandler(void) {

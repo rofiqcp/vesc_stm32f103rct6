@@ -5,11 +5,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define VESC_UART_RX_BUF_SIZE 256U
-#define VESC_UART_TX_BUF_SIZE 2048U
-
-#define VESC_RX_AVAILABLE     (1UL << 0)
-#define VESC_TX_COMPLETE      (1UL << 1)
+/* Transport intentionally follows the proven hoverboard_vesc USART3 path:
+ * RX = DMA1 Channel3 circular, TX = DMA1 Channel2 queued, 115200 8N1.
+ * Parsing still runs in packet_process_thread, never in an interrupt. */
+#define VESC_UART_RX_DMA_SIZE       1024U
+#define VESC_UART_TX_QUEUE_DEPTH    6U
+#define VESC_UART_TX_FRAME_MAX      520U
 
 typedef struct {
     volatile uint32_t rx_bytes;
@@ -18,17 +19,15 @@ typedef struct {
     volatile uint32_t tx_overruns;
     volatile uint32_t uart_errors;
     volatile uint32_t tx_complete_count;
+    volatile uint32_t rx_dma_restarts;
+    volatile uint32_t tx_dma_errors;
 } vesc_uart_stats_t;
 
-/* Set by packet_process_thread. The USART ISR only moves bytes and signals
- * this thread; VESC parsing never runs in interrupt context. */
-extern osThreadId_t vesc_comm_thread_id;
-
 bool vesc_uart_init(void);
-void vesc_uart_rx_isr_put(uint8_t byte);
+void vesc_uart_service(void);
 bool vesc_uart_rx_get(uint8_t *byte);
-bool vesc_uart_tx_isr_get(uint8_t *byte);
 bool vesc_uart_write_raw(const uint8_t *data, uint16_t len);
-void vesc_uart_error_isr(void);
-void vesc_uart_tx_complete_isr(void);
+void vesc_uart_tx_dma_irq_handler(void);
+void vesc_uart_rx_dma_irq_handler(void);
+void vesc_uart_usart_defensive_irq_handler(void);
 const vesc_uart_stats_t *vesc_uart_get_stats(void);

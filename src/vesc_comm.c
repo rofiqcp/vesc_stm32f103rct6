@@ -1,5 +1,6 @@
 #include "vesc_comm.h"
 #include "vesc_uart.h"
+#include "status_io.h"
 #include "vesc_packet.h"
 #include "motor_control.h"
 #include "motor_hw.h"
@@ -202,32 +203,41 @@ static void send_print(const char *msg) {
 static void reply_fw_version(motor_id_t id) {
     uint8_t *p = payload_begin(); if (p == NULL) return;
     uint16_t i = 0U;
+
+    /* Match the proven hoverboard_vesc VESC-6.00 handshake field order. The
+     * transport and this minimal first reply are deliberately conservative;
+     * richer RT data/config support remains implemented by this firmware. */
     p[i++] = COMM_FW_VERSION;
-    p[i++] = 7U; p[i++] = 1U;
-    /* Keep the complete response inside the 65-byte envelope used by the
-     * current upstream COMM_FW_VERSION implementation. */
-    const char hw[] = "F103RC_DUAL";
-    memcpy(&p[i], hw, sizeof(hw)); i = (uint16_t)(i + sizeof(hw));
+    p[i++] = 6U;
+    p[i++] = 0U;
+
+    const char hw[] = "HOVERBOARD_DUAL_FOC";
+    memcpy(&p[i], hw, sizeof(hw));
+    i = (uint16_t)(i + sizeof(hw));
 
     const uint32_t *uid = (const uint32_t *)0x1FFFF7E8UL;
     for (uint8_t w = 0U; w < 3U; w++) {
         uint32_t v = uid[w];
-        p[i++] = (uint8_t)v; p[i++] = (uint8_t)(v >> 8);
-        p[i++] = (uint8_t)(v >> 16); p[i++] = (uint8_t)(v >> 24);
+        p[i++] = (uint8_t)v;
+        p[i++] = (uint8_t)(v >> 8);
+        p[i++] = (uint8_t)(v >> 16);
+        p[i++] = (uint8_t)(v >> 24);
     }
     if (id == MOTOR_RIGHT) p[i - 1U]++;
 
-    p[i++] = 0U; /* pairing_done: no NRF pairing subsystem in this port */
-    p[i++] = 1U; /* test-version field */
+    p[i++] = 1U; /* pairing done */
+    p[i++] = 0U; /* FW test version */
     p[i++] = 0U; /* HW_TYPE_VESC */
-    p[i++] = 0U; /* custom config count */
+    p[i++] = 0U; /* custom configs */
     p[i++] = 0U; /* phase filters */
-    p[i++] = 0U; /* HW QML excluded */
-    p[i++] = 0U; /* APP QML excluded */
-    p[i++] = 0U; /* NRF excluded */
-    const char fw[] = "F103_RTOS2_V7";
-    memcpy(&p[i], fw, sizeof(fw)); i = (uint16_t)(i + sizeof(fw));
-    put_u32(p, &i, 0U); /* reduced-port HW CRC */
+    p[i++] = 0U; /* qml hw */
+    p[i++] = 0U; /* qml app */
+    p[i++] = 0U; /* nrf flags */
+
+    const char fw[] = "hoverboard-vesc6-rtos-v8";
+    memcpy(&p[i], fw, sizeof(fw));
+    i = (uint16_t)(i + sizeof(fw));
+
     payload_end(i);
 }
 
@@ -510,7 +520,7 @@ static void reply_unsupported_detect(uint8_t cmd) {
         default: break;
     }
     vesc_comm_send_payload(p, i);
-    send_print("F103 V7: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
+    send_print("F103 V8: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
 }
 
 static bool wait_sensor_detect(MotorRuntime *m, uint32_t timeout_ms) {
@@ -550,7 +560,7 @@ static void blocking_thread(void *argument) {
 
 static void unsupported_config_command(uint8_t cmd) {
     (void)cmd;
-    send_print("F103 V7: full VESC confgenerator MCCONF/APPCONF schema not present; config not acknowledged.");
+    send_print("F103 V8: full VESC confgenerator MCCONF/APPCONF schema not present; config not acknowledged.");
 }
 
 static bool command_requires_motor_ready(uint8_t cmd) {
@@ -689,6 +699,7 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
 static void process_payload(const uint8_t *data, uint16_t len) {
     if (data == NULL || len == 0U) return;
     s_diag.rx_frames_ok++;
+    status_io_note_vesc_packet();
     /* UART is always local motor-left. Right motor is exposed only through
      * COMM_FORWARD_CAN using the current upstream dual-motor semantic. */
     process_payload_for_motor(data, len, MOTOR_LEFT);
@@ -696,13 +707,25 @@ static void process_payload(const uint8_t *data, uint16_t len) {
 
 static void packet_process_thread(void *argument) {
     (void)argument;
-    vesc_comm_thread_id = osThreadGetId();
     for (;;) {
-        uint32_t flags = osThreadFlagsWait(VESC_RX_AVAILABLE | VESC_TX_COMPLETE, osFlagsWaitAny, 10U);
-        if ((flags & osFlagsError) != 0U) flags = 0U;
-        (void)flags;
+        /* Proven hoverboard transport services circular RX DMA by reading
+         * CNDTR in normal context. Here that normal context is the dedicated
+         * CMSIS-RTOS2 packet thread. */
+        vesc_uart_service();
+
+        bool received = false;
         uint8_t byte;
-        while (vesc_uart_rx_get(&byte)) vesc_packet_process_byte(&s_parser, byte, process_payload);
+        while (vesc_uart_rx_get(&byte)) {
+            received = true;
+            vesc_packet_process_byte(&s_parser, byte, process_payload);
+        }
+
+        vesc_uart_service();
+        if (received) {
+            (void)osThreadYield();
+        } else {
+            osDelay(1U);
+        }
     }
 }
 
@@ -804,7 +827,7 @@ bool vesc_comm_task_init(void) {
     }
 
     const osThreadAttr_t packet_attr = {
-        .name="packet_process_thread", .priority=osPriorityNormal, .stack_size=1536U
+        .name="packet_process_thread", .priority=osPriorityAboveNormal, .stack_size=1536U
     };
     const osThreadAttr_t block_attr = {
         .name="blocking_thread", .priority=osPriorityNormal, .stack_size=1536U
