@@ -97,3 +97,22 @@ V8 host/audit tests: ALL PASS
 ```
 
 The V8 audit checks 64 MHz HSI PLL, PB10/PB11 USART3, RX DMA1_CH3 circular, TX DMA1_CH2 queue, USART3 IRQ disabled in the normal path, known VESC-6.00 FW_VERSION layout, virtual CAN RIGHT ID 2, PB2/PA4/PA5 status hardware, ADC/FOC DMA1_CH1 retention, and ISR liveness relief.
+
+## V9 full-feature / fixed-point validation
+
+V9 preserves the proven V8 USART3 DMA and packet files byte-for-byte and adds control/config/encoder/fixed-point tests.
+
+```text
+test_foc_math: PASS
+test_vesc_buffer: PASS
+test_vesc_config_layout: PASS
+audit_v9_features: PASS
+SELF-TEST PASS: CRC, framing, V9 VESC-6.00 FW parser, virtual-CAN routing, standard sample parser
+V9 host/audit tests: ALL PASS
+```
+
+The exhaustive sine/cosine host test evaluates every uint16 electrical phase and requires interpolation error <= 3 Q15 counts. The config test validates 481-byte MCCONF, 493-byte APPCONF, runtime canonicalization, unsupported-byte preservation, and fractional encoder-ratio independence from physical motor pole pairs.
+
+V8 regression and frozen transport hashes also pass after V9 changes.
+
+ARM cross-build is not claimed in this environment because PlatformIO/arm-none-eabi-gcc are unavailable.

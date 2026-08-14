@@ -18,6 +18,9 @@ static uint64_t s_sq_ru = 0U, s_sq_rv = 0U, s_sq_rdc = 0U;
 static uint16_t s_min_lu, s_min_lv, s_min_ldc, s_min_ru, s_min_rv, s_min_rdc;
 static uint16_t s_max_lu, s_max_lv, s_max_ldc, s_max_ru, s_max_rv, s_max_rdc;
 static uint32_t s_overrun_consecutive = 0U;
+static int32_t s_inv_vbus_q30 = 0;
+static int32_t s_inv_vbus_last_q15 = 0;
+static uint8_t s_inv_vbus_age = 0U;
 
 static int32_t s_vbus_scale_q16;
 static int32_t s_vbus_min_q15;
@@ -28,6 +31,9 @@ static int32_t s_mod_limit_coeff_q15;
 static inline uint16_t low16(uint32_t w)  { return (uint16_t)(w & 0xFFFFU); }
 static inline uint16_t high16(uint32_t w) { return (uint16_t)(w >> 16); }
 static inline int32_t iabs32(int32_t x)   { return (x < 0) ? -x : x; }
+static inline int32_t q15_mul_q16(int32_t a_q15, int32_t b_q16) {
+    return (int32_t)(((int64_t)a_q15 * (int64_t)b_q16) >> 16);
+}
 
 static void cal_reset_isr(void) {
     s_cal_done = false;
@@ -61,6 +67,7 @@ void foc_request_recalibration(void) {
 void foc_control_init(void) {
     cal_reset_isr();
     s_overrun_consecutive = 0U;
+    s_inv_vbus_q30 = 0; s_inv_vbus_last_q15 = 0; s_inv_vbus_age = 0U;
     s_vbus_scale_q16 = (int32_t)((DCLINK_V_PER_COUNT / FOC_VOLTAGE_Q_BASE_V) * 32768.0f * 65536.0f);
     s_vbus_min_q15 = (int32_t)((VBUS_MIN_RUN_V / FOC_VOLTAGE_Q_BASE_V) * 32768.0f);
     s_vbus_max_q15 = (int32_t)((VBUS_MAX_RUN_V / FOC_VOLTAGE_Q_BASE_V) * 32768.0f);
@@ -74,10 +81,13 @@ uint16_t motor_sensor_electrical_phase_u16(MotorRuntime *m) {
     }
 
     if (m->sensor_mode == SENSOR_MODE_ENCODER) {
-        uint32_t cnt = motor_hw_encoder_cnt();
-        uint32_t phase = (uint32_t)(((uint64_t)cnt * (uint64_t)m->encoder.phase_per_count_q16) >> 16);
-        uint16_t p = (uint16_t)phase;
-        if (m->encoder.inverted) p = (uint16_t)(0U - p);
+        /* AB has no index: the electrical phase is relative to the controlled
+           phase-0 alignment captured this boot, not to TIM4 CNT=0 at reset. */
+        int32_t ext = m->encoder.turns * (int32_t)m->encoder.cpr + (int32_t)motor_hw_encoder_cnt();
+        int32_t rel = ext - m->encoder.session_zero_count;
+        int64_t phase64 = ((int64_t)rel * (int64_t)m->encoder.phase_per_count_q16) >> 16;
+        uint16_t p=(uint16_t)phase64;
+        if (m->encoder.inverted) p=(uint16_t)(0U-p);
         return (uint16_t)(p + m->encoder.elec_offset_u16);
     }
 
@@ -168,13 +178,15 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
     m->ia_q15 = ia; m->ib_q15 = ib; m->ic_q15 = ic;
     m->dc_current_raw = raw_dc; m->vbus_q15 = vbus_q15;
 
-    if (iabs32(ia) > s_current_trip_q15 || iabs32(ib) > s_current_trip_q15 || iabs32(ic) > s_current_trip_q15) {
+    int32_t trip = (m->abs_current_trip_q15 > 0) ? m->abs_current_trip_q15 : s_current_trip_q15;
+    if (iabs32(ia) > trip || iabs32(ib) > trip || iabs32(ic) > trip) {
         motor_request_fault_from_isr(m, MOTOR_FAULT_ABS_OVER_CURRENT); return;
     }
     if (m->pwm_enabled && vbus_q15 > s_vbus_max_q15) { motor_request_fault_from_isr(m, MOTOR_FAULT_OVER_VOLTAGE); return; }
     if (m->pwm_enabled && vbus_q15 < s_vbus_min_q15) { motor_request_fault_from_isr(m, MOTOR_FAULT_UNDER_VOLTAGE); return; }
 
     if (!m->pwm_enabled || m->fault != MOTOR_FAULT_NONE || inv_vbus_q30 <= 0) {
+        m->vd_int_q31 = 0; m->vq_int_q31 = 0;
         m->vd_int_q15 = 0; m->vq_int_q15 = 0;
         motor_hw_set_pwm_q15(m, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
         return;
@@ -199,13 +211,22 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
     int32_t vmax_q15 = foc_q15_mul(vbus_q15, s_mod_limit_coeff_q15);
     if (vmax_q15 < 256) vmax_q15 = 256;
 
-    m->vd_int_q15 += foc_q15_mul(m->current_ki_dt_q15, err_d);
-    m->vq_int_q15 += foc_q15_mul(m->current_ki_dt_q15, err_q);
-    m->vd_int_q15 = foc_q15_clamp(m->vd_int_q15, -vmax_q15, vmax_q15);
-    m->vq_int_q15 = foc_q15_clamp(m->vq_int_q15, -vmax_q15, vmax_q15);
+    /* Q15 error x Q16.16 Ki*dt produces a Q31 increment. Keep that full
+       precision in the integrator instead of truncating every 62.5 us. */
+    m->vd_int_q31 += (int64_t)err_d * (int64_t)m->current_ki_dt_q16;
+    m->vq_int_q31 += (int64_t)err_q * (int64_t)m->current_ki_dt_q16;
+    int64_t int_lim_q31 = (int64_t)vmax_q15 << 16;
+    if (m->vd_int_q31 > int_lim_q31) m->vd_int_q31 = int_lim_q31;
+    if (m->vd_int_q31 < -int_lim_q31) m->vd_int_q31 = -int_lim_q31;
+    if (m->vq_int_q31 > int_lim_q31) m->vq_int_q31 = int_lim_q31;
+    if (m->vq_int_q31 < -int_lim_q31) m->vq_int_q31 = -int_lim_q31;
+    m->vd_int_q15 = (int32_t)(m->vd_int_q31 >> 16);
+    m->vq_int_q15 = (int32_t)(m->vq_int_q31 >> 16);
 
-    int32_t vd = m->vd_int_q15 + foc_q15_mul(m->current_kp_q15, err_d);
-    int32_t vq = m->vq_int_q15 + foc_q15_mul(m->current_kp_q15, err_q);
+    int32_t prop_d = q15_mul_q16(err_d, m->current_kp_q16);
+    int32_t prop_q = q15_mul_q16(err_q, m->current_kp_q16);
+    int32_t vd = m->vd_int_q15 + prop_d;
+    int32_t vq = m->vq_int_q15 + prop_q;
 
     int32_t avd = iabs32(vd), avq = iabs32(vq);
     int32_t hi = (avd > avq) ? avd : avq;
@@ -214,8 +235,10 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
     if (mag_approx > vmax_q15 && mag_approx > 0) {
         int32_t scale_q15 = (int32_t)(((int64_t)vmax_q15 << 15) / mag_approx);
         vd = foc_q15_mul(vd, scale_q15); vq = foc_q15_mul(vq, scale_q15);
-        m->vd_int_q15 = vd - foc_q15_mul(m->current_kp_q15, err_d);
-        m->vq_int_q15 = vq - foc_q15_mul(m->current_kp_q15, err_q);
+        m->vd_int_q15 = vd - prop_d;
+        m->vq_int_q15 = vq - prop_q;
+        m->vd_int_q31 = (int64_t)m->vd_int_q15 << 16;
+        m->vq_int_q31 = (int64_t)m->vq_int_q15 << 16;
     }
     m->vd_q15 = vd; m->vq_q15 = vq;
 
@@ -272,6 +295,7 @@ static void calibration_zero_fast_states(MotorRuntime *m) {
     m->id_q15 = 0; m->iq_q15 = 0;
     m->id_filter_q15 = 0; m->iq_filter_q15 = 0;
     m->vd_q15 = 0; m->vq_q15 = 0;
+    m->vd_int_q31 = 0; m->vq_int_q31 = 0;
     m->vd_int_q15 = 0; m->vq_int_q15 = 0;
     m->dc_current_raw = (uint16_t)m->dc_current_offset_counts;
 }
@@ -296,12 +320,14 @@ void foc_adc_dma_quick_guard_isr(const volatile uint32_t adc_words[4]) {
     int32_t rib = adc_current_to_q15(r_v, r->current_offset_v_counts, r->current_scale_q16);
     int32_t ric = -(ria + rib);
 
-    if (iabs32(lia) > s_current_trip_q15 || iabs32(lib) > s_current_trip_q15 ||
-        iabs32(lic) > s_current_trip_q15) {
+    int32_t l_trip = (l->abs_current_trip_q15 > 0) ? l->abs_current_trip_q15 : s_current_trip_q15;
+    int32_t r_trip = (r->abs_current_trip_q15 > 0) ? r->abs_current_trip_q15 : s_current_trip_q15;
+    if (iabs32(lia) > l_trip || iabs32(lib) > l_trip ||
+        iabs32(lic) > l_trip) {
         motor_request_fault_from_isr(l, MOTOR_FAULT_ABS_OVER_CURRENT);
     }
-    if (iabs32(ria) > s_current_trip_q15 || iabs32(rib) > s_current_trip_q15 ||
-        iabs32(ric) > s_current_trip_q15) {
+    if (iabs32(ria) > r_trip || iabs32(rib) > r_trip ||
+        iabs32(ric) > r_trip) {
         motor_request_fault_from_isr(r, MOTOR_FAULT_ABS_OVER_CURRENT);
     }
 
@@ -356,7 +382,15 @@ void foc_adc_dma_isr(const volatile uint32_t adc_words[4]) {
     }
 
     int32_t vbus_q15 = (int32_t)(((int64_t)vraw * (int64_t)s_vbus_scale_q16) >> 16);
-    int32_t inv_vbus_q30 = (vbus_q15 > 256) ? (int32_t)(((int64_t)1 << 30) / vbus_q15) : 0;
+    /* Cortex-M3 integer divide is expensive. Vbus moves slowly relative to
+       16 kHz, so update its reciprocal only on meaningful change or timeout. */
+    int32_t dv = vbus_q15 - s_inv_vbus_last_q15; if (dv < 0) dv=-dv;
+    if (vbus_q15 <= 256) { s_inv_vbus_q30=0; s_inv_vbus_last_q15=vbus_q15; s_inv_vbus_age=0U; }
+    else if (s_inv_vbus_q30==0 || dv > 48 || ++s_inv_vbus_age >= 32U) {
+        s_inv_vbus_q30=(int32_t)(((int64_t)1<<30)/vbus_q15);
+        s_inv_vbus_last_q15=vbus_q15; s_inv_vbus_age=0U;
+    }
+    int32_t inv_vbus_q30=s_inv_vbus_q30;
     foc_one_motor_isr(&g_motor_left,l_u,l_v,l_dc,vbus_q15,inv_vbus_q30);
     foc_one_motor_isr(&g_motor_right,r_u,r_v,r_dc,vbus_q15,inv_vbus_q30);
     debug_sample_capture_isr(&g_motor_left,&g_motor_right);

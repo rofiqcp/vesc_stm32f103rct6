@@ -14,7 +14,7 @@ typedef enum {
     MOTOR_CTRL_BRAKE_CURRENT,
     MOTOR_CTRL_SPEED,
     MOTOR_CTRL_POSITION,
-    MOTOR_CTRL_DUTY_APPROX,
+    MOTOR_CTRL_DUTY,
     MOTOR_CTRL_HANDBRAKE,
     MOTOR_CTRL_DETECT
 } motor_control_mode_t;
@@ -43,6 +43,8 @@ typedef enum {
     SENSOR_DETECT_ENCODER_LOCK0,
     SENSOR_DETECT_ENCODER_SWEEP,
     SENSOR_DETECT_ENCODER_EVAL,
+    SENSOR_DETECT_ENCODER_RETURN0,
+    SENSOR_DETECT_ENCODER_ALIGN,
     SENSOR_DETECT_DONE,
     SENSOR_DETECT_FAILED
 } sensor_detect_state_t;
@@ -74,7 +76,21 @@ typedef struct {
     volatile int32_t turns;
     volatile uint16_t last_cnt;
     volatile int32_t extended_count;
+    volatile int32_t prev_extended_count;
+    volatile bool speed_sample_valid;
+    /* Incremental AB has no absolute phase after reset. session_zero_count is
+       captured by a controlled electrical alignment on every power cycle. */
+    volatile int32_t session_zero_count;
+    volatile int32_t mechanical_zero_count;
+    volatile bool synced;
+    volatile bool motion_proved;
     uint32_t cpr;
+    /* Electrical revolutions per one mechanical encoder revolution.
+       Kept separate from physical motor pole_pairs as in VESC mcconf.
+       The float is task/config-side; Q16.16 and phase-per-count are the ISR
+       representations, so non-integer VESC encoder ratios remain supported. */
+    float electrical_ratio;
+    uint32_t electrical_ratio_q16;
     uint32_t phase_per_count_q16;
     uint16_t elec_offset_u16;
     bool inverted;
@@ -149,6 +165,16 @@ typedef struct MotorRuntime {
     volatile float speed_target_erpm;
     volatile float position_target_deg;
 
+    /* Runtime limits/configuration applied from VESC MCCONF. */
+    volatile float current_max_a;
+    volatile float current_min_a;
+    volatile float abs_current_max_a;
+    volatile float max_erpm;
+    volatile float min_erpm;
+    volatile float max_duty;
+    volatile float min_duty;
+    volatile bool invert_direction;
+
     volatile float ia;
     volatile float ib;
     volatile float ic;
@@ -185,6 +211,7 @@ typedef struct MotorRuntime {
     volatile uint16_t duty_v_q15;
     volatile uint16_t duty_w_q15;
     volatile int32_t vbus_q15;
+    volatile int32_t abs_current_trip_q15;
     volatile uint16_t dc_current_raw;
 
     volatile float erpm;
@@ -204,8 +231,10 @@ typedef struct MotorRuntime {
     float vq_int;
 
     int32_t current_scale_q16;
-    int32_t current_kp_q15;
-    int32_t current_ki_dt_q15;
+    /* PI coefficients are Q16.16; current/voltage samples remain Q15.
+       Q15 error * Q16 gain >> 16 gives a Q15 voltage contribution. */
+    int32_t current_kp_q16;
+    int32_t current_ki_dt_q16;
     volatile int32_t current_offset_u_counts;
     volatile int32_t current_offset_v_counts;
     volatile int32_t dc_current_offset_counts;
@@ -214,7 +243,11 @@ typedef struct MotorRuntime {
     volatile int64_t dc_current_offset_acc_q16;
     volatile uint16_t current_raw_u;
     volatile uint16_t current_raw_v;
-    volatile int32_t vd_int_q15;
+    /* Integral state keeps 16 fractional bits below Q15 (Q31 accumulator).
+       This avoids losing small Ki updates at 16 kHz on Cortex-M3. */
+    volatile int64_t vd_int_q31;
+    volatile int64_t vq_int_q31;
+    volatile int32_t vd_int_q15; /* telemetry/debug mirror */
     volatile int32_t vq_int_q15;
 
     hall_state_t hall;
@@ -225,6 +258,13 @@ typedef struct MotorRuntime {
     encoder_state_t encoder;
 
     pid_state_t speed_pid;
+    pid_state_t position_pid;
+    pid_state_t duty_pid;
+    float speed_kd_filter;
+    float position_kd_filter;
+    float duty_kp;
+    float duty_ki;
+    float position_derivative_filtered;
     sensor_detect_t detect;
     motor_stats_t stats;
 

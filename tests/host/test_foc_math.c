@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "foc_math.h"
 #include "app_config.h"
 
@@ -16,6 +17,21 @@ int main(void) {
     foc_fast_sincos_u16_q15(16384U,&s,&c);
     assert(s > 32600);
     assert(iabs_i((int)c) < 100);
+
+    /* Exhaustive 16-bit phase test: flash LUT + linear interpolation should
+       stay within a few Q15 counts of the mathematical sine/cosine. */
+    int max_s_err=0, max_c_err=0;
+    for (uint32_t ph=0U; ph<65536U; ph++) {
+        foc_fast_sincos_u16_q15((uint16_t)ph,&s,&c);
+        double a=(2.0*3.14159265358979323846*(double)ph)/65536.0;
+        int si=(int)lround(sin(a)*32767.0);
+        int ci=(int)lround(cos(a)*32767.0);
+        int se=iabs_i((int)s-si), ce=iabs_i((int)c-ci);
+        if (se > max_s_err) max_s_err = se;
+        if (ce > max_c_err) max_c_err = ce;
+    }
+    assert(max_s_err <= 3);
+    assert(max_c_err <= 3);
 
     uint16_t u,v,w;
     /* 48 V represented in Q15 base. */

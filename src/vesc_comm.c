@@ -12,6 +12,7 @@
 #include "app_adc_port.h"
 #include "vesc_timeout.h"
 #include "config_store.h"
+#include "vesc_config.h"
 #include "cmsis_os2.h"
 #include <string.h>
 #include <math.h>
@@ -151,13 +152,15 @@ static int16_t scaled_i16(float v, float scale) {
     float x = v * scale;
     if (x > 32767.0f) x = 32767.0f;
     if (x < -32768.0f) x = -32768.0f;
-    return (int16_t)lroundf(x);
+    /* Match VESC buffer_append_float16: truncate toward zero. */
+    return (int16_t)x;
 }
 static int32_t scaled_i32(float v, float scale) {
     double x = (double)v * (double)scale;
     if (x > 2147483647.0) x = 2147483647.0;
     if (x < -2147483648.0) x = -2147483648.0;
-    return (int32_t)llround(x);
+    /* Match VESC buffer_append_float32: truncate toward zero. */
+    return (int32_t)x;
 }
 
 static uint8_t vesc_fault_code(uint8_t native_fault) {
@@ -234,7 +237,7 @@ static void reply_fw_version(motor_id_t id) {
     p[i++] = 0U; /* qml app */
     p[i++] = 0U; /* nrf flags */
 
-    const char fw[] = "hoverboard-vesc6-rtos-v8";
+    const char fw[] = "hoverboard-vesc6-rtos-v9";
     memcpy(&p[i], fw, sizeof(fw));
     i = (uint16_t)(i + sizeof(fw));
 
@@ -520,7 +523,7 @@ static void reply_unsupported_detect(uint8_t cmd) {
         default: break;
     }
     vesc_comm_send_payload(p, i);
-    send_print("F103 V8: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
+    send_print("F103 V9: R/L/flux auto-detect is intentionally unsupported; no fabricated result.");
 }
 
 static bool wait_sensor_detect(MotorRuntime *m, uint32_t timeout_ms) {
@@ -558,11 +561,6 @@ static void blocking_thread(void *argument) {
     }
 }
 
-static void unsupported_config_command(uint8_t cmd) {
-    (void)cmd;
-    send_print("F103 V8: full VESC confgenerator MCCONF/APPCONF schema not present; config not acknowledged.");
-}
-
 static bool command_requires_motor_ready(uint8_t cmd) {
     switch (cmd) {
         case COMM_SET_DUTY:
@@ -572,6 +570,8 @@ static bool command_requires_motor_ready(uint8_t cmd) {
         case COMM_SET_POS:
         case COMM_SET_HANDBRAKE:
         case COMM_SET_CURRENT_REL:
+        case COMM_SET_MCCONF:
+        case COMM_SET_APPCONF:
         case COMM_SAMPLE_PRINT:
         case COMM_DETECT_MOTOR_PARAM:
         case COMM_DETECT_MOTOR_R_L:
@@ -620,7 +620,7 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
             if (len >= 5U) reply_setup_values(COMM_GET_VALUES_SETUP_SELECTIVE, get_u32_be(&data[1]), id);
             break;
         case COMM_SET_DUTY:
-            if (len >= 5U) { motor_set_duty_approx(m, (float)get_i32_be(&data[1]) / 100000.0f); vesc_timeout_reset(); }
+            if (len >= 5U) { motor_set_duty(m, (float)get_i32_be(&data[1]) / 100000.0f); vesc_timeout_reset(); }
             break;
         case COMM_SET_CURRENT:
             if (len >= 5U) { motor_set_current(m, (float)get_i32_be(&data[1]) / 1000.0f); vesc_timeout_reset(); }
@@ -684,13 +684,34 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
             }
             break;
         case COMM_SET_MCCONF:
-        case COMM_GET_MCCONF:
-        case COMM_GET_MCCONF_DEFAULT:
-        case COMM_SET_APPCONF:
-        case COMM_GET_APPCONF:
-        case COMM_GET_APPCONF_DEFAULT:
-            unsupported_config_command(cmd);
+            if (len == (uint16_t)(1U + VESC6_MCCONF_WIRE_SIZE) &&
+                vesc_config_set_mc_wire(id, &data[1], VESC6_MCCONF_WIRE_SIZE, true)) {
+                uint8_t ack=COMM_SET_MCCONF; vesc_comm_send_payload(&ack,1U);
+            }
             break;
+        case COMM_GET_MCCONF:
+        case COMM_GET_MCCONF_DEFAULT: {
+            const uint8_t *wire=vesc_config_mc_wire(id, cmd==COMM_GET_MCCONF_DEFAULT);
+            uint8_t *p=payload_begin(); if(p!=NULL){p[0]=cmd;memcpy(&p[1],wire,VESC6_MCCONF_WIRE_SIZE);payload_end((uint16_t)(1U+VESC6_MCCONF_WIRE_SIZE));}
+        } break;
+        case COMM_SET_APPCONF:
+            if (len == (uint16_t)(1U + VESC6_APPCONF_WIRE_SIZE)) {
+                /* App configuration is controller-level on this single MCU.
+                   When VESC Tool reaches the virtual RIGHT node it may present
+                   controller_id=2; keep that ID virtual while applying and
+                   persisting every other APPCONF byte once for the controller. */
+                uint8_t tmp[VESC6_APPCONF_WIRE_SIZE];
+                memcpy(tmp,&data[1],sizeof(tmp));
+                tmp[4]=VESC_CONTROLLER_ID_LEFT;
+                bool ok=vesc_config_set_app_wire(tmp,VESC6_APPCONF_WIRE_SIZE,true);
+                if(ok){uint8_t ack=COMM_SET_APPCONF;vesc_comm_send_payload(&ack,1U);}
+            }
+            break;
+        case COMM_GET_APPCONF:
+        case COMM_GET_APPCONF_DEFAULT: {
+            const uint8_t *wire=vesc_config_app_wire(cmd==COMM_GET_APPCONF_DEFAULT);
+            uint8_t *p=payload_begin(); if(p!=NULL){p[0]=cmd;memcpy(&p[1],wire,VESC6_APPCONF_WIRE_SIZE);if(id==MOTOR_RIGHT)p[1U+4U]=VESC_CONTROLLER_ID_RIGHT;payload_end((uint16_t)(1U+VESC6_APPCONF_WIRE_SIZE));}
+        } break;
         default:
             break;
     }

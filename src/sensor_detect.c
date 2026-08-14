@@ -4,6 +4,7 @@
 #include "foc_control.h"
 #include "foc_math.h"
 #include "app_config.h"
+#include "vesc_config.h"
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@ bool sensor_detect_request(MotorRuntime *m, uint8_t requested_mode) {
 }
 
 static void detect_fail(MotorRuntime *m) {
+    if (m->id==MOTOR_LEFT && m->sensor_mode==SENSOR_MODE_ENCODER) m->encoder.synced=false;
     motor_set_foc_targets(m,0.0f,0.0f); m->detect_force_angle=false; m->detect.busy=false;
     m->detect.success=false; m->detect.state=SENSOR_DETECT_FAILED; m->control_mode=MOTOR_CTRL_OFF;
     motor_hw_set_pwm_enabled(m,false);
@@ -45,6 +47,7 @@ static void detect_done(MotorRuntime *m,uint8_t mode) {
     motor_set_foc_targets(m,0.0f,0.0f); m->detect_force_angle=false; m->detect.busy=false;
     m->detect.success=true; m->detect.result_mode=mode; m->detect.state=SENSOR_DETECT_DONE;
     m->control_mode=MOTOR_CTRL_OFF; m->sensor_mode=mode; m->sensor_request_mode=mode;
+    vesc_config_sync_motor_runtime(m->id);
     motor_hw_set_pwm_enabled(m,false);
 }
 
@@ -152,10 +155,26 @@ void sensor_detect_update_1khz(MotorRuntime *m,uint32_t now_ms) {
         float counts_per_elec=(float)ad/(float)SENSOR_DETECT_SWEEPS;
         uint32_t pp=(uint32_t)lroundf((float)m->encoder.cpr/counts_per_elec);
         if(pp<1U||pp>SENSOR_DETECT_MAX_POLE_PAIRS){detect_fail(m);break;}
-        m->pole_pairs=(uint8_t)pp; m->encoder.inverted=(delta<0);
-        m->encoder.phase_per_count_q16=(uint32_t)((((uint64_t)m->pole_pairs*65536ULL)<<16)/m->encoder.cpr);
-        /* Rotor was physically aligned to electrical phase 0 before count reset. */
-        m->encoder.elec_offset_u16=0U;
+        m->pole_pairs=(uint8_t)pp;
+        m->encoder.electrical_ratio=(float)pp;
+        m->encoder.electrical_ratio_q16=(uint32_t)pp << 16;
+        m->encoder.inverted=(delta<0); m->encoder.motion_proved=true; m->encoder.synced=false;
+        m->encoder.phase_per_count_q16=(uint32_t)(((uint64_t)m->encoder.electrical_ratio_q16<<16)/m->encoder.cpr);
+        /* AB has no index. Return the rotor to a controlled electrical phase 0
+           and capture the current extended count as this boot's phase origin. */
+        m->detect_phase_u16=0U; motor_set_foc_targets(m,d->drive_current_a,0.0f);
+        d->step_tick=now_ms; d->state=SENSOR_DETECT_ENCODER_RETURN0;
+    } break;
+
+    case SENSOR_DETECT_ENCODER_RETURN0:
+        m->detect_phase_u16=0U; motor_set_foc_targets(m,d->drive_current_a,0.0f);
+        if((uint32_t)(now_ms-d->step_tick)>=SENSOR_DETECT_SETTLE_MS){d->step_tick=now_ms;d->state=SENSOR_DETECT_ENCODER_ALIGN;}
+        break;
+
+    case SENSOR_DETECT_ENCODER_ALIGN: {
+        int32_t zero=motor_encoder_extended_count(m);
+        m->encoder.session_zero_count=zero; m->encoder.mechanical_zero_count=zero;
+        m->encoder.elec_offset_u16=0U; m->encoder.synced=true;
         detect_done(m,SENSOR_MODE_ENCODER);
     } break;
 

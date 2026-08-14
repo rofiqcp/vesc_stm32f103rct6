@@ -372,6 +372,8 @@ void motor_hw_encoder_reset(void) {
     TIM4->CNT = 0U;
     g_motor_left.encoder.turns = 0;
     g_motor_left.encoder.extended_count = 0;
+    g_motor_left.encoder.prev_extended_count = 0;
+    g_motor_left.encoder.speed_sample_valid = false;
     if (!primask) __enable_irq();
 }
 
@@ -407,7 +409,11 @@ void motor_hw_configure_sensor(MotorRuntime *m, uint8_t mode) {
         g.Pin = LEFT_HALL_U_PIN;
         HAL_GPIO_Init(GPIOB, &g);
 
+        uint32_t cpr=m->encoder.cpr; if (cpr<4U) cpr=4U; if (cpr>65535U) cpr=65535U;
+        TIM4->ARR=cpr-1U;
         __HAL_TIM_SET_COUNTER(&htim4, 0U);
+        m->encoder.turns=0; m->encoder.extended_count=0;
+        m->encoder.prev_extended_count=0; m->encoder.speed_sample_valid=false;
         __HAL_TIM_CLEAR_FLAG(&htim4, TIM_FLAG_UPDATE);
         __HAL_TIM_ENABLE_IT(&htim4, TIM_IT_UPDATE);
         if (HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL) != HAL_OK) Error_Handler_Local();

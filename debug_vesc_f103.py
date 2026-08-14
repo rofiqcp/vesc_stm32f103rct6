@@ -843,16 +843,16 @@ def self_test() -> int:
     assert Link.standard_route(0,payload)==payload
     assert Link.standard_route(1,payload)==bytes((COMM_FORWARD_CAN,2))+payload
     fw=(bytes((COMM_FW_VERSION,6,0))+b"HOVERBOARD_DUAL_FOC\x00"+bytes(range(12))+
-        bytes((1,0,0,0,0,0,0,0))+b"hoverboard-vesc6-rtos-v8\x00")
+        bytes((1,0,0,0,0,0,0,0))+b"hoverboard-vesc6-rtos-v9\x00")
     fwd=parse_fw_version(fw)
     assert fwd["major"]==6 and fwd["minor"]==0
     assert fwd["hw_name"]=="HOVERBOARD_DUAL_FOC"
-    assert fwd["fw_name"].endswith("v8") and fwd["hw_crc"] is None
+    assert fwd["fw_name"].endswith("v9") and fwd["hw_crc"] is None
     vals=[1.0,-2.0,3.25,4.0,5.0,6.0,7.0,8.0,16000.0]
     samp=bytes((COMM_SAMPLE_PRINT,))+be_i16(3)+b''.join(struct.pack(">f",x) for x in vals)+bytes((0,123))+be_i32(3)
     idx,row=parse_sample_packet(samp)
     assert idx==3 and abs(row['current1']+2.0)<1e-6 and row['index_full']==3
-    print("SELF-TEST PASS: CRC, framing, V8 VESC-6.00 FW parser, virtual-CAN routing, standard sample parser")
+    print("SELF-TEST PASS: CRC, framing, V9 VESC-6.00 FW parser, virtual-CAN routing, standard sample parser")
     return 0
 
 def add_live_args(p: argparse.ArgumentParser) -> None:

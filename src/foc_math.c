@@ -1,27 +1,32 @@
 #include "foc_math.h"
 #include "app_config.h"
-#include <math.h>
+#include "foc_sin_lut_q15.h"
 
 #define LUT_BITS 10U
 #define LUT_SIZE (1U << LUT_BITS)
-static int16_t s_sin_lut[LUT_SIZE];
 
 void foc_math_init(void) {
-    /* Boot-time only. No sinf/cosf is used from the current-control ISR. */
-    for (uint32_t i = 0; i < LUT_SIZE; i++) {
-        float v = sinf((2.0f * 3.14159265358979323846f * (float)i) / (float)LUT_SIZE);
-        int32_t q = (int32_t)(v * 32767.0f);
-        if (q > 32767) q = 32767;
-        if (q < -32767) q = -32767;
-        s_sin_lut[i] = (int16_t)q;
-    }
+    /* LUT is compile-time const in flash. Kept as an API hook so the motor
+       startup sequence does not need to change. */
+}
+
+static inline int32_t sin_lut_interp_q15(uint16_t phase) {
+    /* 16-bit electrical phase + 1024-entry LUT leaves 6 fractional bits.
+       Linear interpolation costs one small multiply but reduces the phase
+       quantization from 0.3516 deg to roughly the 16-bit phase resolution. */
+    const uint32_t frac_bits = 16U - LUT_BITS;
+    const uint32_t frac_mask = (1U << frac_bits) - 1U;
+    uint32_t idx = ((uint32_t)phase >> frac_bits) & (LUT_SIZE - 1U);
+    uint32_t next = (idx + 1U) & (LUT_SIZE - 1U);
+    int32_t y0 = foc_sin_lut_q15[idx];
+    int32_t dy = (int32_t)foc_sin_lut_q15[next] - y0;
+    uint32_t frac = (uint32_t)phase & frac_mask;
+    return y0 + (int32_t)((dy * (int32_t)frac) >> frac_bits);
 }
 
 void foc_fast_sincos_u16_q15(uint16_t phase, int32_t *s, int32_t *c) {
-    uint32_t idx_s = ((uint32_t)phase * LUT_SIZE) >> 16;
-    uint32_t idx_c = (idx_s + (LUT_SIZE / 4U)) & (LUT_SIZE - 1U);
-    *s = (int32_t)s_sin_lut[idx_s & (LUT_SIZE - 1U)];
-    *c = (int32_t)s_sin_lut[idx_c];
+    *s = sin_lut_interp_q15(phase);
+    *c = sin_lut_interp_q15((uint16_t)(phase + 16384U));
 }
 
 int32_t foc_q15_mul(int32_t a, int32_t b) {

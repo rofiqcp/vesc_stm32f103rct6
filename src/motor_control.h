@@ -12,7 +12,7 @@ void motor_set_handbrake(MotorRuntime *m, float amp);
 void motor_set_current_rel(MotorRuntime *m, float rel);
 void motor_set_speed(MotorRuntime *m, float erpm);
 void motor_set_position(MotorRuntime *m, float deg);
-void motor_set_duty_approx(MotorRuntime *m, float duty);
+void motor_set_duty(MotorRuntime *m, float duty);
 void motor_stop(MotorRuntime *m);
 void motor_clear_fault(MotorRuntime *m);
 void motor_touch_command(MotorRuntime *m);

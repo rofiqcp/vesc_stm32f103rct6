@@ -131,3 +131,16 @@
 #define VESC_CONTROLLER_ID_LEFT         1U
 #define VESC_CONTROLLER_ID_RIGHT        2U
 #define VESC_VIRTUAL_CAN_RIGHT_ID       VESC_CONTROLLER_ID_RIGHT
+
+/* ===================== V9 VESC-COMPATIBLE CONTROL DEFAULTS ===================== */
+#define DUTY_PID_KP_CURRENT_PER_DUTY     18.0f
+#define DUTY_PID_KI_CURRENT_PER_DUTY_S   55.0f
+#define POSITION_PID_KP_CURRENT_PER_DEG  0.12f
+#define POSITION_PID_KI_CURRENT_PER_DEG_S 0.02f
+#define POSITION_PID_KD_CURRENT_PER_DEGPS 0.002f
+#define POSITION_PID_D_FILTER            0.20f
+#define SPEED_PID_D_FILTER               0.20f
+#define MOTOR_DEFAULT_MIN_DUTY           (-0.95f)
+#define MOTOR_DEFAULT_MAX_DUTY           (0.95f)
+#define MOTOR_DEFAULT_MIN_ERPM           (-30000.0f)
+#define MOTOR_DEFAULT_MAX_ERPM           (30000.0f)
