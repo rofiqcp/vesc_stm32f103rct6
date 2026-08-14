@@ -10,7 +10,7 @@ extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim8;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim4;
-extern UART_HandleTypeDef huart2;
+extern UART_HandleTypeDef huart3;
 extern volatile uint32_t g_adc_dual_dma[4];
 
 void motor_hw_init(void);
@@ -25,6 +25,4 @@ void motor_hw_encoder_reset(void);
 void motor_hw_configure_sensor(MotorRuntime *m, uint8_t mode);
 void motor_hw_led(bool on);
 void motor_hw_buzzer(bool on);
-void motor_hw_uart_tx(const uint8_t *data, uint16_t len);
-void motor_hw_uart_start_rx_irq(void);
 void motor_hw_emergency_all_off(void);

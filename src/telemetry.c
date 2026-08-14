@@ -39,9 +39,19 @@ static void snapshot(MotorRuntime *m,motor_telemetry_t *t){
     t->isr_max_cycles=m->isr_max_cycles;t->isr_overruns=m->isr_overruns;
 }
 
+void telemetry_stats_update_100hz(void){
+    update_stats(&g_motor_left,STAT_PERIOD_MS/1000.0f);
+    update_stats(&g_motor_right,STAT_PERIOD_MS/1000.0f);
+}
+
+void telemetry_snapshot_100hz(void){
+    snapshot(&g_motor_left,&s_telem[0]);
+    snapshot(&g_motor_right,&s_telem[1]);
+}
+
 void telemetry_update_100hz(void){
-    update_stats(&g_motor_left,STAT_PERIOD_MS/1000.0f);update_stats(&g_motor_right,STAT_PERIOD_MS/1000.0f);
-    snapshot(&g_motor_left,&s_telem[0]);snapshot(&g_motor_right,&s_telem[1]);
+    telemetry_stats_update_100hz();
+    telemetry_snapshot_100hz();
 }
 
 void telemetry_get(motor_id_t id,motor_telemetry_t *out){if(out==NULL)return;*out=s_telem[(id==MOTOR_RIGHT)?1:0];}

@@ -90,9 +90,9 @@
 #define LEFT_ENCODER_B_PIN GPIO_PIN_7
 #define LEFT_ENCODER_B_PORT GPIOB
 
-/* Minimal VESC UART choice. Change here if your PCB uses another UART. */
-#define VESC_UART USART2
-#define VESC_UART_TX_PIN GPIO_PIN_2
-#define VESC_UART_TX_PORT GPIOA
-#define VESC_UART_RX_PIN GPIO_PIN_3
-#define VESC_UART_RX_PORT GPIOA
+/* Permanent VESC Tool UART interface for this PCB. */
+#define VESC_UART USART3
+#define VESC_UART_TX_PIN GPIO_PIN_10
+#define VESC_UART_TX_PORT GPIOB
+#define VESC_UART_RX_PIN GPIO_PIN_11
+#define VESC_UART_RX_PORT GPIOB

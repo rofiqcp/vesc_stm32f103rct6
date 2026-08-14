@@ -28,11 +28,13 @@ int main(void) {
         while (1) { }
     }
 
-    /* CMSIS-RTOS2 equivalents of the requested VESC-style threads:
-       timer_thread, pid_thread, sample_send_thread, fault_stop_thread,
-       stat_thread, plus vesc_comm_thread. */
-    motor_threads_init();
+    /* Reserve communication resources first so COMM_FW_VERSION remains
+       available even if later motor-task allocation is under memory pressure.
+       Communication: packet_process + blocking. USART3 RX/TX bytes are moved
+       by RXNE/TXE/TC IRQs through software rings; there is no UART DMA thread.
+       Fast FOC remains in the DMA1 Channel1 ISR. */
     vesc_comm_task_init();
+    motor_threads_init();
 
     /* Start synchronized PWM counters + dual ADC DMA. Both TIM1/TIM8 MOE
        remain disabled while the mandatory startup current-zero calibration

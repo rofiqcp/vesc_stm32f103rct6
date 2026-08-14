@@ -5,6 +5,7 @@
 #include "motor_control.h"
 #include "foc_control.h"
 #include "vesc_comm.h"
+#include "vesc_uart.h"
 #include "app_config.h"
 #include "board_pins.h"
 
@@ -36,14 +37,42 @@ void DMA1_Channel1_IRQHandler(void) {
     }
 }
 
-void USART2_IRQHandler(void) {
+void USART3_IRQHandler(void) {
     uint32_t sr = VESC_UART->SR;
-    if ((sr & (USART_SR_RXNE | USART_SR_ORE)) != 0U) {
+
+    /* RX: ISR only moves one byte into the software queue. Parsing, CRC and
+       command processing stay in packet_process_thread. */
+    if ((sr & USART_SR_RXNE) != 0U) {
         uint8_t b = (uint8_t)VESC_UART->DR;
-        if ((sr & USART_SR_RXNE) != 0U) {
-            vesc_comm_uart_rx_isr_byte(b);
-            vesc_comm_notify_from_isr();
+        vesc_uart_rx_isr_put(b);
+    }
+
+    /* STM32F1 clears ORE/NE/FE/PE with an SR->DR read sequence. */
+    if ((sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) != 0U) {
+        volatile uint32_t dummy;
+        dummy = VESC_UART->SR;
+        dummy = VESC_UART->DR;
+        (void)dummy;
+        vesc_uart_error_isr();
+    }
+
+    /* TX: feed DR from the software output queue whenever TXE is set. */
+    if (((VESC_UART->CR1 & USART_CR1_TXEIE) != 0U) &&
+        ((sr & USART_SR_TXE) != 0U)) {
+        uint8_t b;
+        if (vesc_uart_tx_isr_get(&b)) {
+            VESC_UART->DR = b;
+        } else {
+            VESC_UART->CR1 &= ~USART_CR1_TXEIE;
+            VESC_UART->CR1 |= USART_CR1_TCIE;
         }
+    }
+
+    /* TC means the last queued byte has physically left the USART shifter. */
+    if (((VESC_UART->CR1 & USART_CR1_TCIE) != 0U) &&
+        ((sr & USART_SR_TC) != 0U)) {
+        VESC_UART->CR1 &= ~USART_CR1_TCIE;
+        vesc_uart_tx_complete_isr();
     }
 }
 

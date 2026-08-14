@@ -1,4 +1,5 @@
 #include "vesc_comm.h"
+#include "vesc_uart.h"
 #include "vesc_packet.h"
 #include "motor_control.h"
 #include "motor_hw.h"
@@ -11,10 +12,11 @@
 #include <string.h>
 #include <math.h>
 
-#define RX_RING_SIZE 512U
-#define TX_FRAME_SIZE 256U
+#define TX_FRAME_SIZE     224U
+#define BLOCK_QUEUE_DEPTH 1U
+#define BLOCK_DATA_MAX    96U
 
-/* Current VESC command numbers used by this firmware. */
+/* VESC command IDs used by this firmware. */
 enum {
     COMM_FW_VERSION = 0,
     COMM_GET_VALUES = 4,
@@ -25,14 +27,20 @@ enum {
     COMM_SET_POS = 9,
     COMM_SET_DETECT = 11,
     COMM_SAMPLE_PRINT = 19,
+    COMM_PRINT = 21,
     COMM_ROTOR_POSITION = 22,
+    COMM_DETECT_MOTOR_PARAM = 24,
+    COMM_DETECT_MOTOR_R_L = 25,
+    COMM_DETECT_MOTOR_FLUX_LINKAGE = 26,
     COMM_DETECT_ENCODER = 27,
     COMM_DETECT_HALL_FOC = 28,
     COMM_REBOOT = 29,
     COMM_ALIVE = 30,
     COMM_CUSTOM_APP_DATA = 36,
     COMM_GET_VALUES_SETUP = 47,
-    COMM_GET_VALUES_SELECTIVE = 50
+    COMM_GET_VALUES_SELECTIVE = 50,
+    COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP = 57,
+    COMM_DETECT_APPLY_ALL_FOC = 58
 };
 
 enum {
@@ -46,21 +54,38 @@ enum {
     CUSTOM_SAMPLE_START = 0xA7,
     CUSTOM_EXT_TELEMETRY = 0xA8,
     CUSTOM_SENSOR_INFO = 0xA9,
+    CUSTOM_COMM_DIAG = 0xAA,
     CUSTOM_SAMPLE_DATA = 0xB0
 };
 
-static uint8_t s_rx_ring[RX_RING_SIZE];
-static volatile uint16_t s_rx_wr;
-static volatile uint16_t s_rx_rd;
+typedef struct {
+    uint8_t cmd;
+    uint8_t motor;
+    uint16_t len;
+    uint8_t data[BLOCK_DATA_MAX];
+} detect_job_t;
+
+typedef struct {
+    volatile uint32_t rx_frames_ok;
+    volatile uint32_t tx_frames;
+    volatile uint32_t blocking_busy_drops;
+} comm_diag_t;
+
 static vesc_packet_parser_t s_parser;
-static osThreadId_t s_comm_tid;
-static osMutexId_t s_tx_mutex;
+
+static osThreadId_t s_blocking_tid;
+static osMessageQueueId_t s_block_queue;
 static osMutexId_t s_payload_mutex;
+
 static volatile motor_id_t s_selected_motor = MOTOR_LEFT;
 static volatile uint8_t s_display_mode[2];
-static volatile uint8_t s_pending_detect_reply[2];
-static uint8_t s_tx_frame[TX_FRAME_SIZE];
 static uint8_t s_tx_payload[TX_FRAME_SIZE - 8U];
+static comm_diag_t s_diag;
+
+static void process_payload(const uint8_t *data, uint16_t len);
+static void packet_process_thread(void *argument);
+static void blocking_thread(void *argument);
+static void vesc_comm_reply_diag(void);
 
 static int32_t get_i32_be(const uint8_t *p) {
     return (int32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
@@ -148,34 +173,15 @@ static void payload_end(uint16_t len) {
     }
 }
 
-void vesc_comm_send_payload(const uint8_t *payload, uint16_t len) {
-    if (payload == NULL || len == 0U || len > sizeof(s_tx_payload)) {
-        return;
-    }
-
-    if (s_tx_mutex != NULL) {
-        if (osMutexAcquire(s_tx_mutex, 100U) != osOK) {
-            return;
-        }
-    }
-
-    uint16_t n = vesc_packet_encode(payload, len, s_tx_frame, sizeof(s_tx_frame));
-    if (n > 0U) {
-        motor_hw_uart_tx(s_tx_frame, n);
-    }
-
-    if (s_tx_mutex != NULL) {
-        (void)osMutexRelease(s_tx_mutex);
-    }
-}
-
 static void reply_fw_version(void) {
     uint16_t i = 0U;
     uint8_t *p = payload_begin();
     if (p == NULL) return;
     p[i++] = COMM_FW_VERSION;
+    /* Protocol version fields mirror the current upstream VESC 7.01 packet
+       layout so current VESC Tool parses all trailing FW_RX_PARAMS fields. */
     p[i++] = 7U;
-    p[i++] = 0U;
+    p[i++] = 1U;
 
     const char hw[] = "STM32F103RC_DUAL_FOC";
     memcpy(&p[i], hw, sizeof(hw));
@@ -194,7 +200,7 @@ static void reply_fw_version(void) {
     }
 
     p[i++] = 1U; /* pairing done */
-    p[i++] = 0U; /* test version */
+    p[i++] = 1U; /* VESC 7.01 master test-version field */
     p[i++] = 0U; /* HW_TYPE_VESC */
     p[i++] = 0U; /* custom-config count */
     p[i++] = 0U; /* phase filters */
@@ -202,7 +208,7 @@ static void reply_fw_version(void) {
     p[i++] = 0U; /* APP QML */
     p[i++] = 0U; /* NRF flags */
 
-    const char fw[] = "F103_DUAL_FOC_RTOS2_V3";
+    const char fw[] = "F103_DUAL_FOC_RTOS2_V5";
     memcpy(&p[i], fw, sizeof(fw));
     i = (uint16_t)(i + sizeof(fw));
     put_u32(p, &i, 0U);
@@ -504,16 +510,134 @@ static void process_custom(const uint8_t *data, uint16_t len) {
         reply_extended((data[2] == 1U) ? MOTOR_RIGHT : MOTOR_LEFT);
     } else if (sub == CUSTOM_SENSOR_INFO && len >= 3U) {
         reply_sensor_info((data[2] == 1U) ? MOTOR_RIGHT : MOTOR_LEFT);
+    } else if (sub == CUSTOM_COMM_DIAG) {
+        vesc_comm_reply_diag();
+    }
+}
+
+
+static bool is_blocking_command(uint8_t cmd) {
+    switch (cmd) {
+        case COMM_DETECT_MOTOR_PARAM:
+        case COMM_DETECT_MOTOR_R_L:
+        case COMM_DETECT_MOTOR_FLUX_LINKAGE:
+        case COMM_DETECT_ENCODER:
+        case COMM_DETECT_HALL_FOC:
+        case COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP:
+        case COMM_DETECT_APPLY_ALL_FOC:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool queue_blocking_job(const uint8_t *data, uint16_t len) {
+    if (data == NULL || len == 0U || s_block_queue == NULL) return false;
+    detect_job_t job;
+    memset(&job, 0, sizeof(job));
+    job.cmd = data[0];
+    job.motor = (uint8_t)s_selected_motor;
+    job.len = len > BLOCK_DATA_MAX ? BLOCK_DATA_MAX : len;
+    memcpy(job.data, data, job.len);
+    if (osMessageQueuePut(s_block_queue, &job, 0U, 0U) != osOK) {
+        s_diag.blocking_busy_drops++;
+        return false;
+    }
+    return true;
+}
+
+static void send_print(const char *msg) {
+    if (msg == NULL) return;
+    uint8_t p[96];
+    uint16_t i = 0U;
+    p[i++] = COMM_PRINT;
+    size_t n = strlen(msg);
+    if (n > sizeof(p) - 2U) n = sizeof(p) - 2U;
+    memcpy(&p[i], msg, n);
+    i = (uint16_t)(i + n);
+    p[i++] = 0U;
+    vesc_comm_send_payload(p, i);
+}
+
+static void reply_unsupported_blocking(uint8_t cmd) {
+    uint8_t p[24];
+    uint16_t i = 0U;
+    p[i++] = cmd;
+    switch (cmd) {
+        case COMM_DETECT_MOTOR_PARAM:
+            /* cycle_int_limit, bemf coupling, hall table, hall result */
+            put_i32(p, &i, 0);
+            put_i32(p, &i, 0);
+            for (uint8_t k = 0U; k < 8U; k++) p[i++] = 255U;
+            p[i++] = 1U;
+            break;
+        case COMM_DETECT_MOTOR_R_L:
+            /* R, L, Ld-Lq. Zero is a deliberate failure sentinel here. */
+            put_i32(p, &i, 0);
+            put_i32(p, &i, 0);
+            put_i32(p, &i, 0);
+            break;
+        case COMM_DETECT_MOTOR_FLUX_LINKAGE:
+        case COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP:
+            put_i32(p, &i, 0);
+            break;
+        case COMM_DETECT_APPLY_ALL_FOC:
+            /* Negative result: this build does not fake R/L/flux measurements. */
+            put_i16(p, &i, -1);
+            break;
+        default:
+            break;
+    }
+    vesc_comm_send_payload(p, i);
+    send_print("F103 V5: requested full motor-parameter detect is not implemented; sensor detect is available.");
+}
+
+static bool wait_sensor_detect(MotorRuntime *m, uint32_t timeout_ms) {
+    uint32_t start = osKernelGetTickCount();
+    while ((uint32_t)(osKernelGetTickCount() - start) < timeout_ms) {
+        if (m->detect.state == SENSOR_DETECT_DONE) return true;
+        if (m->detect.state == SENSOR_DETECT_FAILED) return false;
+        osDelay(10U);
+    }
+    return false;
+}
+
+static void blocking_thread(void *argument) {
+    (void)argument;
+    detect_job_t job;
+    for (;;) {
+        if (osMessageQueueGet(s_block_queue, &job, NULL, osWaitForever) != osOK) continue;
+        MotorRuntime *m = motor_get(job.motor == (uint8_t)MOTOR_RIGHT ? MOTOR_RIGHT : MOTOR_LEFT);
+
+        if (job.cmd == COMM_DETECT_ENCODER) {
+            bool started = (m->id == MOTOR_LEFT) && sensor_detect_request(m, SENSOR_MODE_ENCODER);
+            if (started) (void)wait_sensor_detect(m, 30000U);
+            reply_standard_detect(m, COMM_DETECT_ENCODER);
+        } else if (job.cmd == COMM_DETECT_HALL_FOC) {
+            bool started = sensor_detect_request(m, SENSOR_MODE_HALL);
+            if (started) (void)wait_sensor_detect(m, 30000U);
+            reply_standard_detect(m, COMM_DETECT_HALL_FOC);
+        } else {
+            reply_unsupported_blocking(job.cmd);
+        }
     }
 }
 
 static void process_payload(const uint8_t *data, uint16_t len) {
     if (len == 0U) return;
+    s_diag.rx_frames_ok++;
     uint8_t cmd = data[0];
     MotorRuntime *m = motor_get(s_selected_motor);
 
+    if (is_blocking_command(cmd)) {
+        (void)queue_blocking_job(data, len);
+        return;
+    }
+
     switch (cmd) {
         case COMM_FW_VERSION:
+            /* Handshake is intentionally immediate: no periodic thread, no ADC
+               thread, and no motor state is required to answer this command. */
             reply_fw_version();
             break;
         case COMM_GET_VALUES:
@@ -550,18 +674,9 @@ static void process_payload(const uint8_t *data, uint16_t len) {
                 debug_sample_start(s_selected_motor, sample_len, decimation);
             }
             break;
-        case COMM_DETECT_ENCODER:
-            if (m->id == MOTOR_LEFT && sensor_detect_request(m, SENSOR_MODE_ENCODER)) {
-                s_pending_detect_reply[0] = COMM_DETECT_ENCODER;
-            }
-            break;
-        case COMM_DETECT_HALL_FOC:
-            if (sensor_detect_request(m, SENSOR_MODE_HALL)) {
-                s_pending_detect_reply[(m->id == MOTOR_RIGHT) ? 1U : 0U] = COMM_DETECT_HALL_FOC;
-            }
-            break;
         case COMM_REBOOT:
             motor_hw_emergency_all_off();
+            osDelay(20U);
             NVIC_SystemReset();
             break;
         case COMM_ALIVE:
@@ -575,53 +690,71 @@ static void process_payload(const uint8_t *data, uint16_t len) {
     }
 }
 
-void vesc_comm_uart_rx_isr_byte(uint8_t b) {
-    uint16_t next = (uint16_t)((s_rx_wr + 1U) % RX_RING_SIZE);
-    if (next != s_rx_rd) {
-        s_rx_ring[s_rx_wr] = b;
-        s_rx_wr = next;
-    }
-}
-
-void vesc_comm_notify_from_isr(void) {
-    if (s_comm_tid != NULL) {
-        (void)osThreadFlagsSet(s_comm_tid, 1U);
-    }
-}
-
-void vesc_comm_thread(void *argument) {
+static void packet_process_thread(void *argument) {
     (void)argument;
     vesc_packet_parser_init(&s_parser);
-    motor_hw_uart_start_rx_irq();
+    vesc_comm_thread_id = osThreadGetId();
+
     for (;;) {
-        (void)osThreadFlagsWait(1U, osFlagsWaitAny, osWaitForever);
-        while (s_rx_rd != s_rx_wr) {
-            uint8_t b = s_rx_ring[s_rx_rd];
-            s_rx_rd = (uint16_t)((s_rx_rd + 1U) % RX_RING_SIZE);
-            vesc_packet_process_byte(&s_parser, b, process_payload);
+        /* Wake on the empty->non-empty transition, but retain a short timeout
+           so bytes received before this thread ID became visible cannot get
+           stranded in the ring. */
+        uint32_t flags = osThreadFlagsWait(VESC_RX_AVAILABLE | VESC_TX_COMPLETE,
+                                           osFlagsWaitAny, 10U);
+        if ((flags & osFlagsError) != 0U) flags = 0U;
+        (void)flags;
+
+        uint8_t byte;
+        while (vesc_uart_rx_get(&byte)) {
+            vesc_packet_process_byte(&s_parser, byte, process_payload);
         }
     }
+}
+
+void vesc_comm_send_payload(const uint8_t *payload, uint16_t len) {
+    if (payload == NULL || len == 0U) return;
+
+    uint8_t frame[TX_FRAME_SIZE];
+    uint16_t frame_len = vesc_packet_encode(payload, len, frame, sizeof(frame));
+    if (frame_len == 0U) {
+        return;
+    }
+
+    /* packet.c-style framing is complete before bytes enter the TX software
+       ring. The USART3 TXE ISR is the only code that writes them to DR. */
+    if (vesc_uart_write_raw(frame, frame_len)) {
+        s_diag.tx_frames++;
+    }
+}
+
+static void vesc_comm_reply_diag(void) {
+    const vesc_uart_stats_t *u = vesc_uart_get_stats();
+    uint8_t p[64];
+    uint16_t i = 0U;
+    p[i++] = COMM_CUSTOM_APP_DATA;
+    p[i++] = CUSTOM_COMM_DIAG;
+    p[i++] = 5U;
+    put_u32(p, &i, u->rx_bytes);
+    put_u32(p, &i, u->rx_overruns);
+    put_u32(p, &i, s_diag.rx_frames_ok);
+    put_u32(p, &i, u->tx_bytes);
+    put_u32(p, &i, u->uart_errors);
+    put_u32(p, &i, s_diag.tx_frames);
+    put_u32(p, &i, u->tx_overruns);
+    put_u32(p, &i, u->tx_complete_count);
+    put_u32(p, &i, s_diag.blocking_busy_drops);
+    put_u32(p, &i, VESC_UART_BAUD);
+    p[i++] = 0U; /* no RTOS TX message queue in V5 */
+    p[i++] = (uint8_t)osMessageQueueGetCount(s_block_queue);
+    vesc_comm_send_payload(p, i);
 }
 
 void vesc_comm_periodic_100hz(void) {
     send_rotor_position(s_selected_motor);
-
-    for (uint8_t idx = 0U; idx < 2U; idx++) {
-        uint8_t pending = s_pending_detect_reply[idx];
-        if (pending != 0U) {
-            MotorRuntime *m = motor_get((idx == 1U) ? MOTOR_RIGHT : MOTOR_LEFT);
-            if (m->detect.state == SENSOR_DETECT_DONE || m->detect.state == SENSOR_DETECT_FAILED) {
-                s_pending_detect_reply[idx] = 0U;
-                reply_standard_detect(m, pending);
-            }
-        }
-    }
 }
 
 void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count) {
     if (samples == NULL || count == 0U) return;
-
-    /* Chunk debug data so each VESC frame stays small. Each sample is 24 B. */
     const uint8_t samples_per_packet = 8U;
     uint16_t offset = 0U;
     while (offset < count) {
@@ -635,22 +768,14 @@ void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count)
         put_u16(p, &i, offset);
         put_u16(p, &i, count);
         p[i++] = n;
-
         for (uint8_t k = 0U; k < n; k++) {
             const debug_sample_t *d = &samples[offset + k];
-            put_i16(p, &i, d->ia_cA);
-            put_i16(p, &i, d->ib_cA);
-            put_i16(p, &i, d->id_cA);
-            put_i16(p, &i, d->iq_cA);
-            put_i16(p, &i, d->vd_cV);
-            put_i16(p, &i, d->vq_cV);
-            put_i16(p, &i, d->erpm);
-            put_u16(p, &i, d->phase_u16);
-            put_u16(p, &i, d->duty_u_q15);
-            put_u16(p, &i, d->duty_v_q15);
-            put_u16(p, &i, d->duty_w_q15);
-            p[i++] = d->motor;
-            p[i++] = d->hall_raw;
+            put_i16(p, &i, d->ia_cA); put_i16(p, &i, d->ib_cA);
+            put_i16(p, &i, d->id_cA); put_i16(p, &i, d->iq_cA);
+            put_i16(p, &i, d->vd_cV); put_i16(p, &i, d->vq_cV);
+            put_i16(p, &i, d->erpm); put_u16(p, &i, d->phase_u16);
+            put_u16(p, &i, d->duty_u_q15); put_u16(p, &i, d->duty_v_q15);
+            put_u16(p, &i, d->duty_w_q15); p[i++] = d->motor; p[i++] = d->hall_raw;
         }
         payload_end(i);
         offset = (uint16_t)(offset + n);
@@ -659,15 +784,21 @@ void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count)
 }
 
 void vesc_comm_task_init(void) {
-    const osMutexAttr_t mutex_attr = {.name = "VescTxMutex"};
-    const osMutexAttr_t payload_mutex_attr = {.name = "VescPayloadMutex"};
-    s_tx_mutex = osMutexNew(&mutex_attr);
+    memset((void *)&s_diag, 0, sizeof(s_diag));
+
+    /* Must be called after osKernelInitialize(): vesc_uart_init creates the TX
+       mutex used to serialize packet writers. UART DMA requests stay disabled. */
+    vesc_uart_init();
+
+    const osMutexAttr_t payload_mutex_attr = {.name = "VescPayload"};
     s_payload_mutex = osMutexNew(&payload_mutex_attr);
 
-    const osThreadAttr_t attr = {
-        .name = "vesc_comm_thread",
-        .priority = osPriorityNormal,
-        .stack_size = 768U
-    };
-    s_comm_tid = osThreadNew(vesc_comm_thread, NULL, &attr);
+    const osMessageQueueAttr_t blockq_attr = {.name = "VescBlockQ"};
+    s_block_queue = osMessageQueueNew(BLOCK_QUEUE_DEPTH, sizeof(detect_job_t), &blockq_attr);
+
+    const osThreadAttr_t packet_attr = {.name="packet_process_thread", .priority=osPriorityAboveNormal, .stack_size=896U};
+    const osThreadAttr_t block_attr = {.name="blocking_thread", .priority=osPriorityAboveNormal, .stack_size=896U};
+    (void)osThreadNew(packet_process_thread, NULL, &packet_attr);
+    s_blocking_tid = osThreadNew(blocking_thread, NULL, &block_attr);
+    (void)s_blocking_tid;
 }

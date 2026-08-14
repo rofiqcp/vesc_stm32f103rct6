@@ -14,7 +14,7 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
-UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart3;
 volatile uint32_t g_adc_dual_dma[4] __attribute__((aligned(4)));
 
 static void Error_Handler_Local(void) {
@@ -268,29 +268,33 @@ static void init_adc_dma(void) {
 }
 
 static void init_uart(void) {
-    __HAL_RCC_USART2_CLK_ENABLE();
+    __HAL_RCC_USART3_CLK_ENABLE();
 
     GPIO_InitTypeDef g = {0};
     g.Pin = VESC_UART_TX_PIN;
     g.Mode = GPIO_MODE_AF_PP;
     g.Speed = GPIO_SPEED_FREQ_HIGH;
     HAL_GPIO_Init(VESC_UART_TX_PORT, &g);
+
     g.Pin = VESC_UART_RX_PIN;
     g.Mode = GPIO_MODE_INPUT;
     g.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(VESC_UART_RX_PORT, &g);
 
-    huart2.Instance = VESC_UART;
-    huart2.Init.BaudRate = VESC_UART_BAUD;
-    huart2.Init.WordLength = UART_WORDLENGTH_8B;
-    huart2.Init.StopBits = UART_STOPBITS_1;
-    huart2.Init.Parity = UART_PARITY_NONE;
-    huart2.Init.Mode = UART_MODE_TX_RX;
-    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-    if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler_Local();
-    HAL_NVIC_SetPriority(USART2_IRQn, 6, 0); /* RTOS-safe priority */
-    HAL_NVIC_EnableIRQ(USART2_IRQn);
+    huart3.Instance = VESC_UART;
+    huart3.Init.BaudRate = VESC_UART_BAUD;
+    huart3.Init.WordLength = UART_WORDLENGTH_8B;
+    huart3.Init.StopBits = UART_STOPBITS_1;
+    huart3.Init.Parity = UART_PARITY_NONE;
+    huart3.Init.Mode = UART_MODE_TX_RX;
+    huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart3) != HAL_OK) Error_Handler_Local();
+
+    /* VESC UART transport is serviced manually from USART3_IRQHandler().
+       Priority 6 is RTOS-safe because configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY=5. */
+    HAL_NVIC_SetPriority(USART3_IRQn, 6, 0);
+    HAL_NVIC_EnableIRQ(USART3_IRQn);
 }
 
 void motor_hw_init(void) {
@@ -459,17 +463,6 @@ void motor_hw_buzzer(bool on) {
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-void motor_hw_uart_tx(const uint8_t *data, uint16_t len) {
-    for (uint16_t i = 0; i < len; i++) {
-        while ((VESC_UART->SR & USART_SR_TXE) == 0U) { }
-        VESC_UART->DR = data[i];
-    }
-    while ((VESC_UART->SR & USART_SR_TC) == 0U) { }
-}
-
-void motor_hw_uart_start_rx_irq(void) {
-    VESC_UART->CR1 |= USART_CR1_RXNEIE;
-}
 
 void motor_hw_emergency_all_off(void) {
     TIM1->BDTR &= ~TIM_BDTR_MOE;

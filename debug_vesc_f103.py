@@ -45,6 +45,7 @@ CUSTOM_CURRENT_CAL = 0xA6
 CUSTOM_SAMPLE_START = 0xA7
 CUSTOM_EXT_TELEMETRY = 0xA8
 CUSTOM_SENSOR_INFO = 0xA9
+CUSTOM_COMM_DIAG = 0xAA
 CUSTOM_SAMPLE_DATA = 0xB0
 
 SENSOR_AUTO = 0
@@ -155,6 +156,35 @@ class Reader:
     def u16(self) -> int: return struct.unpack(">H", self._take(2))[0]
     def i32(self) -> int: return struct.unpack(">i", self._take(4))[0]
     def u32(self) -> int: return struct.unpack(">I", self._take(4))[0]
+
+    def cstring(self) -> str:
+        end = self.data.find(b"\x00", self.i)
+        if end < 0:
+            raise ValueError("string firmware tidak terminated NUL")
+        raw = self.data[self.i:end]
+        self.i = end + 1
+        return raw.decode("ascii", errors="replace")
+
+
+def parse_fw_version(p: bytes) -> dict:
+    if len(p) < 3 or p[0] != COMM_FW_VERSION:
+        raise ValueError("bukan COMM_FW_VERSION")
+    r = Reader(p, 1)
+    d = {"major": r.u8(), "minor": r.u8()}
+    d["hw_name"] = r.cstring()
+    d["uuid"] = r._take(12).hex()
+    d["pairing_done"] = r.u8() if r.i < len(p) else None
+    d["test_version"] = r.u8() if r.i < len(p) else None
+    d["hw_type"] = r.u8() if r.i < len(p) else None
+    d["custom_config_num"] = r.u8() if r.i < len(p) else None
+    d["phase_filters"] = r.u8() if r.i < len(p) else None
+    d["qml_hw"] = r.u8() if r.i < len(p) else None
+    d["qml_app"] = r.u8() if r.i < len(p) else None
+    d["nrf_flags"] = r.u8() if r.i < len(p) else None
+    d["fw_name"] = r.cstring() if r.i < len(p) else ""
+    d["hw_crc"] = r.u32() if len(p) - r.i >= 4 else None
+    d["remaining"] = len(p) - r.i
+    return d
 
 
 class Link:
@@ -328,10 +358,80 @@ def print_values(motor: int, v: Values) -> None:
 
 def cmd_info(link: Link, _args: argparse.Namespace) -> int:
     p=link.request(bytes((COMM_FW_VERSION,)),lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.0)
-    major=p[1] if len(p)>1 else -1; minor=p[2] if len(p)>2 else -1
-    tail=p[3:]
-    print(f"FW protocol reported: {major}.{minor}")
-    print("FW payload ASCII:", ''.join(chr(c) if 32<=c<127 else '.' for c in tail))
+    d=parse_fw_version(p)
+    print(f"FW: {d['major']}.{d['minor']}  name={d['fw_name']}  HW={d['hw_name']}")
+    print(f"UUID={d['uuid']} HW_TYPE={d['hw_type']} custom={d['custom_config_num']} phase_filters={d['phase_filters']} hw_crc={d['hw_crc']}")
+    return 0
+
+
+def _raw_handshake(link: Link, timeout: float = 1.0) -> tuple[bytes, list[bytes]]:
+    tx = frame(bytes((COMM_FW_VERSION,)))
+    link.ser.reset_input_buffer()
+    link.parser = FrameParser()
+    link.pending.clear()
+    print("TX:", tx.hex(" "))
+    link.ser.write(tx); link.ser.flush()
+    raw=bytearray(); parser=FrameParser(); frames=[]
+    deadline=time.monotonic()+timeout
+    while time.monotonic()<deadline:
+        chunk=link.ser.read(link.ser.in_waiting or 1)
+        if chunk:
+            raw.extend(chunk); frames.extend(parser.feed(chunk))
+            if any(p and p[0]==COMM_FW_VERSION for p in frames): break
+    return bytes(raw), frames
+
+
+def cmd_handshake(link: Link, args: argparse.Namespace) -> int:
+    raw,frames=_raw_handshake(link,args.timeout)
+    print("RX raw:", raw.hex(" ") if raw else "<no bytes>")
+    fw=next((p for p in frames if p and p[0]==COMM_FW_VERSION),None)
+    if fw is None:
+        print("FAIL: tidak ada frame COMM_FW_VERSION. Cek PB10/USART3_TX -> adapter RX, PB11/USART3_RX <- adapter TX, GND bersama, dan baud 115200.")
+        return 2
+    print("RX payload:", fw.hex(" "))
+    print(parse_fw_version(fw))
+    print("PASS: framing + CRC + COMM_FW_VERSION reply valid")
+    return 0
+
+
+def cmd_baud_scan(link: Link, args: argparse.Namespace) -> int:
+    rates=[int(x.strip()) for x in args.bauds.split(',') if x.strip()]
+    old=link.ser.baudrate
+    try:
+        for rate in rates:
+            link.ser.baudrate=rate; time.sleep(0.05)
+            print(f"\n=== {rate} baud ===")
+            raw,frames=_raw_handshake(link,args.timeout)
+            fw=next((p for p in frames if p and p[0]==COMM_FW_VERSION),None)
+            if fw is not None:
+                print(parse_fw_version(fw))
+                print(f"FOUND VESC handshake at {rate} baud")
+                return 0
+            print(f"no valid reply ({len(raw)} raw bytes)")
+    finally:
+        link.ser.baudrate=old
+    return 3
+
+
+def parse_comm_diag(p: bytes) -> dict:
+    if len(p)<3 or p[:2]!=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)):
+        raise ValueError("bukan COMM_DIAG")
+    r=Reader(p,2); revision=r.u8()
+    if revision >= 5:
+        names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames','tx_ring_overruns','tx_complete_count','blocking_busy_drops','baud']
+    else:
+        names=['rx_dma_bytes','rx_ring_overruns','rx_frames_ok','uart_idle_events','uart_errors','tx_frames','tx_queue_drops','tx_dma_errors','blocking_busy_drops','baud']
+    d={'revision':revision}
+    for name in names: d[name]=r.u32()
+    d['tx_queue_depth']=r.u8(); d['blocking_queue_depth']=r.u8()
+    return d
+
+
+def cmd_comm_diag(link: Link, _args: argparse.Namespace) -> int:
+    p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                   lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),1.0)
+    d=parse_comm_diag(p)
+    for k,v in d.items(): print(f"{k:22s}: {v}")
     return 0
 
 
@@ -661,13 +761,17 @@ def self_test() -> int:
     for chunk in (fr[:2],fr[2:5],fr[5:]): out.extend(parser.feed(chunk))
     assert out==[payload]
     assert crc16(b"123456789")==0x31C3  # CRC16-CCITT/XMODEM vector
+    fw=(bytes((COMM_FW_VERSION,7,1))+b"STM32F103RC_DUAL_FOC\x00"+bytes(range(12))+
+        bytes((1,1,0,0,0,0,0,0))+b"F103_DUAL_FOC_RTOS2_V5\x00"+struct.pack(">I",0))
+    fwd=parse_fw_version(fw)
+    assert fwd["major"]==7 and fwd["minor"]==1 and fwd["fw_name"].endswith("V5") and fwd["hw_crc"]==0
     # Sample round trip parser smoke test.
     samp=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SAMPLE_DATA))+be_u16(0)+be_u16(1)+bytes((1,))+b''.join([
         be_i16(100),be_i16(-100),be_i16(20),be_i16(30),be_i16(40),be_i16(50),be_i16(600),
         be_u16(32768),be_u16(16384),be_u16(16384),be_u16(16384),bytes((0,5))])
     off,total,rows=parse_sample_packet(samp)
     assert off==0 and total==1 and len(rows)==1 and abs(rows[0]['ia']-1.0)<1e-6
-    print("SELF-TEST PASS: CRC, framing, streaming parser, sample parser")
+    print("SELF-TEST PASS: CRC, framing, VESC FW_VERSION parser, streaming parser, sample parser")
     return 0
 
 
@@ -684,7 +788,10 @@ def main() -> int:
     def sp(name,func,help):
         p=sub.add_parser(name,help=help); add_live_args(p); p.set_defaults(func=func); return p
 
-    sp("info",cmd_info,"read firmware version")
+    sp("info",cmd_info,"read and fully parse VESC firmware version")
+    p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=1.0)
+    p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake"); p.add_argument("--bauds",default="115200,230400,250000,460800,921600"); p.add_argument("--timeout",type=float,default=0.6)
+    sp("comm-diag",cmd_comm_diag,"read firmware USART IRQ/ring diagnostics")
     p=sp("status",cmd_status,"standard VESC telemetry + extended telemetry"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("monitor",cmd_monitor,"monitor both motors"); p.add_argument("--hz",type=float,default=5); p.add_argument("--seconds",type=float,default=10)
     p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration"); p.add_argument("--timeout",type=float,default=5); p.add_argument("--zero-limit",type=float,default=0.30)

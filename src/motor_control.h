@@ -16,6 +16,7 @@ void motor_clear_fault(MotorRuntime *m);
 void motor_touch_command(MotorRuntime *m);
 void motor_keepalive(MotorRuntime *m);
 void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms);
+void motor_rpm_update_1khz(MotorRuntime *m);
 void motor_pid_update_1khz(MotorRuntime *m);
 void motor_raise_fault_from_task(MotorRuntime *m, motor_fault_t fault);
 void motor_request_fault_from_isr(MotorRuntime *m, motor_fault_t fault);

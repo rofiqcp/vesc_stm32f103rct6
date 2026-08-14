@@ -1,68 +1,76 @@
-# FIRST POWER TEST
+# First Test V5
 
-## A. Tanpa power motor / gate disabled
+## A. Uji komunikasi tanpa power motor
+
+1. Flash firmware:
 
 ```bash
 pio run -t clean
 pio run
 pio run -t upload
-python3 debug_vesc_f103.py --self-test
-python3 debug_vesc_f103.py info --port /dev/ttyUSB0
-python3 debug_vesc_f103.py test-all --port /dev/ttyUSB0
 ```
 
-Pastikan startup calibration `done=1 valid=1`.
-
-## B. Verifikasi gate dengan oscilloscope
-
-Sebelum MOSFET diberi bus penuh, pastikan:
+2. Wiring serial:
 
 ```text
-OFF/deadtime: High pin LOW, Low pin HIGH
-High FET ON : High pin HIGH
-Low  FET ON : Low pin LOW
+USB-UART TX -> PB11 / USART3_RX
+USB-UART RX <- PB10 / USART3_TX
+GND         -> GND
+baud        = 115200 8N1
 ```
 
-Tidak boleh ada overlap gate HIGH-side dan low-side secara fisik.
-
-## C. Verifikasi ADC zero
+3. Jalankan:
 
 ```bash
-python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0
-python3 debug_vesc_f103.py status --port /dev/ttyUSB0
+python3 -m pip install pyserial
+python3 debug_vesc_f103.py --self-test
+python3 debug_vesc_f103.py handshake --port /dev/ttyUSB0 --baud 115200 --timeout 1.5
 ```
 
-Id/Iq/Imotor/Ibatt harus dekat nol saat tidak ada arus. Jika offset valid tetapi Ampere terlalu besar/kecil saat arus nyata diberikan, perbaiki A/count di `src/app_config.h`.
+Jangan lanjut sebelum handshake memberi:
 
-## D. Sensor auto-detect
+```text
+PASS: framing + CRC + COMM_FW_VERSION reply valid
+```
 
-Motor harus bebas bergerak dan current scaling sudah diverifikasi.
+4. Setelah PASS:
 
 ```bash
-python3 debug_vesc_f103.py sensor-detect --port /dev/ttyUSB0 --motor 0 --mode auto --yes
-python3 debug_vesc_f103.py sensor-detect --port /dev/ttyUSB0 --motor 1 --mode auto --yes
+python3 debug_vesc_f103.py comm-diag --port /dev/ttyUSB0 --baud 115200
+python3 debug_vesc_f103.py info --port /dev/ttyUSB0 --baud 115200
+python3 debug_vesc_f103.py test-all --port /dev/ttyUSB0 --baud 115200
 ```
 
-LEFT dapat jatuh ke Hall atau Encoder. Untuk memaksa encoder:
+## B. Baru uji ADC/current zero
+
+Power stage tetap tidak diberi command motor.
 
 ```bash
-python3 debug_vesc_f103.py sensor-detect --port /dev/ttyUSB0 --motor 0 --mode encoder --yes
+python3 debug_vesc_f103.py calibrate --port /dev/ttyUSB0 --baud 115200
 ```
 
-## E. Arus kecil
+Pastikan calibration done/valid dan Id/Iq/Imotor dekat nol.
+
+## C. Sensor
 
 ```bash
-python3 debug_vesc_f103.py motor-test --port /dev/ttyUSB0 --motor 0 --mode current --value 0.5 --seconds 1 --yes
-python3 debug_vesc_f103.py motor-test --port /dev/ttyUSB0 --motor 0 --mode current --value -0.5 --seconds 1 --yes
+python3 debug_vesc_f103.py sensor-info --port /dev/ttyUSB0
 ```
 
-Pantau Id, Iq, Vd, Vq, Imotor, Ibatt, duty, ERPM, rotor angle dan fault.
+Auto-detect hanya ketika roda bebas dan area aman.
 
-## F. Baru RPM
+## D. Motor aktif
 
-```bash
-python3 debug_vesc_f103.py motor-test --port /dev/ttyUSB0 --motor 0 --mode rpm --value 300 --seconds 2 --yes
-python3 debug_vesc_f103.py motor-test --port /dev/ttyUSB0 --motor 0 --mode rpm --value -300 --seconds 2 --yes
-```
+Pastikan terlebih dahulu:
 
-Jangan langsung menaikkan current/RPM sampai A/count, phase order, Hall/encoder angle dan ISR margin terbukti benar.
+- current sensor gain benar,
+- DC-link scale benar,
+- phase U/V/W benar,
+- high-side active HIGH,
+- low-side active LOW,
+- deadtime benar,
+- current limit rendah,
+- roda terangkat.
+
+Kemudian gunakan `full-test --yes` dengan current kecil.
+

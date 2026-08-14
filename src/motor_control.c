@@ -167,6 +167,19 @@ static void update_hall_speed_position(MotorRuntime *m) {
     m->position_deg=((float)m->hall.edge_count*60.0f)/(float)m->pole_pairs;
 }
 
+void motor_rpm_update_1khz(MotorRuntime *m) {
+    if (m == NULL) return;
+    if (m->sensor_mode == SENSOR_MODE_ENCODER) {
+        update_encoder_speed_position(m);
+    } else if (m->sensor_mode == SENSOR_MODE_HALL) {
+        update_hall_speed_position(m);
+    } else {
+        m->erpm = 0.0f;
+        m->mech_rpm = 0.0f;
+    }
+    m->erpm_int = (int32_t)m->erpm;
+}
+
 static float lp(float oldv, float newv, float a) { return oldv + a*(newv-oldv); }
 
 void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms) {
@@ -183,8 +196,6 @@ void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms) {
     m->vbus_filter=lp(m->vbus_filter,m->vbus,VBUS_FILTER_CONST);
     float imag=sqrtf(m->id_filter*m->id_filter + m->iq_filter*m->iq_filter); m->motor_current=((m->vq_filter*m->iq_filter)>=0.0f)?imag:-imag;
 
-    if (m->sensor_mode==SENSOR_MODE_ENCODER) update_encoder_speed_position(m); else if(m->sensor_mode==SENSOR_MODE_HALL) update_hall_speed_position(m);
-    m->erpm_int = (int32_t)m->erpm;
     m->rotor_elec_deg=((float)motor_sensor_electrical_phase_u16(m)*360.0f)/65536.0f;
 
     if (m->command_active && !m->detect.busy &&
