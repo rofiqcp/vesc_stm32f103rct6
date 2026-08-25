@@ -1,0 +1,120 @@
+/* STM32F103RCT6: reserve final 8 KiB (0x0803E000..0x0803FFFF)
+ * for transactional VESC Motor/App configuration storage. */
+ENTRY(Reset_Handler)
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);
+/* FreeRTOS/CMSIS-RTOS2 uses heap_4 (ucHeap) for all dynamic RTOS objects.
+ * The application does not call newlib malloc/calloc/realloc/free, so a
+ * second libc heap reserve wastes F103 SRAM. MSP/ISR stack remains 2 KiB. */
+_Min_Heap_Size = 0x000;
+_Min_Stack_Size = 0x800;
+
+MEMORY
+{
+  RAM   (xrw) : ORIGIN = 0x20000000, LENGTH = 48K
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 248K
+}
+
+SECTIONS
+{
+  .isr_vector :
+  {
+    . = ALIGN(4);
+    KEEP(*(.isr_vector))
+    . = ALIGN(4);
+  } >FLASH
+
+  .text :
+  {
+    . = ALIGN(4);
+    *(.text)
+    *(.text*)
+    *(.glue_7)
+    *(.glue_7t)
+    *(.eh_frame)
+    KEEP(*(.init))
+    KEEP(*(.fini))
+    . = ALIGN(4);
+    _etext = .;
+  } >FLASH
+
+  .rodata :
+  {
+    . = ALIGN(4);
+    *(.rodata)
+    *(.rodata*)
+    . = ALIGN(4);
+  } >FLASH
+
+  .ARM.extab :
+  {
+    *(.ARM.extab* .gnu.linkonce.armextab.*)
+  } >FLASH
+
+  .ARM :
+  {
+    __exidx_start = .;
+    *(.ARM.exidx*)
+    __exidx_end = .;
+  } >FLASH
+
+  .preinit_array :
+  {
+    PROVIDE_HIDDEN(__preinit_array_start = .);
+    KEEP(*(.preinit_array*))
+    PROVIDE_HIDDEN(__preinit_array_end = .);
+  } >FLASH
+
+  .init_array :
+  {
+    PROVIDE_HIDDEN(__init_array_start = .);
+    KEEP(*(SORT(.init_array.*)))
+    KEEP(*(.init_array*))
+    PROVIDE_HIDDEN(__init_array_end = .);
+  } >FLASH
+
+  .fini_array :
+  {
+    PROVIDE_HIDDEN(__fini_array_start = .);
+    KEEP(*(SORT(.fini_array.*)))
+    KEEP(*(.fini_array*))
+    PROVIDE_HIDDEN(__fini_array_end = .);
+  } >FLASH
+
+  _sidata = LOADADDR(.data);
+
+  .data :
+  {
+    . = ALIGN(4);
+    _sdata = .;
+    *(.data)
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } >RAM AT> FLASH
+
+  .bss (NOLOAD) :
+  {
+    . = ALIGN(4);
+    _sbss = .;
+    __bss_start__ = _sbss;
+    *(.bss)
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+    __bss_end__ = _ebss;
+  } >RAM
+
+  ._user_heap_stack (NOLOAD) :
+  {
+    . = ALIGN(8);
+    PROVIDE(end = .);
+    PROVIDE(_end = .);
+    . = . + _Min_Heap_Size;
+    . = . + _Min_Stack_Size;
+    . = ALIGN(8);
+  } >RAM
+
+  .ARM.attributes 0 : { *(.ARM.attributes) }
+}

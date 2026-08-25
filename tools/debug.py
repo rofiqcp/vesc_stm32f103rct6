@@ -35,13 +35,30 @@ COMM_SET_RPM = 8
 COMM_SET_POS = 9
 COMM_SET_HANDBRAKE = 10
 COMM_SET_DETECT = 11
+COMM_SET_MCCONF = 13
+COMM_GET_MCCONF = 14
+COMM_GET_MCCONF_DEFAULT = 15
+COMM_SET_APPCONF = 16
+COMM_GET_APPCONF = 17
+COMM_GET_APPCONF_DEFAULT = 18
 COMM_SAMPLE_PRINT = 19
 COMM_ROTOR_POSITION = 22
+COMM_DETECT_MOTOR_R_L = 25
+COMM_DETECT_MOTOR_FLUX_LINKAGE = 26
+COMM_DETECT_ENCODER = 27
+COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
 COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
+COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP = 57
+COMM_DETECT_APPLY_ALL_FOC = 58
 COMM_PING_CAN = 62
 COMM_SET_CURRENT_REL = 84
+
+VESC6_MCCONF_WIRE_SIZE = 481
+VESC6_APPCONF_WIRE_SIZE = 493
+VESC6_MCCONF_SIGNATURE = 776184161
+VESC6_APPCONF_SIGNATURE = 486554156
 
 CUSTOM_SELECT_MOTOR = 0xA0
 CUSTOM_DUAL_SUMMARY = 0xA1
@@ -411,6 +428,18 @@ def parse_cal(p: bytes) -> dict:
                 d["adc_motor_phase_offset_ticks"]=r.u16()
                 d["foc_isr_event_hz"]=r.u32(); d["foc_isr_slot_cycles"]=r.u32()
                 d["tim8_rcr"]=r.u16(); d["tim1_cnt_v15"]=r.u16(); d["tim8_cnt_v15"]=r.u16()
+
+            # V16 appends the independent ADC3/DMA2 DCLINK acquisition state.
+            if d.get("cal_diag_revision",0) >= 16 and len(p)-r.i >= 42:
+                d["adc3_enabled"] = bool(r.u8())
+                d["dma2_ch5_enabled"] = bool(r.u8())
+                d["dma2_ch5_cndtr"] = r.u16()
+                d["adc3_vbus_raw0"] = r.u16(); d["adc3_vbus_raw1"] = r.u16()
+                d["vbus_dma_stale_count"] = r.u8(); _ = r.u8()
+                d["vbus_dma_stale_events"] = r.u32()
+                for name in ("adc3_cr1","adc3_cr2","adc3_sqr1","adc3_sqr3",
+                             "dma2_ch5_ccr","dma2_ch5_cndtr32","dma2_isr"):
+                    d.setdefault("registers",{})[name] = r.u32()
     return d
 
 
@@ -463,6 +492,10 @@ def parse_extended(p: bytes) -> dict:
     d={}
     d["motor"]=r.u8(); d["revision"]=r.u8(); d["controller_id"]=r.u8(); d["sensor_mode"]=r.u8(); d["native_fault"]=r.u8(); d["native_fault_name"]=NATIVE_FAULT_NAMES.get(d["native_fault"],"?"); d["detect_state"]=r.u8()
     d["cal_done"]=bool(r.u8()); d["cal_valid"]=bool(r.u8()); d["hall_raw"]=r.u8(); d["pole_pairs"]=r.u8(); d["encoder_inverted"]=bool(r.u8())
+    if d["revision"] >= 6:
+        d["phase_current_a"]=r.i32()/1000.0
+        d["phase_current_b"]=r.i32()/1000.0
+        d["phase_current_c"]=r.i32()/1000.0
     names_scales=[("id",1000),("iq",1000),("id_filter",1000),("iq_filter",1000),("vd",1000),("vq",1000),
                   ("imotor",1000),("ibatt",1000),("erpm",1),("mech_rpm",10),("position_deg",1000),("rotor_elec_deg",1000),
                   ("vbus",1000),("duty",100000)]
@@ -470,6 +503,15 @@ def parse_extended(p: bytes) -> dict:
     d["offset_u"]=r.i32(); d["offset_v"]=r.i32(); d["offset_dc"]=r.i32()
     d["cal_count"]=r.u32(); d["cal_target"]=r.u32(); d["isr_max_cycles"]=r.u32(); d["isr_overruns"]=r.u32()
     d["encoder_count"]=r.i32(); d["encoder_offset_u16"]=r.u16()
+    if d["revision"] >= 5 and len(p)-r.i >= 55:
+        d["observer_valid"]=bool(r.u8()); d["using_encoder"]=bool(r.u8()); d["encoder_synced"]=bool(r.u8())
+        d["observer_phase_deg"]=r.i32()/1000.0; d["observer_erpm"]=r.i32(); d["observer_quality"]=r.i32()/100000.0
+        d["foc_motor_r_ohm"]=r.i32()/1000000.0; d["foc_motor_l_h"]=r.i32()/1000000000.0
+        d["foc_motor_ld_lq_diff_h"]=r.i32()/1000000000.0; d["foc_motor_flux_linkage_wb"]=r.i32()/10000000.0
+        d["foc_sl_erpm_start"]=r.i32(); d["foc_sl_erpm"]=r.i32(); d["foc_openloop_rpm"]=r.i32(); d["foc_openloop_rpm_low"]=r.i32()
+        d["current_loop_hz"]=r.u32(); d["telemetry_snapshot_hz"]=r.u32()
+        if d["revision"] >= 7 and len(p)-r.i >= 1:
+            d["foc_sensor_mode"]=r.u8()
     return d
 
 
@@ -492,6 +534,80 @@ def cmd_info(link: Link, _args: argparse.Namespace) -> int:
     d=parse_fw_version(p)
     print(f"FW: {d['major']}.{d['minor']}  name={d['fw_name']}  HW={d['hw_name']}")
     print(f"UUID={d['uuid']} HW_TYPE={d['hw_type']} custom={d['custom_config_num']} phase_filters={d['phase_filters']} hw_crc={d['hw_crc']}")
+    return 0
+
+
+def _validate_vesc6_wire(name: str, payload: bytes, command: int, wire_size: int, signature: int) -> bytes:
+    if not payload or payload[0] != command:
+        raise ValueError(f"{name}: command reply salah")
+    if len(payload) != 1 + wire_size:
+        raise ValueError(f"{name}: ukuran reply {len(payload)} != {1 + wire_size}")
+    wire = payload[1:]
+    sig = struct.unpack(">I", wire[:4])[0]
+    if sig != signature:
+        raise ValueError(f"{name}: signature 0x{sig:08X} != VESC 6.00 0x{signature:08X}")
+    return wire
+
+
+def cmd_vesc_tool_check(link: Link, args: argparse.Namespace) -> int:
+    """Exercise the same core FW/config path used by VESC Tool 6.00."""
+    motor = args.motor
+    fw = link.request_std(motor, bytes((COMM_FW_VERSION,)),
+                          lambda x: bool(x) and x[0] == COMM_FW_VERSION, args.timeout)
+    info = parse_fw_version(fw)
+    if (info['major'], info['minor']) != (6, 0):
+        raise ValueError(f"FW ABI bukan 6.00: {info['major']}.{info['minor']}")
+
+    mc_payload = link.request_std(motor, bytes((COMM_GET_MCCONF,)),
+                                  lambda x: bool(x) and x[0] == COMM_GET_MCCONF, args.timeout)
+    mc = _validate_vesc6_wire("MCCONF", mc_payload, COMM_GET_MCCONF,
+                              VESC6_MCCONF_WIRE_SIZE, VESC6_MCCONF_SIGNATURE)
+
+    app_payload = link.request_std(motor, bytes((COMM_GET_APPCONF,)),
+                                   lambda x: bool(x) and x[0] == COMM_GET_APPCONF, args.timeout)
+    app = _validate_vesc6_wire("APPCONF", app_payload, COMM_GET_APPCONF,
+                               VESC6_APPCONF_WIRE_SIZE, VESC6_APPCONF_SIGNATURE)
+
+    controller_id = app[4]
+    expected_id = 1 if motor == 0 else 2
+    if controller_id != expected_id:
+        raise ValueError(f"APPCONF controller_id={controller_id}, expected {expected_id}")
+
+    print("=== VESC TOOL 6.00 CORE PATH ===")
+    print(f"motor             : {motor} ({'LEFT' if motor == 0 else 'RIGHT/local-forward-id2'})")
+    print(f"FW                : {info['major']}.{info['minor']}  {info['hw_name']}  {info['fw_name']}")
+    print(f"MCCONF            : PASS {len(mc)} bytes signature=0x{VESC6_MCCONF_SIGNATURE:08X}")
+    print(f"APPCONF           : PASS {len(app)} bytes signature=0x{VESC6_APPCONF_SIGNATURE:08X} controller_id={controller_id}")
+
+    if args.write_back:
+        require_yes(args, "menulis kembali MCCONF/APPCONF yang baru saja dibaca ke flash")
+        # Writing the exact image back is intentionally non-motor-moving, but
+        # it exercises the asynchronous SET + ACK + persistent-store path used
+        # by VESC Tool. Firmware rejects MCCONF writes while the motor is active.
+        ack_mc = link.request_std(motor, bytes((COMM_SET_MCCONF,)) + mc,
+                                  lambda x: x == bytes((COMM_SET_MCCONF,)), args.write_timeout)
+        if ack_mc != bytes((COMM_SET_MCCONF,)):
+            raise ValueError("MCCONF SET ACK salah")
+        ack_app = link.request_std(motor, bytes((COMM_SET_APPCONF,)) + app,
+                                   lambda x: x == bytes((COMM_SET_APPCONF,)), args.write_timeout)
+        if ack_app != bytes((COMM_SET_APPCONF,)):
+            raise ValueError("APPCONF SET ACK salah")
+        print("SET_MCCONF ACK    : PASS")
+        print("SET_APPCONF ACK   : PASS")
+
+        # Read back and require byte-exact persistence semantics. For motor 2
+        # APPCONF is exposed with controller_id=2 on the wire by design.
+        mc2 = _validate_vesc6_wire("MCCONF readback",
+            link.request_std(motor, bytes((COMM_GET_MCCONF,)), lambda x: bool(x) and x[0] == COMM_GET_MCCONF, args.timeout),
+            COMM_GET_MCCONF, VESC6_MCCONF_WIRE_SIZE, VESC6_MCCONF_SIGNATURE)
+        app2 = _validate_vesc6_wire("APPCONF readback",
+            link.request_std(motor, bytes((COMM_GET_APPCONF,)), lambda x: bool(x) and x[0] == COMM_GET_APPCONF, args.timeout),
+            COMM_GET_APPCONF, VESC6_APPCONF_WIRE_SIZE, VESC6_APPCONF_SIGNATURE)
+        if mc2 != mc or app2 != app:
+            raise ValueError("readback config tidak byte-exact setelah SET")
+        print("READBACK          : PASS byte-exact")
+
+    print("PASS: jalur inti handshake/read-config VESC Tool 6.00 valid")
     return 0
 
 
@@ -528,9 +644,9 @@ def cmd_handshake(link: Link, args: argparse.Namespace) -> int:
         time.sleep(0.05)
 
     if not all_raw:
-        print("FAIL/LEVEL-1: MCU mengirim 0 byte. Fokus ke boot 64MHz, RX DMA1_CH3, packet thread, TX DMA1_CH2, wiring PB10/PB11, GND, dan baud.")
+        print("FAIL/LEVEL-1: MCU mengirim 0 byte. Fokus ke boot 64MHz, USART3 RXNE IRQ/ring, uartcomm packet thread, TXE/TC IRQ, wiring PB10/PB11, GND, dan baud.")
     else:
-        print("FAIL/LEVEL-2: ada byte dari MCU tetapi tidak terbentuk frame VESC valid. Fokus ke baud/clock 64MHz, TX DMA1_CH2, framing, atau CRC.")
+        print("FAIL/LEVEL-2: ada byte dari MCU tetapi tidak terbentuk frame VESC valid. Fokus ke baud/clock 64MHz, USART3 TXE/TC IRQ, framing packet, atau CRC.")
         print("ALL RX raw:", bytes(all_raw).hex(" "))
     return 2
 
@@ -562,11 +678,50 @@ def parse_comm_diag(p: bytes) -> dict:
     if revision >= 6:
         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames',
                'tx_ring_overruns','tx_complete_count','blocking_busy_drops',
-               'virtual_can_forwards','virtual_can_unknown_ids','baud']
+               'motor2_forwards','unsupported_forward_ids','baud']
         for name in names: d[name]=r.u32()
         d['blocking_queue_depth']=r.u8()
         d['timeout_active']=bool(r.u8())
         d['config_valid']=bool(r.u8())
+        if revision >= 8 and len(p)-r.i >= 35:
+            d['rx_dma_irq_count']=r.u32(); d['tx_dma_irq_count']=r.u32()
+            d['idle_irq_count']=r.u32(); d['dma_errors']=r.u32(); d['reset_flags']=r.u32()
+            d['had_iwdg_reset']=bool(r.u8()); d['watchdog_started']=bool(r.u8()); d['watchdog_healthy']=bool(r.u8())
+            if revision >= 9 and len(p)-r.i >= 27:
+                d['config_integrity_ok']=bool(r.u8())
+                d['config_integrity_checks']=r.u32(); d['config_integrity_failures']=r.u32()
+                d['power_hold']=bool(r.u8()); d['shutdown_latched']=bool(r.u8())
+            if len(p)-r.i >= 16:
+                d['watchdog_required_mask']=r.u32()
+                d['heartbeat_foc']=r.u32(); d['heartbeat_motor_service']=r.u32(); d['heartbeat_comm']=r.u32()
+                if revision >= 12 and len(p)-r.i >= 4:
+                    d['heartbeat_fault']=r.u32()
+            if revision >= 10 and len(p)-r.i >= 28:
+                d['watchdog_unhealthy_mask']=r.u32()
+                d['watchdog_miss_foc']=r.u32(); d['watchdog_miss_motor_service']=r.u32(); d['watchdog_miss_comm']=r.u32()
+                if revision >= 12 and len(p)-r.i >= 5:
+                    d['watchdog_miss_fault']=r.u32(); d['config_boot_status']=r.u8()
+                d['sample_clamp_left']=r.u32(); d['sample_clamp_right']=r.u32()
+                d['sample_margin_left_q15']=r.u16(); d['sample_margin_right_q15']=r.u16()
+                if revision >= 11 and len(p)-r.i >= 20:
+                    d['app_adc_raw1']=r.u16(); d['app_adc_raw2']=r.u16()
+                    d['app_adc_mv1']=r.u16(); d['app_adc_mv2']=r.u16()
+                    d['app_adc_decoded1']=r.i16()/1000.0; d['app_adc_decoded2']=r.i16()/1000.0
+                    d['app_adc_command']=r.i16()/1000.0
+                    d['app_adc_fault_flags']=r.u8(); d['app_adc_range_ok']=bool(r.u8())
+                    d['app_adc_armed_left']=bool(r.u8()); d['app_adc_armed_right']=bool(r.u8())
+                    d['app_cmd_source_left']=r.u8(); d['app_cmd_source_right']=r.u8()
+                    if revision >= 13 and len(p)-r.i >= 46:
+                        d['sampling_contract_flags']=r.u32()
+                        d['isr_total_max_cycles']=r.u32(); d['isr_near_deadline_count']=r.u32()
+                        d['isr_period_min_cycles']=r.u32(); d['isr_period_max_cycles']=r.u32()
+                        d['heap_free_bytes']=r.u32(); d['heap_min_ever_bytes']=r.u32()
+                        d['stack_motor_free_bytes']=r.u16(); d['stack_sample_free_bytes']=r.u16()
+                        d['stack_fault_free_bytes']=r.u16(); d['stack_status_free_bytes']=r.u16()
+                        d['stack_packet_free_bytes']=r.u16(); d['stack_block_free_bytes']=r.u16()
+                        d['tx_queue_high_water']=r.u16(); d['tx_queue_busy_drops']=r.u32()
+                        if revision >= 14 and len(p)-r.i >= 4:
+                            d['tx_low_priority_drops']=r.u32()
     elif revision >= 5:
         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames','tx_ring_overruns','tx_complete_count','blocking_busy_drops','baud']
         for name in names: d[name]=r.u32()
@@ -590,8 +745,12 @@ def cmd_status(link: Link, args: argparse.Namespace) -> int:
     for m in motors:
         print_values(m,get_values(link,m))
         e=get_extended(link,m)
+        phase_txt = ""
+        if e.get("revision", 0) >= 6:
+            phase_txt=(f" Ia/Ib/Ic={e['phase_current_a']:+.2f}/{e['phase_current_b']:+.2f}/"
+                       f"{e['phase_current_c']:+.2f} A")
         print(f"      sensor={SENSOR_NAMES.get(e['sensor_mode'],e['sensor_mode'])} hall={e['hall_raw']:03b} "
-              f"rotor={e['rotor_elec_deg']:.2f} deg mechRPM={e['mech_rpm']:.1f} "
+              f"rotor={e['rotor_elec_deg']:.2f} deg mechRPM={e['mech_rpm']:.1f}{phase_txt} "
               f"offsets={e['offset_u']}/{e['offset_v']}/{e['offset_dc']} ISRmax={e['isr_max_cycles']} overrun={e['isr_overruns']}")
     return 0
 
@@ -613,7 +772,7 @@ def _print_calibration_diagnostics(d: dict) -> None:
               "adc1_enabled","adc2_enabled","dma1_ch1_enabled"):
         if k in d: print(f"{k:24s}: {d[k]}")
     if "cal_diag_revision" in d:
-        print("\n=== V15 CALIBRATION STATISTICS ===")
+        print("\n=== CURRENT CALIBRATION STATISTICS ===")
         print(f"diag_revision           : {d['cal_diag_revision']}")
         print(f"warn_mask               : 0x{d.get('warn_mask',0):04X}")
         print(f"fail_range_mask         : 0x{d.get('fail_range_mask',0):04X}")
@@ -624,7 +783,7 @@ def _print_calibration_diagnostics(d: dict) -> None:
             c=d.get("channels",{}).get(name)
             if not c: continue
             print(f"{name:10s} {c['mean']:5d} {c['min']:5d} {c['max']:5d} {c['spread']:6d} {c['stddev']:8.3f}  {_calibration_channel_status(d,idx,name)}")
-        print("\nThreshold policy V15:")
+        print("\nThreshold policy:")
         print("  undriven pass         : only reject ADC rail / gross hardware fault")
         print("  driven offset source  : 50%/50%/50% zero-vector switching, 1000 samples/motor")
         print("  hard mean range       : 128..3967 ADC counts")
@@ -637,7 +796,7 @@ def _print_calibration_diagnostics(d: dict) -> None:
                          4:"WAIT_RIGHT_DRIVEN",5:"RIGHT_WARMUP",6:"RIGHT_DRIVEN",
                          7:"WAIT_FINALIZE",8:"DONE",9:"FAILED"}
             st=d.get("cal_stage",-1)
-            print("\n=== V15 DRIVEN/OFFSET SPLIT ===")
+            print("\n=== DRIVEN/OFFSET SPLIT ===")
             print(f"cal_stage               : {st} {stage_names.get(st,'?')}")
             print(f"shift_warn_mask         : 0x{d.get('shift_warn_mask',0):04X}")
             print("channel      undriven driven  delta")
@@ -651,7 +810,7 @@ def _print_calibration_diagnostics(d: dict) -> None:
             else:
                 print("valid                   : False (no active-drive current fault captured)")
         if d.get("cal_diag_revision",0) >= 15:
-            print("\n=== V15 ADC/PWM SCHEDULE ===")
+            print("\n=== ADC/PWM SCHEDULE ===")
             print(f"adc_phase_offset_ticks  : {d.get('adc_motor_phase_offset_ticks','?')}")
             print(f"foc_isr_event_hz        : {d.get('foc_isr_event_hz','?')}")
             print(f"foc_isr_slot_cycles     : {d.get('foc_isr_slot_cycles','?')}")
@@ -660,6 +819,14 @@ def _print_calibration_diagnostics(d: dict) -> None:
             print("rank1                   : ADC1 RIGHT_DC | ADC2 LEFT_DC")
             print("rank2                   : ADC1 LEFT_A   | ADC2 LEFT_B")
             print("rank3                   : ADC1 RIGHT_B  | ADC2 RIGHT_C")
+        if d.get("cal_diag_revision",0) >= 16:
+            print("\n=== ADC3 DCLINK PATH ===")
+            for k in ("adc3_enabled","dma2_ch5_enabled","dma2_ch5_cndtr",
+                      "adc3_vbus_raw0","adc3_vbus_raw1","vbus_dma_stale_count",
+                      "vbus_dma_stale_events"):
+                if k in d: print(f"{k:24s}: {d[k]}")
+            print("trigger                  : TIM8_TRGO (same PWM frame as current scan)")
+            print("DCLINK                   : PC2 / ADC3_IN12 / DMA2 Channel 5")
     regs=d.get("registers",{})
     if regs:
         print("\n=== RAW PERIPHERAL REGISTERS ===")
@@ -714,7 +881,7 @@ def _default_txt(prefix: str) -> Path:
 
 
 def cmd_calibrate(link: Link,args: argparse.Namespace)->int:
-    path=Path(getattr(args,"out",None) or _default_txt("v15_calibration_debug"))
+    path=Path(getattr(args,"out",None) or _default_txt("vesc_f103_calibration"))
     path.parent.mkdir(parents=True,exist_ok=True)
     rc=1
     with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -729,19 +896,19 @@ def cmd_calibrate(link: Link,args: argparse.Namespace)->int:
     return rc
 
 
-# Regression token: v12_full_debug (V15 EFeru-synchronized calibration supersedes the filename prefix).
+# Full passive diagnostic report including observer/model and hardware timing fields.
 def cmd_diagnose(link: Link,args: argparse.Namespace)->int:
-    path=Path(getattr(args,"out",None) or _default_txt("v15_full_debug"))
+    path=Path(getattr(args,"out",None) or _default_txt("vesc_f103_full_debug"))
     path.parent.mkdir(parents=True,exist_ok=True)
     rc=0
     with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
         try:
-            print("V15 STM32F103RCT6 FULL PASSIVE DEBUG REPORT")
+            print("STM32F103RCT6 VESC FOC FULL PASSIVE DEBUG REPORT")
             print("timestamp:",datetime.now().isoformat(timespec='seconds'))
             print("port:",link.ser.port,"baud:",link.ser.baudrate)
             print("\n=== FIRMWARE ===")
             cmd_info(link,args)
-            print("\n=== COMM DMA ===")
+            print("\n=== COMM USART3 IRQ/RING ===")
             cmd_comm_diag(link,args)
             print("\n=== PRE-CAL HARDWARE SNAPSHOT ===")
             pre=get_cal(link,False); _print_calibration_diagnostics(pre)
@@ -763,7 +930,7 @@ def cmd_diagnose(link: Link,args: argparse.Namespace)->int:
                         print_values(m,get_values(link,m)); print("EXT:",get_extended(link,m))
                     except Exception as exc: print(f"M{m}: {exc}")
                 time.sleep(0.2)
-            print("\n=== FINAL COMM DMA ===")
+            print("\n=== FINAL COMM USART3 IRQ/RING ===")
             cmd_comm_diag(link,args)
         except Exception:
             print("\n=== EXCEPTION ===")
@@ -804,7 +971,7 @@ def _cmd_sensor_detect_body(link: Link,args: argparse.Namespace)->int:
     if args.motor==1 and mode==SENSOR_ENCODER: raise RuntimeError("RIGHT tidak memiliki encoder")
     cal=get_cal(link,False)
     if not cal['done'] or not cal['valid']: raise RuntimeError("Current-zero calibration belum valid. Jalankan 'calibrate' dulu.")
-    print("V15 SENSOR DETECT TRACE")
+    print("VESC F103 SENSOR DETECT TRACE")
     print("timestamp:",datetime.now().isoformat(timespec='seconds'))
     print("motor:","LEFT" if args.motor==0 else "RIGHT","mode:",args.mode,"current_A:",args.current)
     print("NOTE: Hall detect follows VESC 1s Id ramp + 1deg/5ms forward/reverse sweeps.")
@@ -839,7 +1006,7 @@ def _cmd_sensor_detect_body(link: Link,args: argparse.Namespace)->int:
 
 
 def cmd_sensor_detect(link: Link,args: argparse.Namespace)->int:
-    path=Path(getattr(args,"out",None) or _default_txt("v15_sensor_detect"))
+    path=Path(getattr(args,"out",None) or _default_txt("vesc_f103_sensor_detect"))
     path.parent.mkdir(parents=True,exist_ok=True)
     rc=1
     with path.open("w",encoding="utf-8") as f, contextlib.redirect_stdout(f), contextlib.redirect_stderr(f):
@@ -850,6 +1017,71 @@ def cmd_sensor_detect(link: Link,args: argparse.Namespace)->int:
     print(f"DEBUG TXT: {path.resolve()}")
     print(f"RESULT CODE: {rc}")
     return rc
+
+
+def _read_mcconf_wire(link: Link, motor: int, timeout: float) -> bytes:
+    payload=link.request_std(motor,bytes((COMM_GET_MCCONF,)),
+        lambda x: bool(x) and x[0]==COMM_GET_MCCONF,timeout)
+    return _validate_vesc6_wire("MCCONF",payload,COMM_GET_MCCONF,
+                                VESC6_MCCONF_WIRE_SIZE,VESC6_MCCONF_SIGNATURE)
+
+
+def parse_standard_encoder_detect(p: bytes) -> dict:
+    if len(p) != 10 or p[0] != COMM_DETECT_ENCODER:
+        raise ValueError(f"COMM_DETECT_ENCODER reply size/command invalid: {len(p)}")
+    r=Reader(p,1)
+    offset=r.i32()/1_000_000.0
+    ratio=r.i32()/1_000_000.0
+    inverted=bool(r.u8())
+    ok=abs(offset-1001.0)>1e-6 and ratio>0.0
+    return {"ok":ok,"offset_deg":offset,"ratio":ratio,"inverted":inverted}
+
+
+def parse_standard_hall_detect(p: bytes) -> dict:
+    if len(p) != 10 or p[0] != COMM_DETECT_HALL_FOC:
+        raise ValueError(f"COMM_DETECT_HALL_FOC reply size/command invalid: {len(p)}")
+    table=list(p[1:9])
+    ok=bool(p[9])
+    return {"ok":ok,"hall_table":table}
+
+
+def cmd_detect_encoder_standard(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"Standard VESC encoder detection")
+    if args.motor != 0:
+        raise RuntimeError("Encoder A/B fisik hanya tersedia pada LEFT/motor 0")
+    if not 0.2 <= args.current <= 5.0:
+        raise ValueError("--current harus 0.2..5.0 A")
+    before=_read_mcconf_wire(link,args.motor,args.timeout)
+    link.stop(args.motor); link.clear_fault(args.motor); time.sleep(0.1)
+    req=bytes((COMM_DETECT_ENCODER,))+be_i32(int(round(args.current*1000.0)))
+    p=link.request_std(args.motor,req,
+        lambda x: len(x)==10 and x[0]==COMM_DETECT_ENCODER,args.timeout)
+    d=parse_standard_encoder_detect(p)
+    after=_read_mcconf_wire(link,args.motor,2.0)
+    unchanged=(before==after)
+    print("COMM_DETECT_ENCODER:",d)
+    print("MCCONF unchanged    :", "PASS" if unchanged else "FAIL")
+    print("NOTE: command standar hanya mengembalikan hasil; VESC Tool yang memilih Apply/Write.")
+    return 0 if d['ok'] and unchanged else 3
+
+
+def cmd_detect_hall_standard(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"Standard VESC Hall detection")
+    if not 0.2 <= args.current <= 5.0:
+        raise ValueError("--current harus 0.2..5.0 A")
+    before=_read_mcconf_wire(link,args.motor,args.timeout)
+    link.stop(args.motor); link.clear_fault(args.motor); time.sleep(0.1)
+    req=bytes((COMM_DETECT_HALL_FOC,))+be_i32(int(round(args.current*1000.0)))
+    p=link.request_std(args.motor,req,
+        lambda x: len(x)==10 and x[0]==COMM_DETECT_HALL_FOC,args.timeout)
+    d=parse_standard_hall_detect(p)
+    after=_read_mcconf_wire(link,args.motor,2.0)
+    unchanged=(before==after)
+    valid_states=sum(1 for v in d['hall_table'] if v != 255)
+    print("COMM_DETECT_HALL_FOC:",d,"valid_states=",valid_states)
+    print("MCCONF unchanged       :", "PASS" if unchanged else "FAIL")
+    print("NOTE: command standar hanya mengembalikan Hall table; VESC Tool yang memilih Apply/Write.")
+    return 0 if d['ok'] and valid_states==6 and unchanged else 3
 
 
 def cmd_rotor(link: Link,args: argparse.Namespace)->int:
@@ -915,6 +1147,56 @@ def command_payload(mode:str,value:float)->bytes:
     if mode=="position": return bytes((COMM_SET_POS,))+be_i32(round(value*1_000_000))
     raise ValueError(mode)
 
+
+
+def cmd_detect_rl(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"R/L detection")
+    p=link.request_std(args.motor,bytes((COMM_DETECT_MOTOR_R_L,)),
+        lambda x: len(x)>=9 and x[0]==COMM_DETECT_MOTOR_R_L,args.timeout)
+    r=Reader(p,1); resistance=r.i32()/1_000_000.0; inductance_uH=r.i32()/1000.0
+    ld_lq_uH=(r.i32()/1000.0) if len(p)-r.i>=4 else 0.0
+    inductance=inductance_uH*1.0e-6; ld_lq=ld_lq_uH*1.0e-6
+    print(f"R={resistance:.8f} ohm  L={inductance_uH:.3f} uH ({inductance:.9f} H)  "
+          f"Ld-Lq={ld_lq_uH:.3f} uH ({ld_lq:.9f} H)")
+    return 0 if resistance>0 and inductance>0 else 3
+
+
+def cmd_detect_flux(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"Flux linkage detection")
+    current=int(round(args.current*1000.0))
+    resistance=int(round(args.resistance*1_000_000.0))
+    if args.openloop:
+        payload=(bytes((COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP,))+be_i32(current)+
+                 be_i32(int(round(args.erpm_per_sec*1000.0)))+
+                 be_i32(int(round(args.duty*1000.0)))+be_i32(resistance)+
+                 be_i32(int(round(args.inductance*100_000_000.0))))
+        cmd=COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP
+    else:
+        payload=(bytes((COMM_DETECT_MOTOR_FLUX_LINKAGE,))+be_i32(current)+
+                 be_i32(int(round(args.min_erpm*1000.0)))+
+                 be_i32(int(round(args.duty*1000.0)))+be_i32(resistance))
+        cmd=COMM_DETECT_MOTOR_FLUX_LINKAGE
+    p=link.request_std(args.motor,payload,lambda x: len(x)>=5 and x[0]==cmd,args.timeout)
+    flux=Reader(p,1).i32()/10_000_000.0
+    print(f"flux_linkage={flux:.9f} Wb")
+    return 0 if flux>0 else 3
+
+
+def cmd_detect_all_foc(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"Full FOC auto-detection")
+    # Port ini tidak memiliki physical CAN. Byte detect_can tetap ada pada wire
+    # command VESC, tetapi selalu nol agar tidak mengiklankan backend yang tidak ada.
+    payload=(bytes((COMM_DETECT_APPLY_ALL_FOC,0))+
+             be_i32(int(round(args.max_power_loss*1000.0)))+
+             be_i32(int(round(args.min_input_current*1000.0)))+
+             be_i32(int(round(args.max_input_current*1000.0)))+
+             be_i32(int(round(args.openloop_erpm*1000.0)))+
+             be_i32(int(round(args.sl_erpm*1000.0))))
+    p=link.request_std(args.motor,payload,lambda x: len(x)>=3 and x[0]==COMM_DETECT_APPLY_ALL_FOC,args.timeout)
+    result=Reader(p,1).i16(); print(f"detect_apply_all_foc result={result}")
+    try: print("EXT:",get_extended(link,args.motor))
+    except Exception as exc: print("extended telemetry after detect error:",exc)
+    return 0 if result==0 else 3
 
 def cmd_motor_test(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"Motor test")
@@ -1089,16 +1371,78 @@ def cmd_full_test(link: Link,args: argparse.Namespace)->int:
     print("FULL ACTIVE TEST PASS (protocol/firmware-level; verify waveforms/current physically with scope/clamp)")
     return 0
 
+def parse_ping_can(p: bytes) -> list[int]:
+    if not p or p[0] != COMM_PING_CAN:
+        raise ValueError("bukan COMM_PING_CAN")
+    return list(p[1:])
+
+
 def cmd_can_scan(link: Link, _args: argparse.Namespace) -> int:
-    p=link.request(bytes((COMM_PING_CAN,)),lambda x: bool(x) and x[0]==COMM_PING_CAN,2.0)
-    ids=list(p[1:])
-    print("Virtual CAN IDs:",ids)
-    if 2 not in ids:
-        print("FAIL: motor RIGHT virtual CAN ID 2 tidak terdeteksi")
-        return 2
+    p=link.request(bytes((COMM_PING_CAN,)), lambda x: bool(x) and x[0]==COMM_PING_CAN, 2.0)
+    devs=parse_ping_can(p)
+    print("VESC Tool-compatible device scan:", devs)
+    if devs != [2]:
+        raise ValueError(f"expected exactly local motor-2 ID [2], got {devs}")
+    print("PASS: direct controller=M1/ID1, discovered local forwarded controller=M2/ID2")
+    return 0
+
+
+def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
+    print("=== VESC TOOL DUAL BASIC PASSIVE CHECK ===")
+    # Direct/root controller.
+    fw1=link.request(bytes((COMM_FW_VERSION,)), lambda x: bool(x) and x[0]==COMM_FW_VERSION, 2.0)
+    i1=parse_fw_version(fw1)
+    if (i1['major'],i1['minor']) != (6,0):
+        raise ValueError(f"root FW ABI {i1['major']}.{i1['minor']} != 6.00")
+    v1=get_values(link,0)
+    if v1.controller_id != 1:
+        raise ValueError(f"root GET_VALUES controller_id={v1.controller_id}, expected 1")
+
+    # Discovery is exactly what VESC Tool CAN Scan uses.
+    ping=link.request(bytes((COMM_PING_CAN,)), lambda x: bool(x) and x[0]==COMM_PING_CAN, 2.0)
+    devs=parse_ping_can(ping)
+    if devs != [2]:
+        raise ValueError(f"device scan expected [2], got {devs}")
+
+    # VESC Tool switches to the discovered node by wrapping requests in
+    # COMM_FORWARD_CAN, ID 2. Replies remain normal inner replies.
+    fw2=link.request_std(1,bytes((COMM_FW_VERSION,)), lambda x: bool(x) and x[0]==COMM_FW_VERSION, 2.0)
+    i2=parse_fw_version(fw2)
+    if (i2['major'],i2['minor']) != (6,0):
+        raise ValueError(f"M2 FW ABI {i2['major']}.{i2['minor']} != 6.00")
+    if i2['uuid'] == i1['uuid']:
+        raise ValueError("M1/M2 UUID must differ for VESC Tool backup/identity")
+    v2=get_values(link,1)
+    if v2.controller_id != 2:
+        raise ValueError(f"forwarded GET_VALUES controller_id={v2.controller_id}, expected 2")
+
+    # Both configuration read paths must be independently addressable.
+    for motor,expected in ((0,1),(1,2)):
+        mc_payload=link.request_std(motor,bytes((COMM_GET_MCCONF,)),lambda x: bool(x) and x[0]==COMM_GET_MCCONF,2.0)
+        _validate_vesc6_wire(f"M{motor+1} MCCONF",mc_payload,COMM_GET_MCCONF,VESC6_MCCONF_WIRE_SIZE,VESC6_MCCONF_SIGNATURE)
+        app_payload=link.request_std(motor,bytes((COMM_GET_APPCONF,)),lambda x: bool(x) and x[0]==COMM_GET_APPCONF,2.0)
+        app=_validate_vesc6_wire(f"M{motor+1} APPCONF",app_payload,COMM_GET_APPCONF,VESC6_APPCONF_WIRE_SIZE,VESC6_APPCONF_SIGNATURE)
+        if app[4] != expected:
+            raise ValueError(f"M{motor+1} APPCONF controller_id={app[4]}, expected {expected}")
+
+    print(f"M1 FW/UUID/ID : PASS  {i1['major']}.{i1['minor']}  {i1['uuid']}  ID=1")
+    print(f"SCAN          : PASS  remote IDs={devs}")
+    print(f"M2 FW/UUID/ID : PASS  {i2['major']}.{i2['minor']}  {i2['uuid']}  ID=2")
+    print("M1/M2 VALUES  : PASS")
+    print("M1/M2 MCCONF  : PASS")
+    print("M1/M2 APPCONF : PASS")
+    print("PASS: basic VESC Tool dual-controller discovery/routing path is coherent")
+    return 0
+
+
+def cmd_motor2_forward(link: Link, _args: argparse.Namespace) -> int:
+    # Board ini tidak memiliki CAN PHY. COMM_FORWARD_CAN ID 2 dipakai seperti
+    # cabang local second-motor pada VESC dual-motor: request diproses oleh
+    # runtime motor kanan di MCU yang sama. Motor-2 tetap diiklankan ke VESC
+    # Tool melalui COMM_PING_CAN agar muncul pada device scan.
     fw=link.request_std(1,bytes((COMM_FW_VERSION,)),lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.0)
     d=parse_fw_version(fw)
-    print("RIGHT FW via COMM_FORWARD_CAN:",d)
+    print("RIGHT FW via local COMM_FORWARD_CAN ID 2:",d)
     return 0
 
 
@@ -1130,18 +1474,28 @@ def self_test() -> int:
     assert crc16(b"123456789")==0x31C3
     assert Link.standard_route(0,payload)==payload
     assert Link.standard_route(1,payload)==bytes((COMM_FORWARD_CAN,2))+payload
+    assert parse_ping_can(bytes((COMM_PING_CAN,2))) == [2]
+    assert parse_ping_can(bytes((COMM_PING_CAN,))) == []
     fw=(bytes((COMM_FW_VERSION,6,0))+b"HOVERBOARD_DUAL_FOC\x00"+bytes(range(12))+
-        bytes((1,0,0,0,0,0,0,0))+b"hoverboard-vesc6-rtos-v15\x00")
+        bytes((1,0,0,0,0,0,0,0))+b"vesc-f103-hoverboard-v24\x00")
     fwd=parse_fw_version(fw)
     assert fwd["major"]==6 and fwd["minor"]==0
     assert fwd["hw_name"]=="HOVERBOARD_DUAL_FOC"
-    assert fwd["fw_name"].endswith("v15") and fwd["hw_crc"] is None
+    assert fwd["fw_name"].endswith("v24") and fwd["hw_crc"] is None
+
+    mc_wire=struct.pack(">I",VESC6_MCCONF_SIGNATURE)+bytes(VESC6_MCCONF_WIRE_SIZE-4)
+    app_wire=struct.pack(">I",VESC6_APPCONF_SIGNATURE)+bytes((1,))+bytes(VESC6_APPCONF_WIRE_SIZE-5)
+    assert _validate_vesc6_wire("MCCONF-selftest",bytes((COMM_GET_MCCONF,))+mc_wire,
+                                COMM_GET_MCCONF,VESC6_MCCONF_WIRE_SIZE,VESC6_MCCONF_SIGNATURE)==mc_wire
+    assert _validate_vesc6_wire("APPCONF-selftest",bytes((COMM_GET_APPCONF,))+app_wire,
+                                COMM_GET_APPCONF,VESC6_APPCONF_WIRE_SIZE,VESC6_APPCONF_SIGNATURE)==app_wire
+
     vals=[1.0,-2.0,3.25,4.0,5.0,6.0,7.0,8.0,16000.0]
     samp=bytes((COMM_SAMPLE_PRINT,))+be_i16(3)+b''.join(struct.pack(">f",x) for x in vals)+bytes((0,123))+be_i32(3)
     idx,row=parse_sample_packet(samp)
     assert idx==3 and abs(row['current1']+2.0)<1e-6 and row['index_full']==3
 
-    # V15 sensor diagnostics ABI: verify the appended PWM/ADC scheduling fields
+    # V21 sensor/observer diagnostics ABI: verify the appended PWM/ADC scheduling fields
     # independently of serial hardware so a stale debug parser cannot hide a
     # terminal detect state again.
     spay=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO,0,1,SENSOR_HALL,0,DETECT_FAILED,0,15,0))
@@ -1161,7 +1515,84 @@ def self_test() -> int:
     assert sd['pwm_enable_pending_events']==2 and sd['pwm_enable_blank_cycles']==8
     assert sd['tim8_rcr']==1 and sd['adc_motor_phase_offset_ticks']==120
 
-    print("SELF-TEST PASS: CRC, framing, VESC-6.00 FW parser, virtual-CAN routing, sample parser, V15 sensor diagnostics")
+    # Extended telemetry revision 6: phase currents are inserted before dq.
+    epay=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_EXT_TELEMETRY,0,6,1,SENSOR_HALL,0,0,1,1,5,15,0))
+    for v in (1100,-2200,1100): epay += be_i32(v)
+    core=(300,400,310,390,5000,6000,700,800,900,1000,1100,1200,48000,12345)
+    for v in core: epay += be_i32(v)
+    for v in (2000,2001,2002): epay += be_i32(v)
+    for v in (100,1000,7200,3): epay += struct.pack(">I",v)
+    epay += be_i32(42)+be_u16(1234)
+    epay += bytes((1,1,1))
+    for v in (45000,1234,99000,25000,50000,1000,35000,1800,2500,3000,600): epay += be_i32(v)
+    epay += struct.pack(">II",16000,1000)
+    ed=parse_extended(bytes(epay))
+    assert ed['revision']==6 and abs(ed['phase_current_a']-1.1)<1e-9
+    assert abs(ed['phase_current_b']+2.2)<1e-9 and abs(ed['phase_current_c']-1.1)<1e-9
+    assert abs(ed['id']-0.3)<1e-9 and abs(ed['vd']-5.0)<1e-9 and abs(ed['vq']-6.0)<1e-9
+    assert ed['observer_valid'] and ed['encoder_synced'] and ed['current_loop_hz']==16000
+
+    # Standard Hall/encoder detector reply ABI. These commands are deliberately
+    # non-auto-apply: parsers only expose the result returned to VESC Tool.
+    encp=bytes((COMM_DETECT_ENCODER,))+be_i32(12_500_000)+be_i32(15_000_000)+bytes((1,))
+    encd=parse_standard_encoder_detect(encp)
+    assert encd['ok'] and abs(encd['offset_deg']-12.5)<1e-9 and encd['inverted']
+    encfail=parse_standard_encoder_detect(bytes((COMM_DETECT_ENCODER,))+be_i32(1_001_000_000)+be_i32(0)+bytes((0,)))
+    assert not encfail['ok']
+    hallp=bytes((COMM_DETECT_HALL_FOC,255,0,33,66,100,133,166,255,1))
+    halld=parse_standard_hall_detect(hallp)
+    assert halld['ok'] and sum(1 for x in halld['hall_table'] if x!=255)==6
+
+    # COMM_DIAG revision 7: local motor-2 forwarding is distinct from physical CAN.
+    dpay=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,7))
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): dpay += struct.pack(">I",v)
+    dpay += bytes((2,1,1))
+    dd=parse_comm_diag(bytes(dpay))
+    assert dd['motor2_forwards']==20 and dd['unsupported_forward_ids']==21 and dd['baud']==115200
+
+    d9=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,9))
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d9 += struct.pack(">I",v)
+    d9 += bytes((2,1,1))
+    for v in (31,32,33,34,35): d9 += struct.pack(">I",v)
+    d9 += bytes((1,1,1,1)); d9 += struct.pack(">II",41,42); d9 += bytes((1,0))
+    for v in (51,52,53,54): d9 += struct.pack(">I",v)
+    dd9=parse_comm_diag(bytes(d9))
+    assert dd9['config_integrity_ok'] and dd9['config_integrity_checks']==41 and dd9['config_integrity_failures']==42
+    assert dd9['power_hold'] and not dd9['shutdown_latched'] and dd9['heartbeat_comm']==54
+
+    d10=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,10))
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d10 += struct.pack(">I",v)
+    d10 += bytes((2,1,1))
+    for v in (31,32,33,34,35): d10 += struct.pack(">I",v)
+    d10 += bytes((1,1,1,1)); d10 += struct.pack(">II",41,42); d10 += bytes((1,0))
+    for v in (51,52,53,54): d10 += struct.pack(">I",v)
+    for v in (61,62,63,64,65,66): d10 += struct.pack(">I",v)
+    d10 += struct.pack(">HH",777,888)
+    dd10=parse_comm_diag(bytes(d10))
+    assert dd10['watchdog_unhealthy_mask']==61 and dd10['watchdog_miss_comm']==64
+    assert dd10['sample_clamp_left']==65 and dd10['sample_clamp_right']==66
+    assert dd10['sample_margin_left_q15']==777 and dd10['sample_margin_right_q15']==888
+
+    d14=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,14))
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d14 += struct.pack(">I",v)
+    d14 += bytes((2,1,1))
+    for v in (31,32,33,34,35): d14 += struct.pack(">I",v)
+    d14 += bytes((1,1,1,1)); d14 += struct.pack(">II",41,42); d14 += bytes((1,0))
+    for v in (51,52,53,54,55): d14 += struct.pack(">I",v)
+    for v in (61,62,63,64,65): d14 += struct.pack(">I",v)
+    d14 += bytes((2,))
+    d14 += struct.pack(">IIHH",66,67,777,888)
+    d14 += struct.pack(">HHHHhhh",1000,2000,1100,2200,100,-200,300)
+    d14 += bytes((0,1,1,0,1,2))
+    for v in (0,1234,9,3990,4010,4096,3072): d14 += struct.pack(">I",v)
+    d14 += struct.pack(">HHHHHHH",500,400,300,200,600,700,3)
+    d14 += struct.pack(">II",4,5)
+    dd14=parse_comm_diag(bytes(d14))
+    assert dd14['sampling_contract_flags']==0 and dd14['isr_total_max_cycles']==1234
+    assert dd14['heap_min_ever_bytes']==3072 and dd14['tx_queue_high_water']==3
+    assert dd14['tx_queue_busy_drops']==4 and dd14['tx_low_priority_drops']==5
+
+    print("SELF-TEST PASS: CRC, framing, VESC-6.00 FW/config parser, VESC Tool local-ID2 scan + motor-2 forwarding, sample parser, EXT-v6 phase/dq telemetry, COMM_DIAG-v14 resources/timing, sensor/observer diagnostics, standard Hall/encoder detect ABI")
     return 0
 
 def add_live_args(p: argparse.ArgumentParser) -> None:
@@ -1178,21 +1609,34 @@ def main() -> int:
         p=sub.add_parser(name,help=help); add_live_args(p); p.set_defaults(func=func); return p
 
     sp("info",cmd_info,"read and fully parse VESC firmware version")
+    p=sp("vesc-tool-check",cmd_vesc_tool_check,"verify VESC Tool 6.00 FW + MCCONF/APPCONF read path; optional byte-exact write-back")
+    p.add_argument("--motor",type=int,choices=[0,1],default=0)
+    p.add_argument("--timeout",type=float,default=2.0)
+    p.add_argument("--write-back",action="store_true",help="also SET the exact read config and require ACK/readback")
+    p.add_argument("--write-timeout",type=float,default=5.0)
+    p.add_argument("--yes",action="store_true",help="required with --write-back")
     p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=0.5); p.add_argument("--attempts",type=int,default=5)
     p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake"); p.add_argument("--bauds",default="115200,230400,250000,460800,921600"); p.add_argument("--timeout",type=float,default=0.6)
-    sp("comm-diag",cmd_comm_diag,"read firmware USART DMA diagnostics")
-    sp("can-scan",cmd_can_scan,"verify virtual CAN RIGHT ID 2 + forwarded FW_VERSION")
+    sp("comm-diag",cmd_comm_diag,"read firmware USART3 IRQ/ring diagnostics")
+    sp("can-scan",cmd_can_scan,"VESC Tool-compatible COMM_PING_CAN scan; must discover local motor-2 ID 2")
+    sp("vesc-tool-dual-basic",cmd_vesc_tool_dual_basic,"passive end-to-end VESC Tool dual-controller discovery/routing/config check")
+    sp("motor2-forward",cmd_motor2_forward,"verify local second-motor forwarding ID 2 with FW_VERSION")
     sp("config-status",cmd_config_status,"read flash-emulated persistent config status")
     sp("config-save",cmd_config_save,"save runtime Hall/encoder/PID/timeout config to flash")
     p=sp("status",cmd_status,"standard VESC telemetry + extended telemetry"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("monitor",cmd_monitor,"monitor both motors"); p.add_argument("--hz",type=float,default=5); p.add_argument("--seconds",type=float,default=10)
-    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration and write TXT only"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v15_calibration_debug_TIMESTAMP.txt")
-    p=sp("diagnose",cmd_diagnose,"full passive V15 diagnostic; writes one TXT report"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default v15_full_debug_TIMESTAMP.txt")
+    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration and write TXT only"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default calibration_debug_TIMESTAMP.txt")
+    p=sp("diagnose",cmd_diagnose,"full passive diagnostic; writes one TXT report"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default vesc_f103_full_debug_TIMESTAMP.txt")
     p=sp("sensor-info",cmd_sensor_info,"show runtime Hall/encoder state"); p.add_argument("--motor",type=int,choices=[0,1])
     p=sp("sensor-select",cmd_sensor_select,"live switch Hall/encoder while stopped"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["hall","encoder"],required=True)
-    p=sp("sensor-detect",cmd_sensor_detect,"V15 VESC-style forced-angle Hall/encoder detect; writes TXT"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto"); p.add_argument("--current",type=float,default=0.5,help="diagnostic detect current in A (0.2..2.0, default 0.5)"); p.add_argument("--timeout",type=float,default=25); p.add_argument("--out",help="TXT output path; default v15_sensor_detect_TIMESTAMP.txt"); p.add_argument("--yes",action="store_true")
+    p=sp("detect-encoder",cmd_detect_encoder_standard,"ACTIVE standard VESC COMM_DETECT_ENCODER; does not auto-apply"); p.add_argument("--motor",type=int,choices=[0],default=0); p.add_argument("--current",type=float,default=0.5); p.add_argument("--timeout",type=float,default=35.0); p.add_argument("--yes",action="store_true")
+    p=sp("detect-hall",cmd_detect_hall_standard,"ACTIVE standard VESC COMM_DETECT_HALL_FOC; does not auto-apply"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--current",type=float,default=0.5); p.add_argument("--timeout",type=float,default=25.0); p.add_argument("--yes",action="store_true")
+    p=sp("sensor-detect",cmd_sensor_detect,"VESC-style blocking Hall/encoder detect; writes TXT"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto"); p.add_argument("--current",type=float,default=0.5,help="diagnostic detect current in A (0.2..2.0, default 0.5)"); p.add_argument("--timeout",type=float,default=25); p.add_argument("--out",help="TXT output path; default vesc_f103_sensor_detect_TIMESTAMP.txt"); p.add_argument("--yes",action="store_true")
     p=sp("rotor",cmd_rotor,"stream COMM_ROTOR_POSITION"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=list(DISPLAY_MODES),default="encoder"); p.add_argument("--seconds",type=float,default=5)
     p=sp("sample",cmd_sample,"capture fast FOC samples from ISR buffer"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--count",type=int,default=128); p.add_argument("--decimation",type=int,default=8); p.add_argument("--timeout",type=float,default=8); p.add_argument("--csv"); p.add_argument("--raw",action="store_true")
+    p=sp("detect-rl",cmd_detect_rl,"ACTIVE standard VESC FOC R/L detection"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--timeout",type=float,default=15.0); p.add_argument("--yes",action="store_true")
+    p=sp("detect-flux",cmd_detect_flux,"ACTIVE standard VESC flux-linkage detection"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--current",type=float,default=1.0); p.add_argument("--resistance",type=float,required=True); p.add_argument("--min-erpm",type=float,default=1800.0); p.add_argument("--duty",type=float,default=0.2); p.add_argument("--openloop",action="store_true"); p.add_argument("--erpm-per-sec",type=float,default=2000.0); p.add_argument("--inductance",type=float,default=0.00005); p.add_argument("--timeout",type=float,default=20.0); p.add_argument("--yes",action="store_true")
+    p=sp("detect-all-foc",cmd_detect_all_foc,"ACTIVE standard VESC Detect All FOC and persist result"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--max-power-loss",type=float,default=50.0); p.add_argument("--min-input-current",type=float,default=-20.0); p.add_argument("--max-input-current",type=float,default=20.0); p.add_argument("--openloop-erpm",type=float,default=3000.0); p.add_argument("--sl-erpm",type=float,default=2500.0); p.add_argument("--timeout",type=float,default=60.0); p.add_argument("--yes",action="store_true")
     p=sp("motor-test",cmd_motor_test,"active current/brake/rpm/duty/position test at 50 Hz command refresh"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["current","brake","rpm","duty","position"],required=True); p.add_argument("--value",type=float,required=True); p.add_argument("--seconds",type=float,default=2); p.add_argument("--yes",action="store_true"); p.add_argument("--force",action="store_true")
     p=sp("test-all",cmd_test_all,"passive end-to-end firmware/telemetry test"); p.add_argument("--zero-limit",type=float,default=0.30)
     p=sp("full-test",cmd_full_test,"ACTIVE commissioning: calibration, auto-detect, samples, current +/- and optional RPM/position"); p.add_argument("--yes",action="store_true"); p.add_argument("--current",type=float,default=0.5); p.add_argument("--erpm",type=float,default=300.0); p.add_argument("--stage-seconds",type=float,default=1.0); p.add_argument("--cal-timeout",type=float,default=5.0); p.add_argument("--detect-timeout",type=float,default=15.0); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--sample-decimation",type=int,default=8); p.add_argument("--skip-rpm",action="store_true"); p.add_argument("--position-step",type=float,default=5.0)

@@ -1,6 +1,6 @@
 #include "FreeRTOS.h"
 #include "task.h"
-#include "motor_hw.h"
+#include "hwconf/hw.h"
 
 void vApplicationMallocFailedHook(void) {
     motor_hw_emergency_all_off();

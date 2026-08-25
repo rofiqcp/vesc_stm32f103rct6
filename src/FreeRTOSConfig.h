@@ -25,7 +25,11 @@ extern uint32_t SystemCoreClock;
 #define configTICK_RATE_HZ                      ((TickType_t)1000)
 #define configMAX_PRIORITIES                    56
 #define configMINIMAL_STACK_SIZE                ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                   ((size_t)(22 * 1024))
+/* STM32F103RCT6 has exactly 48 KiB SRAM. 18 KiB is sufficient for the
+ * seven application threads, idle/timer tasks, mutexes and the one-entry
+ * blocking queue while leaving several KiB linker headroom. Do not grow
+ * this without checking the final .map file. */
+#define configTOTAL_HEAP_SIZE                   ((size_t)(18 * 1024))
 #define configMAX_TASK_NAME_LEN                 16
 #define configUSE_16_BIT_TICKS                  0
 #define configIDLE_SHOULD_YIELD                 1

@@ -1,15 +1,16 @@
 #include "stm32f1xx_hal.h"
 #include "cmsis_os2.h"
-#include "motor_hw.h"
-#include "motor_control.h"
+#include "hwconf/hw.h"
+#include "motor/mc_interface.h"
 #include "motor_tasks.h"
-#include "foc_control.h"
+#include "motor/mcpwm_foc.h"
 #include "telemetry.h"
 #include "debug_sample.h"
-#include "vesc_comm.h"
-#include "config_store.h"
-#include "vesc_config.h"
+#include "comm/commands.h"
+#include "conf_general.h"
+#include "confgenerator.h"
 #include "status_io.h"
+#include "timeout.h"
 
 static void SystemClock_Config(void);
 static void dwt_init(void);
@@ -18,6 +19,7 @@ static void motor_boot_thread(void *argument);
 
 int main(void) {
     HAL_Init();
+    timeout_capture_reset_reason();
     HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
 
     /* PB2 LED + PA4 buzzer + PA5 power-hold are alive before PLL/motor init. */
@@ -38,12 +40,13 @@ int main(void) {
         early_fatal();
     }
 
-    /* LED and buzzer threads start independently of motor/ADC startup. */
+    /* Satu status thread non-blocking (LED+buzzer) start independen dari motor/ADC. */
     if (!status_threads_init()) {
         early_fatal();
     }
 
-    if (!vesc_comm_task_init()) {
+    commands_init();
+    if (!commands_is_initialized()) {
         early_fatal();
     }
 
@@ -66,34 +69,58 @@ int main(void) {
 static void motor_boot_thread(void *argument) {
     (void)argument;
 
-    /* packet_process_thread is Normal while this boot helper is BelowNormal, so a
-     * FW_VERSION request preempts motor initialization. Any motor HAL failure stays confined to
+    /* uartcomm proc berprioritas lebih tinggi daripada boot helper, sehingga
+     * FW_VERSION dapat mem-preempt inisialisasi motor. Any motor HAL failure stays confined to
      * this thread and must not globally disable USART interrupts. */
     motor_hw_init();
     motor_control_init();
 
-    /* V11 configuration is version-isolated from the experimental V9 record.
-     * Build the exact VESC-6.00 wire defaults, then import only a V11 CRC-valid
-     * record. Failure simply keeps compiled safe defaults; communication is
+    /* Konfigurasi VESC 6.00 dipisahkan dari record eksperimen lama.
+     * Build the exact VESC-6.00 wire defaults, then import only a CRC-valid
+     * transactional record. Failure simply keeps compiled safe defaults; communication is
      * already alive in the higher-priority packet thread. */
     vesc_config_init_defaults();
-    bool loaded_cfg = config_store_load_apply();
+    bool loaded_cfg = conf_general_init();
     if (!loaded_cfg) {
-        /* GET_MCCONF can legally arrive before this boot thread runs. In that
-           case vesc_config_init_defaults() intentionally built a safe wire
-           image without reading zeroed MotorRuntime. Now publish the actual
-           initialized runtime defaults before motor control is enabled. */
-        vesc_config_sync_motor_runtime(MOTOR_LEFT);
-        vesc_config_sync_motor_runtime(MOTOR_RIGHT);
+        /* Virgin erased flash is a valid first boot and uses compiled safe
+           defaults. Non-blank flash with no valid transactional record is
+           corruption: keep defaults for communication/repair but latch a
+           configuration fault so neither bridge can enable until repaired and
+           rebooted. */
+        if (conf_general_boot_status() == CONF_BOOT_CORRUPT) {
+            motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_FLASH_CONFIG);
+            motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_FLASH_CONFIG);
+        }
     }
+    /* From this point VESC Tool may safely repair/write MC/APPCONF even when a
+       later telemetry/control-task startup step fails. */
+    vesc_comm_set_config_ready(true);
 
-    telemetry_init();
+    if (!telemetry_init()) {
+        /* Communication remains alive, but do not expose a motor-ready state
+           without an atomic telemetry snapshot path. */
+        osThreadExit();
+    }
     debug_sample_init();
-    motor_threads_init();
+    if (!motor_threads_init()) {
+        /* One missing control/stat/periodic thread is a partial controller,
+           not a ready VESC. Keep UART handshakes alive and refuse motor use. */
+        osThreadExit();
+    }
 
     /* Start synchronized PWM counters + dual ADC DMA only after communication
      * is alive. TIM1/TIM8 MOE remain off through current-zero calibration. */
     motor_hw_start_sampling();
+    if (!motor_hw_sampling_contract_valid()) {
+        /* A timer/ADC/DMA contract mismatch can invalidate current feedback.
+         * Leave USART3 alive for diagnostics/config repair, but never expose
+         * the controller as motor-ready. */
+        motor_hw_emergency_all_off();
+        motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_ADC_DMA);
+        motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_ADC_DMA);
+        osThreadExit();
+    }
+    timeout_watchdog_require_foc(true);
 
     vesc_comm_set_motor_ready(true);
     osThreadExit();

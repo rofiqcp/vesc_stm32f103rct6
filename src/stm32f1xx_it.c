@@ -1,13 +1,13 @@
 #include "stm32f1xx_hal.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "motor_hw.h"
-#include "motor_control.h"
-#include "foc_control.h"
-#include "vesc_comm.h"
-#include "vesc_uart.h"
-#include "app_config.h"
-#include "board_pins.h"
+#include "hwconf/hw.h"
+#include "motor/mc_interface.h"
+#include "motor/mcpwm_foc.h"
+#include "comm/commands.h"
+#include "applications/app_uartcomm.h"
+#include "applications/appconf_default.h"
+#include "hwconf/hw_hoverboard.h"
 #include "status_io.h"
 
 extern void xPortSysTickHandler(void);
@@ -16,6 +16,36 @@ void SysTick_Handler(void) {
     HAL_IncTick();
     if (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED) {
         xPortSysTickHandler();
+    }
+}
+
+void PVD_IRQHandler(void) {
+    motor_hw_pvd_irq_handler();
+}
+
+void TIM1_BRK_IRQHandler(void) {
+    motor_hw_break_irq_handler(TIM1);
+}
+
+void TIM8_BRK_IRQHandler(void) {
+    motor_hw_break_irq_handler(TIM8);
+}
+
+void DMA2_Channel4_5_IRQHandler(void) {
+    const uint32_t isr = DMA2->ISR;
+    if ((isr & DMA_ISR_TEIF5) != 0U) {
+        DMA2->IFCR = DMA_IFCR_CGIF5;
+        motor_hw_emergency_all_off();
+        motor_request_fault_from_isr(&g_motor_left, MOTOR_FAULT_ADC_DMA);
+        motor_request_fault_from_isr(&g_motor_right, MOTOR_FAULT_ADC_DMA);
+        return;
+    }
+
+    /* ADC3 HT/TC IRQs are intentionally disabled. Clear any unexpected
+       channel-5 flags defensively so a stale bootloader/debug setup cannot
+       create an interrupt storm. */
+    if ((isr & (DMA_ISR_HTIF5 | DMA_ISR_TCIF5)) != 0U) {
+        DMA2->IFCR = DMA_IFCR_CGIF5;
     }
 }
 
@@ -36,30 +66,27 @@ void DMA1_Channel1_IRQHandler(void) {
        formatted-output/flash/blocking HAL calls are permitted here. */
     if ((isr & DMA_ISR_HTIF1) != 0U) {
         DMA1->IFCR = DMA_IFCR_CHTIF1;
+        motor_hw_capture_app_adc_from_isr();
         foc_adc_dma_isr(g_adc_dual_dma);
     }
 }
 
 void TIM2_IRQHandler(void) {
-    /* V15 does not use TIM2 for ADC timing. Defensive clear only in case a
+    /* This port does not use TIM2 for ADC timing. Defensive clear only in case a
        stale bootloader/debug configuration left a TIM2 flag pending. */
     TIM2->SR = 0U;
 }
 
 void DMA1_Channel2_IRQHandler(void) {
-    /* USART3 TX DMA completion. Priority 0 is safe because this handler never
-     * calls FreeRTOS/CMSIS-RTOS2. */
-    vesc_uart_tx_dma_irq_handler();
+    app_uartcomm_dma_tx_irq_handler();
 }
 
 void DMA1_Channel3_IRQHandler(void) {
-    /* RX DMA runs circular with its NVIC line disabled; defensive only. */
-    vesc_uart_rx_dma_irq_handler();
+    app_uartcomm_dma_rx_irq_handler();
 }
 
 void USART3_IRQHandler(void) {
-    /* Normal VESC transport does not use USART3 IRQ. */
-    vesc_uart_usart_defensive_irq_handler();
+    app_uartcomm_irq_handler();
 }
 
 void TIM3_IRQHandler(void) {

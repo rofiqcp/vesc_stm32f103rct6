@@ -1,10 +1,12 @@
 #include "status_io.h"
-#include "board_pins.h"
+#include "hwconf/hw_hoverboard.h"
 #include "stm32f1xx_hal.h"
 #include "cmsis_os2.h"
 
 static volatile bool s_tone_level = false;
 static volatile bool s_tone_running = false;
+static volatile uint32_t s_tone_toggle_remaining = 0U;
+static volatile bool s_power_held = true;
 static volatile uint32_t s_last_vesc_packet_tick = 0U;
 static volatile bool s_seen_vesc_packet = false;
 
@@ -28,6 +30,7 @@ void status_io_early_gpio_init(void) {
     /* Proven hoverboard board behavior: PA5 HIGH holds the controller powered.
      * It is a power-latch/OFF control, not the TIM1/TIM8 MOE gate-enable. */
     HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
+    s_power_held = true;
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
 }
@@ -68,10 +71,32 @@ void status_io_tone_start(uint16_t hz) {
     TIM3->DIER = TIM_DIER_UIE;
     s_tone_level = false;
     s_tone_running = true;
+    s_tone_toggle_remaining = UINT32_MAX;
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
     TIM3->CR1 |= TIM_CR1_CEN;
     if (!primask) __enable_irq();
 }
+
+void status_io_tone_start_for(uint16_t hz, uint32_t duration_ms) {
+    if (duration_ms == 0U) { status_io_tone_stop(); return; }
+    if (hz < 100U) hz = 100U;
+    if (hz > 5000U) hz = 5000U;
+    status_io_tone_start(hz);
+    uint64_t toggles = ((uint64_t)hz * 2ULL * (uint64_t)duration_ms + 999ULL) / 1000ULL;
+    if (toggles == 0ULL) toggles = 1ULL;
+    if (toggles > 0xFFFFFFFEULL) toggles = 0xFFFFFFFEULL;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s_tone_toggle_remaining = (uint32_t)toggles;
+    if (!primask) __enable_irq();
+}
+
+void status_io_power_hold(bool on) {
+    s_power_held = on;
+    HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+bool status_io_power_is_held(void) { return s_power_held; }
 
 void status_io_tone_stop(void) {
     uint32_t primask = __get_PRIMASK();
@@ -80,6 +105,7 @@ void status_io_tone_stop(void) {
     TIM3->CR1 &= ~TIM_CR1_CEN;
     TIM3->SR = 0U;
     s_tone_running = false;
+    s_tone_toggle_remaining = 0U;
     s_tone_level = false;
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
     if (!primask) __enable_irq();
@@ -89,6 +115,13 @@ void status_io_tim3_irq_handler(void) {
     if ((TIM3->SR & TIM_SR_UIF) == 0U) return;
     TIM3->SR &= ~TIM_SR_UIF;
     if (!s_tone_running) return;
+    if (s_tone_toggle_remaining != UINT32_MAX) {
+        if (s_tone_toggle_remaining == 0U) {
+            TIM3->DIER = 0U; TIM3->CR1 &= ~TIM_CR1_CEN; s_tone_running = false;
+            s_tone_level = false; BUZZER_PORT->BRR = BUZZER_PIN; return;
+        }
+        s_tone_toggle_remaining--;
+    }
     s_tone_level = !s_tone_level;
     if (s_tone_level) {
         BUZZER_PORT->BSRR = BUZZER_PIN;
