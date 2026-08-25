@@ -16,7 +16,7 @@ it = read('src/stm32f1xx_it.c')
 timeout = read('src/timeout.c')
 timeout_h = read('src/timeout.h')
 main = read('src/main.c')
-tasks = read('src/motor_tasks.c')
+tasks = read('src/motor/mc_interface_tasks.c')
 commands = read('src/comm/commands.c')
 foc = read('src/motor/mcpwm_foc.c')
 
@@ -76,7 +76,8 @@ req('timeout_heartbeat(TIMEOUT_HEARTBEAT_COMM)' in commands,
     'communication parser task publishes watchdog heartbeat')
 req('timeout_watchdog_require_foc(true)' in main and main.index('motor_hw_start_sampling()') < main.index('timeout_watchdog_require_foc(true)'),
     'FOC heartbeat becomes mandatory only after ADC sampling starts')
-req('if (ok) timeout_watchdog_start();' in tasks,
+req('const bool ready = threads_ok && heap_ok;' in tasks and
+    'if (ready)' in tasks and 'timeout_watchdog_start();' in tasks,
     'IWDG starts only after required control threads are created')
 req('timeout_watchdog_update_10ms(now)' in tasks,
     'motor-service task is the watchdog health gate')

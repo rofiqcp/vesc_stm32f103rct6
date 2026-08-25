@@ -41,6 +41,21 @@ int32_t motor_encoder_extended_count(MotorRuntime *m);
  * VESC does on dual-motor targets, and dispatch by MCCONF motor_type.
  * ======================================================================== */
 void mc_interface_init(bool reset_conf);
+bool mc_interface_start_threads(void);
+
+typedef struct {
+	uint32_t heap_free_bytes;
+	uint32_t heap_min_ever_bytes;
+	uint32_t motor_service_stack_free_bytes;
+	uint32_t sample_sender_stack_free_bytes;
+	uint32_t fault_stack_free_bytes;
+	uint32_t status_stack_free_bytes;
+} mc_interface_resource_stats_t;
+
+uint32_t mc_interface_free_heap_bytes(void);
+uint32_t mc_interface_min_ever_free_heap_bytes(void);
+void mc_interface_get_resource_stats(mc_interface_resource_stats_t *stats);
+
 int mc_interface_motor_now(void);
 void mc_interface_select_motor_thread(int motor);
 int mc_interface_get_motor_thread(void);

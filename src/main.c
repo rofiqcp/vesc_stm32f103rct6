@@ -2,14 +2,12 @@
 #include "cmsis_os2.h"
 #include "hwconf/hw.h"
 #include "motor/mc_interface.h"
-#include "motor_tasks.h"
+#include "motor/mc_interface_sample.h"
 #include "motor/mcpwm_foc.h"
 #include "telemetry.h"
-#include "debug_sample.h"
 #include "comm/commands.h"
 #include "conf_general.h"
 #include "confgenerator.h"
-#include "status_io.h"
 #include "timeout.h"
 
 static void SystemClock_Config(void);
@@ -23,11 +21,11 @@ int main(void) {
     HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
 
     /* PB2 LED + PA4 buzzer + PA5 power-hold are alive before PLL/motor init. */
-    status_io_early_gpio_init();
+    hw_status_early_init();
 
     SystemClock_Config();
     dwt_init();
-    status_io_tone_timer_init();
+    hw_status_timer_init();
 
     /* Handshake-first boot architecture.
      *
@@ -41,7 +39,7 @@ int main(void) {
     }
 
     /* Satu status thread non-blocking (LED+buzzer) start independen dari motor/ADC. */
-    if (!status_threads_init()) {
+    if (!hw_status_init()) {
         early_fatal();
     }
 
@@ -73,13 +71,19 @@ static void motor_boot_thread(void *argument) {
      * FW_VERSION dapat mem-preempt inisialisasi motor. Any motor HAL failure stays confined to
      * this thread and must not globally disable USART interrupts. */
     motor_hw_init();
-    motor_control_init();
+    mc_interface_init(false);
 
     /* Konfigurasi VESC 6.00 dipisahkan dari record eksperimen lama.
      * Build the exact VESC-6.00 wire defaults, then import only a CRC-valid
      * transactional record. Failure simply keeps compiled safe defaults; communication is
      * already alive in the higher-priority packet thread. */
     vesc_config_init_defaults();
+    if (!vesc_config_apply_defaults()) {
+        motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_FLASH_CONFIG);
+        motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_FLASH_CONFIG);
+        vesc_comm_set_config_ready(true);
+        osThreadExit();
+    }
     bool loaded_cfg = conf_general_init();
     if (!loaded_cfg) {
         /* Virgin erased flash is a valid first boot and uses compiled safe
@@ -101,8 +105,8 @@ static void motor_boot_thread(void *argument) {
            without an atomic telemetry snapshot path. */
         osThreadExit();
     }
-    debug_sample_init();
-    if (!motor_threads_init()) {
+    mc_interface_sample_init();
+    if (!mc_interface_start_threads()) {
         /* One missing control/stat/periodic thread is a partial controller,
            not a ready VESC. Keep UART handshakes alive and refuse motor use. */
         osThreadExit();
@@ -163,5 +167,5 @@ static void SystemClock_Config(void) {
 
 static void early_fatal(void) {
     /* Keep interrupts/tick alive so PB2/PA4 visibly report an early failure. */
-    status_io_early_fatal_loop();
+    hw_status_early_fatal_loop();
 }

@@ -6,17 +6,15 @@
 #include "encoder/encoder.h"
 #include "terminal.h"
 #include "util/buffer.h"
-#include "status_io.h"
 #include "comm/packet.h"
 #include "motor/mc_interface.h"
 #include "hwconf/hw.h"
 #include "telemetry.h"
-#include "debug_sample.h"
+#include "motor/mc_interface_sample.h"
 #include "motor/mcpwm_foc.h"
 #include "motor/foc_math.h"
 #include "applications/appconf_default.h"
 #include "timeout.h"
-#include "motor_tasks.h"
 #include "conf_general.h"
 #include "confgenerator.h"
 #include "cmsis_os2.h"
@@ -29,6 +27,11 @@
 #define BLOCK_QUEUE_DEPTH 1U
 #define BLOCK_DATA_MAX    VESC_PACKET_MAX_PAYLOAD
 #define VESC_TEMP_UNAVAILABLE_DECIC (-3000)
+#define CURRENT_CAL_REPLY_REV17_LEN 463U
+
+#if VESC_PACKET_MAX_PAYLOAD < CURRENT_CAL_REPLY_REV17_LEN
+#error "VESC packet payload is too small for current-cal revision 17"
+#endif
 
 /* Command numbers are locked to the VESC firmware 6.00 ABI for the subset
  * this reduced STM32F103 FOC port intentionally implements. */
@@ -271,7 +274,7 @@ static void reply_fw_version(motor_id_t id) {
     p[i++] = 0U; /* qml app */
     p[i++] = 0U; /* nrf flags */
 
-    const char fw[] = "vesc-f103-hoverboard-v32-full-reaudit";
+    const char fw[] = "vesc-f103-hoverboard-v33-vesc-layout";
     memcpy(&p[i], fw, sizeof(fw));
     i = (uint16_t)(i + sizeof(fw));
 
@@ -551,7 +554,7 @@ static void reply_current_cal(void) {
     /* Calibration diagnostics keep the established field prefix and only
        append new timing/synchronized-enable fields at the end. */
     foc_cal_diag_t cd; foc_get_calibration_diag(&cd);
-    p[i++] = 16U; /* calibration diagnostic revision */
+    p[i++] = 17U; /* calibration diagnostic revision */
     put_u16(p, &i, cd.warn_mask);
     put_u16(p, &i, cd.fail_range_mask);
     put_u16(p, &i, cd.fail_noise_mask);
@@ -612,6 +615,25 @@ static void reply_current_cal(void) {
     put_u32(p, &i, ADC3->SQR1); put_u32(p, &i, ADC3->SQR3);
     put_u32(p, &i, DMA2_Channel5->CCR); put_u32(p, &i, DMA2_Channel5->CNDTR);
     put_u32(p, &i, DMA2->ISR);
+
+    /* Revision 17: robust driven-sample filtering and explicit MOE timing.
+       Raw min/max above remain untouched so isolated switching spikes are
+       visible, while these counters show whether enough clean samples were
+       available for each current offset. */
+    for (uint8_t k = 0U; k < 6U; k++) {
+        put_u16(p, &i, cd.outlier_count[k]);
+    }
+    p[i++] = cd.moe_fail_mask;
+    p[i++] = cd.moe_confirmed_mask;
+    for (uint8_t k = 0U; k < 2U; k++) {
+        put_u32(p, &i, cd.moe_request_adc[k]);
+    }
+    for (uint8_t k = 0U; k < 2U; k++) {
+        put_u32(p, &i, cd.moe_confirm_adc[k]);
+    }
+    for (uint8_t k = 0U; k < 2U; k++) {
+        put_u32(p, &i, cd.first_sample_adc[k]);
+    }
     payload_end(i);
 }
 
@@ -688,7 +710,7 @@ static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context
         reply_current_cal();
     } else if (sub == CUSTOM_SAMPLE_START && len >= 6U) {
         uint16_t count = get_u16_be(&data[2]); uint16_t decimation = get_u16_be(&data[4]);
-        debug_sample_start(explicit_id, count, decimation);
+        mc_interface_sample_start(explicit_id, count, decimation);
     } else if (sub == CUSTOM_EXT_TELEMETRY && len >= 2U) {
         reply_extended(explicit_id);
     } else if (sub == CUSTOM_SENSOR_INFO && len >= 2U) {
@@ -1627,7 +1649,7 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
                 uint16_t decimation = data[4];
                 bool raw = (len >= 6U) ? (data[5] != 0U) : false;
                 if (mode <= (uint8_t)DEBUG_SAMPLING_SEND_SINGLE_SAMPLE) {
-                    if (!debug_sample_control((debug_sampling_mode)mode, id,
+                    if (!mc_interface_sample_control((debug_sampling_mode)mode, id,
                                               sample_len, decimation, raw)) {
                         commands_send_print("VESC F103: sample request busy or no previous capture.");
                     }
@@ -1682,10 +1704,12 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
                     app_disable_output(-1);
                     app_command_release(MOTOR_LEFT, true);
                     app_command_release(MOTOR_RIGHT, true);
-                    motor_hw_emergency_all_off(); status_io_tone_stop(); status_io_led(false);
+                    motor_hw_emergency_all_off();
+                    hw_status_tone_stop();
+                    motor_hw_led(false);
                     osDelay(20U);
                     if (restart) NVIC_SystemReset();
-                    else status_io_power_hold(false);
+                    else hw_status_power_hold(false);
                 }
             }
             break;
@@ -1724,7 +1748,6 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
 static void process_payload(const uint8_t *data, uint16_t len) {
     if (data == NULL || len == 0U) return;
     s_diag.rx_frames_ok++;
-    status_io_note_vesc_packet();
     /* UART default memilih motor-1. Seperti cabang HW_HAS_DUAL_MOTORS upstream,
      * COMM_FORWARD_CAN untuk ID motor-2 dipakai sebagai local motor selector;
      * build ini tidak memuat driver CAN fisik. */
@@ -1798,7 +1821,7 @@ static void vesc_comm_reply_diag(void) {
     p[i++] = conf_general_integrity_ok() ? 1U : 0U;
     put_u32(p, &i, conf_general_get_integrity_checks());
     put_u32(p, &i, conf_general_get_integrity_failures());
-    p[i++] = status_io_power_is_held() ? 1U : 0U;
+    p[i++] = hw_status_power_is_held() ? 1U : 0U;
     p[i++] = s_shutdown_latched ? 1U : 0U;
     put_u32(p, &i, timeout_watchdog_required_mask());
     put_u32(p, &i, timeout_heartbeat_count(TIMEOUT_HEARTBEAT_FOC));
@@ -1831,9 +1854,9 @@ static void vesc_comm_reply_diag(void) {
 
     /* Revision 13: hardware sampling contract, complete dual-motor ISR timing
      * and RTOS/UART resource headroom. Diagnostics are task-side only. */
-    motor_runtime_resource_stats_t r;
+    mc_interface_resource_stats_t r;
     vesc_comm_resource_stats_t cr;
-    motor_threads_get_resource_stats(&r);
+    mc_interface_get_resource_stats(&r);
     vesc_comm_get_resource_stats(&cr);
     put_u32(p, &i, motor_hw_sampling_contract_flags());
     put_u32(p, &i, foc_isr_total_max_cycles());
@@ -1865,9 +1888,9 @@ void vesc_comm_periodic_100hz(void) {
 
 void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count) {
     if (samples == NULL || count == 0U) return;
-    bool raw = debug_sample_raw();
+    bool raw = mc_interface_sample_raw();
     for (uint16_t n = 0U; n < count; n++) {
-        const debug_sample_t *d = debug_sample_at(n);
+        const debug_sample_t *d = mc_interface_sample_at(n);
         if (d == NULL) d = &samples[n];
         uint8_t p[56]; uint16_t i = 0U;
         p[i++] = COMM_SAMPLE_PRINT;
@@ -2005,4 +2028,3 @@ void vesc_comm_set_motor_ready(bool ready) {
 bool vesc_comm_motor_ready(void) {
     return s_motor_ready;
 }
-

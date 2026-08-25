@@ -18,7 +18,8 @@ foc = read('src/motor/mcpwm_foc.c')
 fmath = read('src/motor/foc_math.c')
 enc = read('src/encoder/encoder.c')
 hw = read('src/hwconf/hw.c')
-tasks = read('src/motor_tasks.c')
+tasks = read('src/motor/mc_interface_tasks.c')
+status = read('src/hwconf/hw_status.c')
 dt = read('src/datatypes.h')
 port = read('PORTING_NOTES.md')
 
@@ -117,13 +118,13 @@ ok('fabsf(current) >= 0.05f' in cmd or 'fabsf(current)>=0.05f' in cmd,
    'open-loop flux detection requires nonzero drive current; passive zero-current flux is not faked')
 
 # ---- Fault LED/buzzer + startup melody ----
-ok('MOTOR_FAULT_ENCODER_SLIP' in tasks, 'encoder-slip is included in audible/visible fault selection')
-ok('motor_fault_to_vesc(f)' in tasks, 'fault indication is derived from canonical VESC fault number')
-ok('fault_tens' in tasks and 'fault_ones' in tasks and 'fault_digit_pulses' in tasks,
+ok('MOTOR_FAULT_ENCODER_SLIP' in status, 'encoder-slip is included in audible/visible fault selection')
+ok('motor_fault_to_vesc(fault)' in status, 'fault indication is derived from canonical VESC fault number')
+ok('fault_tens' in status and 'fault_ones' in status and 'fault_digit_pulses' in status,
    'LED+buzzer encode the same decimal fault-code pulse groups')
-ok('status_io_led(true)' in tasks and 'status_io_tone_start' in tasks,
+ok('motor_hw_led(true)' in status and 'hw_status_tone_start' in status,
    'same state machine drives visual and audible fault indication')
-ok('900U' in tasks and '1350U' in tasks and '1900U' in tasks,
+ok('900U' in status and '1350U' in status and '1900U' in status,
    'non-blocking VESC-style power-on melody remains present')
 
 # ---- PWM polarity contract ----
@@ -139,7 +140,7 @@ ok(start >= 0 and end > start, 'hard FOC ISR body found')
 fi = foc[start:end]
 for bad in ['sqrtf(', 'fabsf(', 'lrintf(', 'double ', 'float ']:
     ok(bad not in fi, f'hard FOC ISR remains free of {bad.strip()} operations')
-combined = '\n'.join([cmd,conf,mc,foc,tasks,hw,fmath,enc]).lower()
+combined = '\n'.join([cmd,conf,mc,foc,tasks,status,hw,fmath,enc]).lower()
 excluded_includes = ['#include \"comm_can.h\"','#include \"imu/','#include \"bms/','#include \"bm_if','#include \"nrf','#include \"ledpwm','#include \"comm_usb','#include \"lispif','#include \"lzo']
 for token in excluded_includes:
     ok(token not in combined, f'excluded runtime subsystem not introduced: {token}')

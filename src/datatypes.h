@@ -884,9 +884,6 @@ typedef struct MotorRuntime {
     volatile int32_t current_offset_u_counts;
     volatile int32_t current_offset_v_counts;
     volatile int32_t dc_current_offset_counts;
-    volatile int64_t current_offset_u_acc_q16;
-    volatile int64_t current_offset_v_acc_q16;
-    volatile int64_t dc_current_offset_acc_q16;
     volatile uint16_t current_raw_u;
     volatile uint16_t current_raw_v;
     /* Integral state keeps 16 fractional bits below Q15 (Q31 accumulator).

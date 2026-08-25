@@ -13,8 +13,8 @@ ld = read('src/stm32f103rc_flash.ld')
 pio = read('platformio.ini')
 fr = read('src/FreeRTOSConfig.h')
 app = read('src/applications/appconf_default.h')
-mt = read('src/motor_tasks.c')
-dbg = read('src/debug_sample.c')
+mt = read('src/motor/mc_interface_tasks.c')
+dbg = read('src/motor/mc_interface_sample.c')
 
 ok('LENGTH = 48K' in ld and 'ORIGIN = 0x20000000' in ld,
    'linker remains locked to real STM32F103RCT6 48-KiB SRAM')

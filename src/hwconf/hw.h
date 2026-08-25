@@ -60,7 +60,6 @@ void motor_hw_pvd_irq_handler(void);
 uint32_t motor_hw_powerstage_fault_flags(void);
 bool motor_hw_powerstage_fault_latched(void);
 bool motor_hw_pvd_low(void);
-void motor_hw_gate_global(bool enable);
 uint8_t motor_hw_read_hall_raw(motor_id_t id);
 uint16_t motor_hw_encoder_cnt(void);
 bool motor_hw_board_temperature_c(float *temp_c);
@@ -69,5 +68,17 @@ bool motor_hw_get_app_adc_raw(uint16_t *pa2_raw, uint16_t *pa3_raw);
 void motor_hw_encoder_set_count(MotorRuntime *m, uint16_t count);
 void motor_hw_configure_sensor(MotorRuntime *m, uint8_t mode);
 void motor_hw_led(bool on);
-void motor_hw_buzzer(bool on);
 void motor_hw_emergency_all_off(void);
+
+/* Board status/power-latch service. Kept in hwconf because these functions are
+ * tied to the hoverboard PCB, not to the generic motor-control interface. */
+void hw_status_early_init(void);
+void hw_status_timer_init(void);
+bool hw_status_init(void);
+void hw_status_tone_start(uint16_t hz);
+void hw_status_tone_stop(void);
+void hw_status_power_hold(bool on);
+bool hw_status_power_is_held(void);
+uint32_t hw_status_stack_free_bytes(void);
+void hw_status_tim3_irq_handler(void);
+void hw_status_early_fatal_loop(void) __attribute__((noreturn));

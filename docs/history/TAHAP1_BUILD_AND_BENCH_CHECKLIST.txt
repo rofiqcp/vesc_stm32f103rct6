@@ -1,0 +1,46 @@
+TAHAP 1 BUILD + BENCH CHECKLIST
+===============================
+
+A. TARGET BUILD
+1. pio run -t clean
+2. pio run
+3. Confirm there is no project-source warning/error.
+4. Record RAM and Flash usage from the linker output.
+5. Compare RAM usage with the known earlier baseline (~47,136 / 49,152 bytes).
+
+B. POWER-OFF / LOW-RISK ANALOG CHECK
+1. Keep motor outputs disabled.
+2. Apply protected 0..3.3 V signals to PA2 and PA3.
+3. Use terminal command `appadc` and verify raw/voltage/decoded fields.
+4. Confirm PA2 and PA3 cannot exceed STM32 analog input limits.
+
+C. CURRENT-SAMPLING REGRESSION CHECK
+1. Confirm current offset calibration still passes.
+2. Confirm ADC rank1..3 current readings remain correct.
+3. If possible, scope DMA/FOC timing and ensure APP ADC rank6 does not disturb FOC timing.
+
+D. APP ADC SAFE-START
+1. Boot with PA2 throttle active: bridge must remain stopped.
+2. Return throttle neutral and hold >=500 ms: ADC may arm.
+3. Verify low/high rail and invalid-range faults stop output and revoke ownership.
+4. Verify re-arm requires neutral after ADC invalid/output disable/UART preemption.
+
+E. CONTROL MAPPING
+1. Low-current CURRENT mode first.
+2. DUTY mode with conservative duty limit.
+3. RPM mode with conservative speed/current limits.
+4. PA3 brake: brake must cancel positive throttle before regen command.
+5. Verify brake-current sign and battery over-voltage behavior.
+
+F. ARBITRATION
+1. Run ADC command, then send UART SET_CURRENT: UART must preempt ADC.
+2. Stop UART keepalive: only the targeted motor must timeout safely.
+3. ADC must not resume torque until neutral re-arm.
+4. Repeat LEFT, RIGHT, and local dual-motor (`multi_esc`) operation.
+
+G. POWER-STAGE CHECK BEFORE HIGHER CURRENT
+1. Scope TIM8 LEFT and TIM1 RIGHT complementary outputs.
+2. Verify high-side active HIGH.
+3. Verify low-side complementary output active LOW.
+4. Verify dead-time and MOE shutdown behavior.
+5. Verify no shoot-through around enable/disable/fault transitions.

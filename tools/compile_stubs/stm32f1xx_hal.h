@@ -20,17 +20,18 @@ typedef struct { uint32_t Pin,Mode,Speed,Pull; } GPIO_InitTypeDef;
 typedef struct { uint32_t BaudRate,WordLength,StopBits,Parity,Mode,HwFlowCtl,OverSampling; } UART_InitTypeDef;
 typedef struct { USART_TypeDef *Instance; UART_InitTypeDef Init; } UART_HandleTypeDef;
 
-extern TIM_TypeDef _stub_tim1, _stub_tim2, _stub_tim8;
+extern TIM_TypeDef _stub_tim1, _stub_tim2, _stub_tim3, _stub_tim8;
 extern ADC_TypeDef _stub_adc1,_stub_adc2,_stub_adc3;
 extern DMA_TypeDef _stub_dma1,_stub_dma2;
 extern RCC_TypeDef _stub_rcc;
 extern DMA_Channel_TypeDef _stub_dma1_ch1,_stub_dma1_ch2,_stub_dma1_ch3,_stub_dma2_ch5;
 extern USART_TypeDef _stub_usart3;
 extern AFIO_TypeDef _stub_afio;
-extern GPIO_TypeDef _stub_gpiob;
+extern GPIO_TypeDef _stub_gpioa, _stub_gpiob;
 
 #define TIM1 (&_stub_tim1)
 #define TIM2 (&_stub_tim2)
+#define TIM3 (&_stub_tim3)
 #define TIM8 (&_stub_tim8)
 #define ADC1 (&_stub_adc1)
 #define ADC2 (&_stub_adc2)
@@ -44,6 +45,7 @@ extern GPIO_TypeDef _stub_gpiob;
 #define RCC (&_stub_rcc)
 #define USART3 (&_stub_usart3)
 #define AFIO (&_stub_afio)
+#define GPIOA (&_stub_gpioa)
 #define GPIOB (&_stub_gpiob)
 
 typedef struct { volatile uint32_t CYCCNT; } DWT_Type;
@@ -53,6 +55,9 @@ extern DWT_Type _stub_dwt;
 #define TIM_BDTR_MOE (1U << 15)
 #define TIM_CR1_DIR (1U<<4)
 #define TIM_CR1_CEN (1U<<0)
+#define TIM_DIER_UIE (1U<<0)
+#define TIM_SR_UIF (1U<<0)
+#define TIM_EGR_UG (1U<<0)
 #define ADC_CR2_ADON (1U<<0)
 #define DMA_CCR_EN (1U<<0)
 #define DMA_CCR_MINC (1U<<7)
@@ -73,12 +78,19 @@ extern DWT_Type _stub_dwt;
 #define DMA_ISR_TEIF2 (1U<<7)
 #define DMA_ISR_TEIF3 (1U<<11)
 
+#define GPIO_PIN_2 (1U<<2)
+#define GPIO_PIN_4 (1U<<4)
+#define GPIO_PIN_5 (1U<<5)
 #define GPIO_PIN_10 (1U<<10)
 #define GPIO_PIN_11 (1U<<11)
+#define GPIO_MODE_OUTPUT_PP 0U
 #define GPIO_MODE_AF_PP 1U
 #define GPIO_MODE_INPUT 2U
 #define GPIO_PULLUP 1U
+#define GPIO_SPEED_FREQ_LOW 1U
 #define GPIO_SPEED_FREQ_HIGH 3U
+#define GPIO_PIN_RESET 0U
+#define GPIO_PIN_SET 1U
 
 #define UART_WORDLENGTH_8B 0U
 #define UART_STOPBITS_1 0U
@@ -101,12 +113,15 @@ extern DWT_Type _stub_dwt;
 #define USART_SR_IDLE (1U<<4)
 #define AFIO_MAPR_USART3_REMAP (3U<<4)
 
+#define TIM3_IRQn 29
 #define DMA1_Channel2_IRQn 12
 #define DMA1_Channel3_IRQn 13
 #define USART3_IRQn 39
 #define HAL_OK 0
 #define __HAL_RCC_AFIO_CLK_ENABLE() ((void)0)
+#define __HAL_RCC_GPIOA_CLK_ENABLE() ((void)0)
 #define __HAL_RCC_GPIOB_CLK_ENABLE() ((void)0)
+#define __HAL_RCC_TIM3_CLK_ENABLE() ((void)0)
 #define __HAL_RCC_USART3_CLK_ENABLE() ((void)0)
 #define __HAL_RCC_DMA1_CLK_ENABLE() ((void)0)
 
@@ -116,6 +131,8 @@ static inline void __disable_irq(void){}
 static inline void __enable_irq(void){}
 static inline void __DMB(void){}
 static inline void HAL_GPIO_Init(GPIO_TypeDef*p,GPIO_InitTypeDef*g){(void)p;(void)g;}
+static inline void HAL_GPIO_WritePin(GPIO_TypeDef*p,uint32_t pin,uint32_t state){(void)p;(void)pin;(void)state;}
+static inline void HAL_Delay(uint32_t ms){(void)ms;}
 static inline int HAL_UART_Init(UART_HandleTypeDef*h){(void)h;return HAL_OK;}
 static inline void HAL_NVIC_SetPriority(int irq,uint32_t p,uint32_t s){(void)irq;(void)p;(void)s;}
 static inline void HAL_NVIC_EnableIRQ(int irq){(void)irq;}

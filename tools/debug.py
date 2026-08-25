@@ -48,6 +48,7 @@ COMM_DETECT_MOTOR_FLUX_LINKAGE = 26
 COMM_DETECT_ENCODER = 27
 COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
+COMM_GET_DECODED_ADC = 31
 COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
 COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP = 57
@@ -338,10 +339,33 @@ def parse_values(p: bytes) -> Values:
     return Values(temp_fet,temp_motor,imotor,ibatt,id_,iq,duty,erpm,vin,ah,ahc,wh,whc,tach,tach_abs,fault,pos,cid,vd,vq,status)
 
 
-def get_values(link: Link, motor: int) -> Values:
+def get_values(link: Link, motor: int, timeout: float = 1.0) -> Values:
     p = link.request_std(motor, bytes((COMM_GET_VALUES,)),
-                         lambda x: bool(x) and x[0] == COMM_GET_VALUES)
+                         lambda x: bool(x) and x[0] == COMM_GET_VALUES,
+                         timeout)
     return parse_values(p)
+
+
+def parse_decoded_adc(p: bytes) -> dict:
+    if len(p) != 17 or p[0] != COMM_GET_DECODED_ADC:
+        raise ValueError("bukan COMM_GET_DECODED_ADC")
+    r = Reader(p, 1)
+    return {
+        "decoded1": r.i32() / 1_000_000.0,
+        "voltage1": r.i32() / 1_000_000.0,
+        "decoded2": r.i32() / 1_000_000.0,
+        "voltage2": r.i32() / 1_000_000.0,
+    }
+
+
+def get_decoded_adc(link: Link, motor: int, timeout: float = 1.0) -> dict:
+    p = link.request_std(
+        motor,
+        bytes((COMM_GET_DECODED_ADC,)),
+        lambda x: len(x) == 17 and x[0] == COMM_GET_DECODED_ADC,
+        timeout,
+    )
+    return parse_decoded_adc(p)
 
 
 def parse_cal(p: bytes) -> dict:
@@ -440,6 +464,17 @@ def parse_cal(p: bytes) -> dict:
                 for name in ("adc3_cr1","adc3_cr2","adc3_sqr1","adc3_sqr3",
                              "dma2_ch5_ccr","dma2_ch5_cndtr32","dma2_isr"):
                     d.setdefault("registers",{})[name] = r.u32()
+
+            # V17 appends robust-filter outlier counts and per-motor MOE trace.
+            if d.get("cal_diag_revision",0) >= 17 and len(p)-r.i >= 38:
+                names = ["left_u", "left_v", "left_dc",
+                         "right_u", "right_v", "right_dc"]
+                d["outlier_count"] = {name: r.u16() for name in names}
+                d["moe_fail_mask"] = r.u8()
+                d["moe_confirmed_mask"] = r.u8()
+                d["moe_request_adc"] = [r.u32(), r.u32()]
+                d["moe_confirm_adc"] = [r.u32(), r.u32()]
+                d["first_sample_adc"] = [r.u32(), r.u32()]
     return d
 
 
@@ -777,18 +812,26 @@ def _print_calibration_diagnostics(d: dict) -> None:
         print(f"warn_mask               : 0x{d.get('warn_mask',0):04X}")
         print(f"fail_range_mask         : 0x{d.get('fail_range_mask',0):04X}")
         print(f"fail_noise_mask         : 0x{d.get('fail_noise_mask',0):04X}")
-        print("channel      mean   min   max spread  stddev      status")
+        print("channel      mean   min   max spread  stddev outlier      status")
         names=["left_u","left_v","left_dc","right_u","right_v","right_dc"]
         for idx,name in enumerate(names):
             c=d.get("channels",{}).get(name)
             if not c: continue
-            print(f"{name:10s} {c['mean']:5d} {c['min']:5d} {c['max']:5d} {c['spread']:6d} {c['stddev']:8.3f}  {_calibration_channel_status(d,idx,name)}")
+            outliers=d.get("outlier_count",{}).get(name,0)
+            print(f"{name:10s} {c['mean']:5d} {c['min']:5d} {c['max']:5d} "
+                  f"{c['spread']:6d} {c['stddev']:8.3f} {outliers:7d}  "
+                  f"{_calibration_channel_status(d,idx,name)}")
         print("\nThreshold policy:")
         print("  undriven pass         : only reject ADC rail / gross hardware fault")
         print("  driven offset source  : 50%/50%/50% zero-vector switching, 1000 samples/motor")
         print("  hard mean range       : 128..3967 ADC counts")
-        print("  warning noise         : spread >160 OR stddev >16 counts")
-        print("  hard driven-noise fail: spread >800 OR stddev >80 counts")
+        if d.get("cal_diag_revision",0) >= 17:
+            print("  robust inlier window  : +/-256 counts around undriven mean")
+            print("  warning noise         : any outlier OR raw spread >160 OR clean stddev >16")
+            print("  hard driven-noise fail: >10 outliers, <990 inliers, OR clean stddev >80")
+        else:
+            print("  warning noise         : spread >160 OR stddev >16 counts")
+            print("  hard driven-noise fail: spread >800 OR stddev >80 counts")
         print("  PWM start blanking    : 8 driven samples at 50% zero vector; DC trip 17 A")
         print("  warning does NOT inhibit PWM; hard failure does.")
         if d.get("cal_diag_revision",0) >= 14:
@@ -827,6 +870,18 @@ def _print_calibration_diagnostics(d: dict) -> None:
                 if k in d: print(f"{k:24s}: {d[k]}")
             print("trigger                  : TIM8_TRGO (same PWM frame as current scan)")
             print("DCLINK                   : PC2 / ADC3_IN12 / DMA2 Channel 5")
+        if d.get("cal_diag_revision",0) >= 17:
+            print("\n=== PWM MOE CALIBRATION TRACE ===")
+            print(f"moe_fail_mask           : 0x{d.get('moe_fail_mask',0):02X}")
+            print(f"moe_confirmed_mask      : 0x{d.get('moe_confirmed_mask',0):02X}")
+            request=d.get("moe_request_adc",[0,0])
+            confirm=d.get("moe_confirm_adc",[0,0])
+            first=d.get("first_sample_adc",[0,0])
+            print("motor        request_adc confirm_adc first_sample delta_confirm delta_sample")
+            for idx,name in enumerate(("LEFT", "RIGHT")):
+                req=request[idx]; con=confirm[idx]; fst=first[idx]
+                print(f"{name:10s} {req:11d} {con:11d} {fst:12d} "
+                      f"{(con-req) if con else -1:13d} {(fst-con) if fst and con else -1:12d}")
     regs=d.get("registers",{})
     if regs:
         print("\n=== RAW PERIPHERAL REGISTERS ===")
@@ -1225,6 +1280,180 @@ def cmd_motor_test(link: Link,args: argparse.Namespace)->int:
     return 0
 
 
+def _measured_rate_hz(timestamps: list[float]) -> float:
+    if len(timestamps) < 2:
+        return 0.0
+    span = timestamps[-1] - timestamps[0]
+    return (len(timestamps) - 1) / span if span > 0.0 else 0.0
+
+
+def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
+    """Active ERPM test with independently measured RT and APP rates."""
+    require_yes(args, "Speed test")
+    if args.seconds <= 0.0:
+        raise ValueError("--seconds harus > 0")
+
+    cal = get_cal(link, False)
+    if not cal["valid"]:
+        raise RuntimeError("current calibration tidak valid")
+    sensor = get_sensor(link, args.motor)
+    if not sensor["success"] and not args.force:
+        raise RuntimeError(
+            "sensor belum lulus auto-detect. Jalankan sensor-detect atau "
+            "gunakan --force dengan risiko sendiri."
+        )
+
+    initial = get_values(link, args.motor)
+    if initial.fault != 0:
+        raise RuntimeError(
+            f"fault aktif sebelum test: {initial.fault} "
+            f"({FAULT_NAMES.get(initial.fault, '?')})"
+        )
+
+    rt_period = 1.0 / 50.0
+    app_period = 1.0 / 20.0
+    payload = command_payload("rpm", args.erpm)
+    command_times: list[float] = []
+    rt_times: list[float] = []
+    app_times: list[float] = []
+    rt_jitter_ms: list[float] = []
+    app_jitter_ms: list[float] = []
+    rows: list[dict] = []
+    rt_timeouts = 0
+    app_timeouts = 0
+    missed_rt_slots = 0
+    missed_app_slots = 0
+    fault_seen = 0
+    latest_app: dict = {}
+    latest_values: Optional[Values] = None
+
+    link.clear_fault(args.motor)
+    time.sleep(0.05)
+    started = time.monotonic()
+    stop_at = started + args.seconds
+    next_rt = started
+    next_app = started
+
+    try:
+        while True:
+            event_deadline = min(next_rt, next_app)
+            if event_deadline >= stop_at:
+                break
+            now = time.monotonic()
+            if now < event_deadline:
+                time.sleep(event_deadline - now)
+                now = time.monotonic()
+
+            event = "rt" if next_rt <= next_app else "app"
+            rt_ok = False
+            app_updated = False
+            if event == "rt":
+                if now - next_rt >= rt_period:
+                    skipped = int((now - next_rt) // rt_period)
+                    missed_rt_slots += skipped
+                    next_rt += skipped * rt_period
+                scheduled = next_rt
+                rt_jitter_ms.append((now - scheduled) * 1000.0)
+                link.send_std(args.motor, payload)
+                command_times.append(time.monotonic())
+                try:
+                    latest_values = get_values(link, args.motor, timeout=0.04)
+                    rt_times.append(time.monotonic())
+                    rt_ok = True
+                except TimeoutError:
+                    rt_timeouts += 1
+                next_rt += rt_period
+            else:
+                if now - next_app >= app_period:
+                    skipped = int((now - next_app) // app_period)
+                    missed_app_slots += skipped
+                    next_app += skipped * app_period
+                scheduled = next_app
+                app_jitter_ms.append((now - scheduled) * 1000.0)
+                try:
+                    latest_app = get_decoded_adc(link, args.motor, timeout=0.04)
+                    app_times.append(time.monotonic())
+                    app_updated = True
+                except TimeoutError:
+                    app_timeouts += 1
+                next_app += app_period
+
+            row = {
+                "elapsed_s": time.monotonic() - started,
+                "scheduled_s": scheduled - started,
+                "event": event,
+                "jitter_ms": ((rt_jitter_ms[-1] if event == "rt" else
+                                app_jitter_ms[-1])),
+                "motor": args.motor,
+                "target_erpm": args.erpm,
+                "rt_ok": int(rt_ok),
+                "app_updated": int(app_updated),
+                "erpm": latest_values.erpm if latest_values else "",
+                "duty": latest_values.duty if latest_values else "",
+                "imotor_a": latest_values.imotor if latest_values else "",
+                "ibatt_a": latest_values.ibatt if latest_values else "",
+                "id_a": latest_values.id if latest_values else "",
+                "iq_a": latest_values.iq if latest_values else "",
+                "vin_v": latest_values.vin if latest_values else "",
+                "fault": latest_values.fault if latest_values else "",
+                "app_decoded1": latest_app.get("decoded1", ""),
+                "app_voltage1_v": latest_app.get("voltage1", ""),
+                "app_decoded2": latest_app.get("decoded2", ""),
+                "app_voltage2_v": latest_app.get("voltage2", ""),
+            }
+            rows.append(row)
+
+            if rt_ok and latest_values is not None and latest_values.fault != 0:
+                fault_seen = latest_values.fault
+                break
+    finally:
+        link.stop(args.motor)
+        link.send_std(args.motor, bytes((COMM_SET_CURRENT,)) + be_i32(0))
+
+    rt_hz = _measured_rate_hz(rt_times)
+    app_hz = _measured_rate_hz(app_times)
+    command_hz = _measured_rate_hz(command_times)
+    rt_max_jitter = max(rt_jitter_ms, default=0.0)
+    rt_mean_jitter = (sum(rt_jitter_ms) / len(rt_jitter_ms)
+                      if rt_jitter_ms else 0.0)
+    app_max_jitter = max(app_jitter_ms, default=0.0)
+    app_mean_jitter = (sum(app_jitter_ms) / len(app_jitter_ms)
+                       if app_jitter_ms else 0.0)
+
+    print("\n=== SPEED TEST RATE RESULT ===")
+    print(f"motor                   : {'LEFT' if args.motor == 0 else 'RIGHT'}")
+    print(f"target_erpm             : {args.erpm}")
+    print(f"command_rate_hz         : {command_hz:.2f} (target 50)")
+    print(f"rt_data_rate_hz         : {rt_hz:.2f} (target 50)")
+    print(f"app_data_rate_hz        : {app_hz:.2f} (target 20)")
+    print(f"rt/app_timeouts         : {rt_timeouts} / {app_timeouts}")
+    print(f"missed_rt/app_slots     : {missed_rt_slots} / {missed_app_slots}")
+    print(f"mean/max_jitter_ms RT   : {rt_mean_jitter:.3f} / {rt_max_jitter:.3f}")
+    print(f"mean/max_jitter_ms APP  : {app_mean_jitter:.3f} / {app_max_jitter:.3f}")
+    print(f"fault                   : {fault_seen} ({FAULT_NAMES.get(fault_seen, '?')})")
+
+    if args.csv:
+        path = Path(args.csv)
+        with path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
+            if rows:
+                writer.writeheader()
+                writer.writerows(rows)
+        print(f"CSV                     : {path}")
+
+    rates_ok = (command_hz >= args.min_rt_hz and
+                rt_hz >= args.min_rt_hz and
+                app_hz >= args.min_app_hz)
+    if fault_seen != 0:
+        print("RESULT: FAIL - motor fault during speed test")
+        return 6
+    if not rates_ok or rt_timeouts or app_timeouts:
+        print("RESULT: FAIL - telemetry rate/timeout requirement not met")
+        return 8
+    print("RESULT: PASS - RT 50 Hz and APP 20 Hz schedules verified")
+    return 0
+
+
 def cmd_monitor(link: Link,args: argparse.Namespace)->int:
     end=time.monotonic()+args.seconds if args.seconds>0 else math.inf
     period=1/max(1.0,args.hz)
@@ -1476,6 +1705,8 @@ def self_test() -> int:
     assert Link.standard_route(1,payload)==bytes((COMM_FORWARD_CAN,2))+payload
     assert parse_ping_can(bytes((COMM_PING_CAN,2))) == [2]
     assert parse_ping_can(bytes((COMM_PING_CAN,))) == []
+    assert abs(_measured_rate_hz([i * 0.02 for i in range(100)]) - 50.0) < 1e-9
+    assert abs(_measured_rate_hz([i * 0.05 for i in range(40)]) - 20.0) < 1e-9
     fw=(bytes((COMM_FW_VERSION,6,0))+b"HOVERBOARD_DUAL_FOC\x00"+bytes(range(12))+
         bytes((1,0,0,0,0,0,0,0))+b"vesc-f103-hoverboard-v24\x00")
     fwd=parse_fw_version(fw)
@@ -1494,6 +1725,73 @@ def self_test() -> int:
     samp=bytes((COMM_SAMPLE_PRINT,))+be_i16(3)+b''.join(struct.pack(">f",x) for x in vals)+bytes((0,123))+be_i32(3)
     idx,row=parse_sample_packet(samp)
     assert idx==3 and abs(row['current1']+2.0)<1e-6 and row['index_full']==3
+
+    adc_payload = bytes((COMM_GET_DECODED_ADC,)) + b"".join(
+        be_i32(v) for v in (250_000, 825_000, 750_000, 2_475_000)
+    )
+    adc = parse_decoded_adc(adc_payload)
+    assert adc == {
+        "decoded1": 0.25, "voltage1": 0.825,
+        "decoded2": 0.75, "voltage2": 2.475,
+    }
+
+    # Current-cal revision 17 remains exactly within the 512-byte firmware
+    # payload and exposes robust-filter/MOE state without changing its prefix.
+    cpay = bytearray((COMM_CUSTOM_APP_DATA, CUSTOM_CURRENT_CAL, 1, 1))
+    cpay += struct.pack(">II", 6096, 6096)
+    for value in (2669, 2659, 1954, 2616, 2604, 1985):
+        cpay += be_i32(value)
+    cpay += struct.pack(">IHH", 1_659_009, 6, 0)
+    cpay += bytes((0, 1, 1, 0, 1, 1, 1))
+    cpay += bytes((17,)) + struct.pack(">HHH", 0x18, 0, 0)
+    channel_values = (
+        (2669, 2631, 4074, 625_300),
+        (2659, 2344, 4076, 977_600),
+        (1954, 1948, 1961, 286),
+        (2616, 2587, 2941, 31_260),
+        (2604, 2575, 2929, 31_220),
+        (1985, 1979, 1990, 397),
+    )
+    for mean, minimum, maximum, variance in channel_values:
+        cpay += be_i32(mean) + be_u16(minimum) + be_u16(maximum)
+        cpay += struct.pack(">I", variance)
+    for value in range(24):
+        cpay += struct.pack(">I", value)
+    for value in range(6):
+        cpay += struct.pack(">I", 0x08000800 + value)
+    cpay += bytes((8,)) + be_u16(0)
+    for value in (2680, 2672, 1954, 2632, 2620, 1984,
+                  2669, 2659, 1954, 2616, 2604, 1985):
+        cpay += be_i32(value)
+    cpay += bytes((0, 0, 0, 8))
+    cpay += be_u16(0) + be_u16(0) + be_u16(0)
+    for _ in range(3):
+        cpay += be_i32(0)
+    for _ in range(6):
+        cpay += be_i32(0)
+    for _ in range(5):
+        cpay += be_u16(0)
+    cpay += struct.pack(">I", 0)
+    cpay += be_u16(8) + bytes((0, 0, 0, 0)) + be_u16(120)
+    cpay += struct.pack(">IIHHH", 16_000, 4_000, 1, 1900, 1767)
+    cpay += bytes((1, 1)) + be_u16(1) + be_u16(1668) + be_u16(1667)
+    cpay += bytes((0, 0)) + struct.pack(">I", 0)
+    for value in range(7):
+        cpay += struct.pack(">I", value)
+    for value in (4, 5, 0, 2, 3, 0):
+        cpay += be_u16(value)
+    cpay += bytes((0, 3))
+    for value in (1000, 4000, 2000, 5000, 2100, 5100):
+        cpay += struct.pack(">I", value)
+    assert len(cpay) == 463
+    cal17 = parse_cal(bytes(cpay))
+    assert cal17["cal_diag_revision"] == 17
+    assert cal17["outlier_count"]["left_u"] == 4
+    assert cal17["outlier_count"]["right_v"] == 3
+    assert cal17["moe_confirmed_mask"] == 3
+    assert cal17["moe_request_adc"] == [1000, 4000]
+    assert cal17["moe_confirm_adc"] == [2000, 5000]
+    assert cal17["first_sample_adc"] == [2100, 5100]
 
     # V21 sensor/observer diagnostics ABI: verify the appended PWM/ADC scheduling fields
     # independently of serial hardware so a stale debug parser cannot hide a
@@ -1592,7 +1890,9 @@ def self_test() -> int:
     assert dd14['heap_min_ever_bytes']==3072 and dd14['tx_queue_high_water']==3
     assert dd14['tx_queue_busy_drops']==4 and dd14['tx_low_priority_drops']==5
 
-    print("SELF-TEST PASS: CRC, framing, VESC-6.00 FW/config parser, VESC Tool local-ID2 scan + motor-2 forwarding, sample parser, EXT-v6 phase/dq telemetry, COMM_DIAG-v14 resources/timing, sensor/observer diagnostics, standard Hall/encoder detect ABI")
+    print("SELF-TEST PASS: CRC/framing, VESC-6.00 FW/config, local-ID2 forwarding, "
+          "sample/ADC parser, current-cal-v17 robust/MOE ABI, EXT-v6 telemetry, "
+          "COMM_DIAG-v14 resources, sensor/observer diagnostics")
     return 0
 
 def add_live_args(p: argparse.ArgumentParser) -> None:
@@ -1638,6 +1938,15 @@ def main() -> int:
     p=sp("detect-flux",cmd_detect_flux,"ACTIVE standard VESC flux-linkage detection"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--current",type=float,default=1.0); p.add_argument("--resistance",type=float,required=True); p.add_argument("--min-erpm",type=float,default=1800.0); p.add_argument("--duty",type=float,default=0.2); p.add_argument("--openloop",action="store_true"); p.add_argument("--erpm-per-sec",type=float,default=2000.0); p.add_argument("--inductance",type=float,default=0.00005); p.add_argument("--timeout",type=float,default=20.0); p.add_argument("--yes",action="store_true")
     p=sp("detect-all-foc",cmd_detect_all_foc,"ACTIVE standard VESC Detect All FOC and persist result"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--max-power-loss",type=float,default=50.0); p.add_argument("--min-input-current",type=float,default=-20.0); p.add_argument("--max-input-current",type=float,default=20.0); p.add_argument("--openloop-erpm",type=float,default=3000.0); p.add_argument("--sl-erpm",type=float,default=2500.0); p.add_argument("--timeout",type=float,default=60.0); p.add_argument("--yes",action="store_true")
     p=sp("motor-test",cmd_motor_test,"active current/brake/rpm/duty/position test at 50 Hz command refresh"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["current","brake","rpm","duty","position"],required=True); p.add_argument("--value",type=float,required=True); p.add_argument("--seconds",type=float,default=2); p.add_argument("--yes",action="store_true"); p.add_argument("--force",action="store_true")
+    p=sp("speed-test",cmd_speed_test,"ACTIVE ERPM test with measured RT 50 Hz and APP ADC 20 Hz")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--erpm",type=float,default=300.0)
+    p.add_argument("--seconds",type=float,default=5.0)
+    p.add_argument("--min-rt-hz",type=float,default=45.0)
+    p.add_argument("--min-app-hz",type=float,default=18.0)
+    p.add_argument("--csv",help="optional per-cycle CSV output")
+    p.add_argument("--yes",action="store_true")
+    p.add_argument("--force",action="store_true")
     p=sp("test-all",cmd_test_all,"passive end-to-end firmware/telemetry test"); p.add_argument("--zero-limit",type=float,default=0.30)
     p=sp("full-test",cmd_full_test,"ACTIVE commissioning: calibration, auto-detect, samples, current +/- and optional RPM/position"); p.add_argument("--yes",action="store_true"); p.add_argument("--current",type=float,default=0.5); p.add_argument("--erpm",type=float,default=300.0); p.add_argument("--stage-seconds",type=float,default=1.0); p.add_argument("--cal-timeout",type=float,default=5.0); p.add_argument("--detect-timeout",type=float,default=15.0); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--sample-decimation",type=int,default=8); p.add_argument("--skip-rpm",action="store_true"); p.add_argument("--position-step",type=float,default=5.0)
 

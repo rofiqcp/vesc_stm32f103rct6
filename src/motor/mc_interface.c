@@ -3,7 +3,7 @@
 #include "motor/foc_math.h"
 #include "motor/mc_math.h"
 #include "motor/mcpwm_foc.h"
-#include "debug_sample.h"
+#include "motor/mc_interface_sample.h"
 #include "telemetry.h"
 #include "encoder/encoder.h"
 #include "motor/mcconf_default.h"
@@ -2001,7 +2001,15 @@ void mc_interface_update_pid_pos_offset(float angle_now,bool store){
     if(store)(void)conf_general_store_mc_configuration(&s_mcconf_mirror[m->id],m->id==MOTOR_RIGHT);
 }
 float mc_interface_get_last_sample_adc_isr_duration(void){MotorRuntime*m=mc_interface_motor_runtime_now();return (float)m->isr_max_cycles/(float)CPU_CLOCK_HZ;}
-void mc_interface_sample_print_data(debug_sampling_mode mode,uint16_t len,uint8_t decimation,bool raw,void(*reply_func)(unsigned char*,unsigned int)){(void)reply_func;MotorRuntime*m=mc_interface_motor_runtime_now();if(m)(void)debug_sample_control(mode,m->id,len,decimation,raw);}
+void mc_interface_sample_print_data(debug_sampling_mode mode, uint16_t len,
+		uint8_t decimation, bool raw,
+		void (*reply_func)(unsigned char *data, unsigned int len)) {
+	(void)reply_func;
+	MotorRuntime *motor = mc_interface_motor_runtime_now();
+	if (motor != NULL) {
+		(void)mc_interface_sample_control(mode, motor->id, len, decimation, raw);
+	}
+}
 /* There is still no MOSFET NTC. VESC's FET-temperature API exposes the
  * explicitly documented MCU/board proxy. Motor temperature remains unavailable
  * unless a real sensor backend feeds the override API. */

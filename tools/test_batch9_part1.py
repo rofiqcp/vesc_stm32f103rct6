@@ -12,7 +12,8 @@ dt=read('src/datatypes.h')
 cg=read('src/confgenerator.c'); cgh=read('src/confgenerator.h')
 hw=read('src/hwconf/hw.c'); hwh=read('src/hwconf/hw_hoverboard.h')
 mc=read('src/motor/mc_interface.c'); mcd=read('src/motor/mcconf_default.h')
-mt=read('src/motor_tasks.c'); mm=read('src/motor/mc_math.c'); mmh=read('src/motor/mc_math.h')
+mt=read('src/motor/mc_interface_tasks.c'); status=read('src/hwconf/hw_status.c')
+mm=read('src/motor/mc_math.c'); mmh=read('src/motor/mc_math.h')
 foc=read('src/motor/mcpwm_foc.c')
 part2=('Batch 9 Part 2' in foc and 'motor_hw_vbus_raw_from_isr' in foc)
 
@@ -107,9 +108,9 @@ ok('mc_math_start_current_limit' in mmh and 'mc_math_start_current_limit' in mm 
    'foc_start_curr_dec has a tested 1-kHz VESC-style runtime backend')
 ok('s_pending_fault_mask |=' in mc,
    'task-level thermal/RPM faults are delivered through the existing fault-thread pending mask')
-ok(all(x in mt for x in ['MOTOR_FAULT_OVER_TEMP_BOARD','MOTOR_FAULT_OVER_TEMP_MOTOR',
+ok(all(x in status for x in ['MOTOR_FAULT_OVER_TEMP_BOARD','MOTOR_FAULT_OVER_TEMP_MOTOR',
                          'MOTOR_FAULT_OVERSPEED','MOTOR_FAULT_UNDERSPEED','MOTOR_FAULT_ABS_OVERSPEED']),
-   'fault task prioritizes and handles all new Part-1 fault classes')
+   'status fault priority includes all new Part-1 fault classes')
 
 # Syntax-check the modified controller with the same strict warning classes as
 # platformio.ini, using host-only CMSIS/HAL type stubs.

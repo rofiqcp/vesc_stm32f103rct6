@@ -21,7 +21,7 @@ def body(src, name):
 hw=txt('src/hwconf/hw.c'); hwh=txt('src/hwconf/hw.h')
 foc=txt('src/motor/mcpwm_foc.c'); foch=txt('src/motor/mcpwm_foc.h')
 uart=txt('src/applications/app_uartcomm.c'); uarth=txt('src/applications/app_uartcomm.h')
-mt=txt('src/motor_tasks.c'); mth=txt('src/motor_tasks.h')
+mt=txt('src/motor/mc_interface_tasks.c'); mth=txt('src/motor/mc_interface.h')
 cmd=txt('src/comm/commands.c'); cmdh=txt('src/comm/commands.h')
 term=txt('src/terminal.c'); conf=txt('src/confgenerator.c')
 
@@ -73,7 +73,7 @@ req('vesc_comm_send_payload_low_priority' in cmd and 'vesc_comm_send_sample_buff
 req('xPortGetMinimumEverFreeHeapSize' in mt, 'minimum-ever heap monitor missing')
 req('uxTaskGetStackHighWaterMark' in mt and ('osThreadGetStackSpace' in cmd or 'uxTaskGetStackHighWaterMark' in cmd),
     'stack high-water monitoring incomplete')
-for token in ['motor_runtime_resource_stats_t','motor_threads_get_resource_stats',
+for token in ['mc_interface_resource_stats_t','mc_interface_get_resource_stats',
               'vesc_comm_resource_stats_t','vesc_comm_get_resource_stats']:
     req(token in mth+mt+cmdh+cmd, f'resource API missing: {token}')
 req('resources' in term and 'timing' in term, 'resource/timing terminal commands missing')
@@ -86,7 +86,8 @@ req(re.search(r'p\[i\+\+\]\s*=\s*14',cmd) is not None, 'COMM_DIAG revision is no
 for token in ['sampling_contract_flags','isr_total_max_cycles','heap_min_ever',
               'tx_queue_high_water','tx_queue_busy_drops','tx_low_priority_drops']:
     req(token in cmd+cmdh, f'diagnostic/resource field missing: {token}')
-req('vesc-f103-hoverboard-v32-full-reaudit' in cmd, 'Stage3 v32 firmware identity missing')
+req('vesc-f103-hoverboard-v33-vesc-layout' in cmd,
+    'V33 VESC-layout firmware identity missing')
 
 # Excluded subsystems should not reappear as runtime source dependencies.
 for forbidden in ['#include "bms',' #include "imu','#include "nrf','#include "lispif',

@@ -1,0 +1,610 @@
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/F103_RAM_LINKER_FIX_NOTES.md /mnt/data/ramfix/F103_RAM_LINKER_FIX_NOTES.md
+--- /mnt/data/ramfix_base/F103_RAM_LINKER_FIX_NOTES.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/ramfix/F103_RAM_LINKER_FIX_NOTES.md	2026-08-20 17:15:18.176488153 +0000
+@@ -0,0 +1,74 @@
++# STM32F103RCT6 48-KiB RAM Linker Fix
++
++Baseline: `vesc_stm32f103rct6_batch11_part2_arm_buildfix.zip`
++Target remains: STM32F103RCT6, 48 KiB SRAM, 256 KiB Flash (248 KiB application + 8 KiB transactional config pages).
++
++## Real target-build failure addressed
++
++The first real PlatformIO ARM link reported:
++
++`region RAM overflowed by 6184 bytes`
++
++This revision fixes the RAM architecture rather than enlarging the linker RAM region.
++
++## SRAM reductions
++
++1. Debug/experiment sample capture is reduced from 256 to 64 entries.
++   - `debug_sample_t` is 30 bytes.
++   - old: 256 * 30 = 7680 bytes
++   - new: 64 * 30 = 1920 bytes
++   - SRAM saved: 5760 bytes
++
++2. FreeRTOS heap_4 reservation is reduced from 22 KiB to 18 KiB.
++   - SRAM saved: 4096 bytes
++   - Application thread stacks request about 9.0 KiB in total; idle/timer stacks add about 1.5 KiB. 18 KiB leaves additional heap room for TCBs, mutexes, the blocking queue and allocator metadata.
++
++Combined static SRAM saving: 9856 bytes.
++
++Using the real linker overflow of 6184 bytes, the projected post-fix linker headroom is about 3672 bytes. The real `pio run` output remains authoritative.
++
++## Runtime heap guard
++
++After motor-service/sample/fault threads are created, motor-ready is refused unless `xPortGetFreeHeapSize()` reports at least 2048 bytes remaining. malloc-failure and stack-overflow hooks still hard-disable both bridges.
++
++## Functionality intentionally preserved
++
++No reduction was made to:
++- dual motor state/control;
++- 16-kHz fixed-point FOC;
++- ADC1/ADC2 current acquisition;
++- ADC3/DMA2 Vbus;
++- LEFT Hall/ABI and RIGHT Hall-only policy;
++- current-offset calibration and dual Detect-All;
++- R/Ld/Lq/flux/sensor detection;
++- VESC Tool FW/config/telemetry/control commands;
++- transactional flash persistence;
++- fault LED/buzzer and startup melody.
++
++Only the optional high-rate debug/experiment capture history is capped to 64 samples. Standard VESC telemetry is unaffected.
++
++## Compiler-warning cleanup
++
++The source warnings observed after the vendor-HAL warning was unblocked are corrected at source:
++- `debug_sample.c`: redundant enum lower-bound check removed (`-Wtype-limits`).
++- `hw.c`: chained duty clamps split into unambiguous statements (`-Wmisleading-indentation`).
++- `conf_general.c`: misleading one-line guards/flash-program flow reformatted without changing behavior.
++
++Vendor STM32CubeF1 is not patched. Project warning policy remains source-scoped through `build_src_flags`.
++
++## Required real target verification
++
++From a freshly extracted directory:
++
++```
++pio run -t clean
++pio run
++```
++
++Expected: link succeeds with RAM below 49152 bytes. Then:
++
++```
++pio run -t upload
++```
++
++Do not copy only `platformio.ini` into an old tree; use the whole ZIP because the RAM reduction also changes FreeRTOSConfig and the debug sample buffer.
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/F103_RAM_LINKER_FIX_VALIDATION.txt /mnt/data/ramfix/F103_RAM_LINKER_FIX_VALIDATION.txt
+--- /mnt/data/ramfix_base/F103_RAM_LINKER_FIX_VALIDATION.txt	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/ramfix/F103_RAM_LINKER_FIX_VALIDATION.txt	2026-08-20 17:15:23.873045607 +0000
+@@ -0,0 +1,163 @@
++STM32F103RCT6 RAM FIX VALIDATION
++=================================
++PASS: linker remains locked to real STM32F103RCT6 48-KiB SRAM
++PASS: PlatformIO RAM checker is explicitly locked to 49152 bytes
++PASS: FreeRTOS heap is bounded to 18 KiB
++PASS: debug sampler is capped at 64 samples
++PASS: motor-ready state requires at least 2 KiB runtime FreeRTOS heap reserve
++PASS: debug sampling enum no longer triggers ARM -Wtype-limits
++PASS: debug_sample_t remains 30 bytes
++PASS: debug-buffer reduction saves 5760 bytes of static SRAM
++PASS: RTOS-heap reduction saves 4096 bytes of static SRAM
++PASS: combined RAM fix saves 9856 bytes versus the failing build
++PASS: RAM changes exceed measured overflow with ~3672 bytes projected linker headroom
++ALL STM32F103RCT6 RAM-BUDGET REGRESSIONS: PASS
++PASS: project-only build_src_flags section exists
++PASS: blanket -Werror is absent from global framework build flags
++PASS: firmware src/ keeps strict warnings and critical semantic errors
++PASS: blanket project -Werror is intentionally disabled for portable vendor/toolchain compatibility
++PASS: target MCU/framework/optimization flags remain unchanged
++ALL PLATFORMIO BUILD-POLICY REGRESSIONS: PASS
++PASS: VESC 6.00 wire sizes/signatures are locked (481/493)
++PASS: COMM_FW_VERSION remains aligned with the VESC 6.00 wire schema
++PASS: hard ADC/FOC call path and direct fast helpers contain no floating-point constructs
++PASS: excluded CAN/IMU/BMS/NRF/USB/Lisp/LZO/QML/LEDPWM/NTC source modules are absent
++PASS: LEFT encoder defaults are 4 pole-pairs, 1024 PPR, 4096 quadrature counts/rev
++PASS: sensor policy is LEFT Hall/ABI only and RIGHT Hall only
++PASS: COMM_FORWARD_CAN is retained as local motor-2 protocol routing without CAN PHY
++PASS: VESC Tool device scan advertises exactly the locally forwarded motor-2 ID
++PASS: TIM1/TIM8 + dual-ADC/DMA hoverboard timing architecture remains present
++ALL STATIC PORT INVARIANTS: PASS
++PASS: FW identity bumped to v25 while preserving VESC6 protocol target
++PASS: direct VESC Tool scan advertises local Motor-2 ID
++PASS: setup telemetry carries VESC count
++PASS: standard telemetry carries selected controller ID
++PASS: direct detect_can=true is handled as local dual Detect-All
++PASS: dual Detect-All executes LEFT then RIGHT
++PASS: dual Detect-All uses dedicated atomic dual commit
++PASS: dual Detect-All persists with one transactional store-all operation
++PASS: dual commit snapshots and restores both motor configs on failure
++PASS: failed dual Detect-All reapplies both last-known-good MCCONFs
++PASS: Detect-All reply remains VESC Tool int16 result format
++PASS: fresh calibration helper exists
++PASS: Detect-All waits for a newly-started calibration transaction, not stale boot result
++PASS: ordinary motor input is gated for both motors during Detect-All and released afterwards
++PASS: both bridges are commanded stopped before calibration/detection
++PASS: shared calibration covers all six LEFT/RIGHT phase/DC-current channels
++PASS: fresh calibration includes driven zero-vector stages for both inverters
++PASS: calibration uses explicit multi-sample undriven and driven estimators
++PASS: LEFT Detect-All calibrates ABI encoder when LEFT is configured encoder
++PASS: Detect-All calibrates Hall table for Hall-selected motor
++PASS: RIGHT encoder selection is explicitly rejected
++PASS: hard FOC layer also clamps RIGHT encoder request back to Hall
++PASS: ABI encoder fast-path remains LEFT-only
++PASS: COMM_SET_DUTY is routed to real motor-control backend
++PASS: COMM_SET_CURRENT is routed to real motor-control backend
++PASS: COMM_SET_CURRENT_BRAKE is routed to real motor-control backend
++PASS: COMM_SET_RPM is routed to real motor-control backend
++PASS: COMM_SET_POS is routed to real motor-control backend
++PASS: COMM_SET_HANDBRAKE is routed to real motor-control backend
++PASS: COMM_SET_CURRENT_REL is routed to real motor-control backend
++PASS: main control commands pass motor input ownership/safety gate
++PASS: COMM_GET_VALUES is implemented
++PASS: COMM_GET_VALUES_SELECTIVE is implemented
++PASS: COMM_GET_VALUES_SETUP is implemented
++PASS: COMM_GET_VALUES_SETUP_SELECTIVE is implemented
++PASS: full standard VESC6 selective telemetry mask bits 0..21 are populated
++PASS: standard telemetry exposes motor current
++PASS: standard telemetry exposes input current
++PASS: standard telemetry exposes Id
++PASS: standard telemetry exposes Iq
++PASS: standard telemetry exposes duty
++PASS: standard telemetry exposes ERPM
++PASS: standard telemetry exposes Vbus
++PASS: standard telemetry exposes tachometer
++PASS: standard telemetry exposes position
++PASS: standard telemetry exposes Vd
++PASS: standard telemetry exposes Vq
++PASS: standard telemetry exposes fault
++PASS: unavailable NTC/FET/motor temperatures are explicit, not faked
++PASS: telemetry snapshot is selected per requested M1/M2
++PASS: COMM_SET_APPCONF_NO_STORE is accepted
++PASS: APPCONF no-store path does not write flash
++PASS: APPCONF set/no-store ACK preserves actual command ID
++PASS: VESC6 fixed MCCONF/APPCONF wire ABI remains explicit
++PASS: COMM_DETECT_MOTOR_R_L exists for VESC Tool motor wizard
++PASS: COMM_DETECT_MOTOR_FLUX_LINKAGE exists for VESC Tool motor wizard
++PASS: COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP exists for VESC Tool motor wizard
++PASS: COMM_DETECT_ENCODER exists for VESC Tool motor wizard
++PASS: COMM_DETECT_HALL_FOC exists for VESC Tool motor wizard
++PASS: COMM_DETECT_APPLY_ALL_FOC exists for VESC Tool motor wizard
++PASS: open-loop flux detection requires nonzero drive current; passive zero-current flux is not faked
++PASS: encoder-slip is included in audible/visible fault selection
++PASS: fault indication is derived from canonical VESC fault number
++PASS: LED+buzzer encode the same decimal fault-code pulse groups
++PASS: same state machine drives visual and audible fault indication
++PASS: non-blocking VESC-style power-on melody remains present
++PASS: high-side PWM input is active HIGH
++PASS: low-side complementary PWM input is active LOW
++PASS: idle polarity explicitly leaves both high-side and low-side gate inputs OFF
++PASS: hard FOC ISR body found
++PASS: hard FOC ISR remains free of sqrtf( operations
++PASS: hard FOC ISR remains free of fabsf( operations
++PASS: hard FOC ISR remains free of lrintf( operations
++PASS: hard FOC ISR remains free of double operations
++PASS: hard FOC ISR remains free of float operations
++PASS: excluded runtime subsystem not introduced: #include "comm_can.h"
++PASS: excluded runtime subsystem not introduced: #include "imu/
++PASS: excluded runtime subsystem not introduced: #include "bms/
++PASS: excluded runtime subsystem not introduced: #include "bm_if
++PASS: excluded runtime subsystem not introduced: #include "nrf
++PASS: excluded runtime subsystem not introduced: #include "ledpwm
++PASS: excluded runtime subsystem not introduced: #include "comm_usb
++PASS: excluded runtime subsystem not introduced: #include "lispif
++PASS: excluded runtime subsystem not introduced: #include "lzo
++PASS: confgenerator.c dual atomic-commit changes pass strict host syntax/warning check
++ALL BATCH 11 PART-1 CORE/DETECT/CALIBRATION/TELEMETRY REGRESSIONS: PASS
++PASS: Part-2 FW identity is v26 while protocol remains VESC6
++PASS: VESC battery-cut SET/GET commands are implemented
++PASS: battery-cut payload length and forward-all flag follow VESC command format
++PASS: forward-all battery cut applies local M1+M2 with one transactional store
++PASS: dual battery-cut update snapshots and rolls back both active MCCONFs on failure
++PASS: GET_BATTERY_CUT uses canonical 1e3 int32 representation
++PASS: COMM_FW_INFO is implemented
++PASS: FW_INFO truthfully reports 6.00/test0 with empty local git hashes
++PASS: COMM_SHUTDOWN is implemented without a bootloader
++PASS: shutdown safety checks both local motors, not only the selected virtual controller
++PASS: shutdown clears power-stage outputs before dropping PA5 power hold
++PASS: shutdown remains input-latched if external power does not immediately collapse
++PASS: PA5 power-hold has a single explicit StatusIO backend
++PASS: timed buzzer tones are non-blocking and IRQ-counted
++PASS: VESC beep API no longer blocks a task
++PASS: fake audio sample-table state is removed and unsupported sample synthesis is explicit
++PASS: transactional flash config has persistent integrity-supervision state
++PASS: config scrub runs at 1 Hz rather than burdening the FOC or 1-kHz control math
++PASS: CRC scrub is deferred until both bridges are idle
++PASS: scrub verifies the exact last committed sequence, not merely any older valid page
++PASS: config corruption maps to canonical VESC flash-corruption fault
++PASS: detected config corruption hard-disables both bridges and faults both motors
++PASS: persistent config corruption fault cannot be cleared while integrity remains bad
++PASS: flash integrity fault participates in canonical LED+buzzer fault reporting
++PASS: a verified replacement record can repair the integrity latch before fault clear
++PASS: custom communications diagnostics are revisioned for new integrity/power fields
++PASS: communications diagnostics expose integrity and power-latch status
++PASS: terminal exposes config integrity counters
++PASS: cc_* semantics are corrected: only cc_min_current is applicable to FOC
++PASS: misleading unfinished-current-controller marker is removed
++PASS: BLDC-only cc_startup_boost/cc_gain/cc_ramp remain immutable; FOC cc_min_current remains writable
++PASS: excluded subsystem not introduced: #include "comm_can.h"
++PASS: excluded subsystem not introduced: #include "imu/
++PASS: excluded subsystem not introduced: #include "bms/
++PASS: excluded subsystem not introduced: #include "bm_if
++PASS: excluded subsystem not introduced: #include "nrf
++PASS: excluded subsystem not introduced: #include "ledpwm
++PASS: excluded subsystem not introduced: #include "comm_usb
++PASS: excluded subsystem not introduced: #include "lispif
++PASS: excluded subsystem not introduced: #include "lzo
++PASS: src/motor/mc_interface.c passes strict host syntax/warning check
++PASS: src/motor/mcpwm_foc.c passes strict host syntax/warning check
++PASS: src/confgenerator.c passes strict host syntax/warning check
++PASS: src/terminal.c passes strict host syntax/warning check
++PASS: debug parser accepts extended COMM_DIAG integrity/power fields
++ALL BATCH 11 PART-2 COMMAND/INTEGRITY/CLEANUP REGRESSIONS: PASS
++SELF-TEST PASS: CRC, framing, VESC-6.00 FW/config parser, VESC Tool local-ID2 scan + motor-2 forwarding, sample parser, EXT-v6 phase/dq telemetry, COMM_DIAG-v9, sensor/observer diagnostics, standard Hall/encoder detect ABI
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/PORTING_NOTES.md /mnt/data/ramfix/PORTING_NOTES.md
+--- /mnt/data/ramfix_base/PORTING_NOTES.md	2026-08-20 16:59:32.000000000 +0000
++++ /mnt/data/ramfix/PORTING_NOTES.md	2026-08-20 17:15:18.176488153 +0000
+@@ -262,3 +262,7 @@
+ The simple PA4 buzzer backend is made explicit: timed tones are non-blocking; fake arbitrary sample-audio state is removed and unsupported sample playback reports unsupported. VESC6 `cc_startup_boost_duty`, `cc_gain`, and `cc_ramp_step_max` remain byte-preserved but immutable because upstream uses them in trapezoidal BLDC `mcpwm.c`, not in FOC. `cc_min_current` remains the real FOC control/release field.
+ 
+ Firmware name is `vesc-f103-hoverboard-v26`; VESC wire ABI remains 6.00 / 481-byte MCCONF / 493-byte APPCONF. Excluded HFI/CAN-hardware/IMU/BMS/bm_if/NRF/LEDPWM/COM_USB/QML/lispif/NTC/LZO subsystems remain absent.
++
++## F103 48-KiB RAM linker fix
++
++The first complete ARM link exposed a real 6184-byte SRAM overflow that earlier compile failures had hidden. The target remains the physical STM32F103RCT6 48-KiB SRAM; the linker region is not enlarged. The debug/experiment capture buffer is reduced from 256 to 64 30-byte samples (saving 5760 bytes), and heap_4 is right-sized from 22 KiB to 18 KiB (saving 4096 bytes). A 2-KiB runtime free-heap reserve is required before the controller is advertised motor-ready. Standard VESC telemetry/control, dual Detect-All, FOC, sensor/calibration and persistence functionality are unchanged.
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/platformio.ini /mnt/data/ramfix/platformio.ini
+--- /mnt/data/ramfix_base/platformio.ini	2026-08-20 17:03:21.000000000 +0000
++++ /mnt/data/ramfix/platformio.ini	2026-08-20 17:11:15.123361967 +0000
+@@ -7,6 +7,8 @@
+ debug_tool = stlink
+ # Reserve final 8 KiB (four 2-KiB pages) (0x0803E000..0x0803FFFF) for persistent config.
+ board_upload.maximum_size = 253952
++# Lock linker/checkprogsize to the real STM32F103RCT6 SRAM capacity.
++board_upload.maximum_ram_size = 49152
+ extra_scripts = pre:tools/extra_script.py
+ build_flags =
+     -DSTM32F103xE
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/src/FreeRTOSConfig.h /mnt/data/ramfix/src/FreeRTOSConfig.h
+--- /mnt/data/ramfix_base/src/FreeRTOSConfig.h	2026-08-17 16:18:14.000000000 +0000
++++ /mnt/data/ramfix/src/FreeRTOSConfig.h	2026-08-20 17:10:30.963025416 +0000
+@@ -25,7 +25,11 @@
+ #define configTICK_RATE_HZ                      ((TickType_t)1000)
+ #define configMAX_PRIORITIES                    56
+ #define configMINIMAL_STACK_SIZE                ((uint16_t)128)
+-#define configTOTAL_HEAP_SIZE                   ((size_t)(22 * 1024))
++/* STM32F103RCT6 has exactly 48 KiB SRAM. 18 KiB is sufficient for the
++ * seven application threads, idle/timer tasks, mutexes and the one-entry
++ * blocking queue while leaving several KiB linker headroom. Do not grow
++ * this without checking the final .map file. */
++#define configTOTAL_HEAP_SIZE                   ((size_t)(18 * 1024))
+ #define configMAX_TASK_NAME_LEN                 16
+ #define configUSE_16_BIT_TICKS                  0
+ #define configIDLE_SHOULD_YIELD                 1
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/src/applications/appconf_default.h /mnt/data/ramfix/src/applications/appconf_default.h
+--- /mnt/data/ramfix_base/src/applications/appconf_default.h	2026-08-20 13:40:24.000000000 +0000
++++ /mnt/data/ramfix/src/applications/appconf_default.h	2026-08-20 17:10:30.962867440 +0000
+@@ -200,7 +200,7 @@
+ #define VESC_UART_BAUD                  115200U
+ #define STAT_PERIOD_MS                  10U
+ #define ROTOR_STREAM_PERIOD_MS          10U
+-#define SAMPLE_BUFFER_LEN               256U
++#define SAMPLE_BUFFER_LEN                64U
+ #define SAMPLE_DEFAULT_DECIMATION       8U
+ 
+ /* PA5 is the hoverboard power-latch/OFF control. HIGH keeps the controller
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/src/conf_general.c /mnt/data/ramfix/src/conf_general.c
+--- /mnt/data/ramfix_base/src/conf_general.c	2026-08-20 16:51:48.000000000 +0000
++++ /mnt/data/ramfix/src/conf_general.c	2026-08-20 17:14:16.433090129 +0000
+@@ -93,8 +93,22 @@
+ static HAL_StatusTypeDef erase_page(uint32_t p){FLASH_EraseInitTypeDef e={0};uint32_t err=0;e.TypeErase=FLASH_TYPEERASE_PAGES;e.PageAddress=CFG_REGION_ADDR+p*CFG_FLASH_PAGE_SIZE;e.NbPages=1;return HAL_FLASHEx_Erase(&e,&err);}
+ static HAL_StatusTypeDef phw(uint32_t a,uint16_t v){return HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,a,v);}
+ static HAL_StatusTypeDef write_commit(uint32_t addr,const config_record_t*r){
+-    const uint8_t*s=(const uint8_t*)r;for(uint32_t o=4;o<sizeof(*r);o+=2){uint16_t h=s[o];if(o+1<sizeof(*r))h|=(uint16_t)s[o+1]<<8;HAL_StatusTypeDef st=phw(addr+o,h);if(st!=HAL_OK)return st;}
+-    HAL_StatusTypeDef st=phw(addr,(uint16_t)(r->h.magic&0xFFFFU));if(st!=HAL_OK)return st;return phw(addr+2,(uint16_t)(r->h.magic>>16));
++    const uint8_t *s = (const uint8_t *)r;
++    for (uint32_t o = 4U; o < sizeof(*r); o += 2U) {
++        uint16_t h = s[o];
++        if (o + 1U < sizeof(*r)) {
++            h |= (uint16_t)s[o + 1U] << 8;
++        }
++        HAL_StatusTypeDef st = phw(addr + o, h);
++        if (st != HAL_OK) {
++            return st;
++        }
++    }
++    HAL_StatusTypeDef st = phw(addr, (uint16_t)(r->h.magic & 0xFFFFU));
++    if (st != HAL_OK) {
++        return st;
++    }
++    return phw(addr + 2U, (uint16_t)(r->h.magic >> 16));
+ }
+ 
+ static bool store_stage(void){
+@@ -109,7 +123,14 @@
+        motors are idle. Previous committed page remains valid until magic is
+        programmed last. */
+     HAL_NVIC_DisableIRQ(DMA1_Channel1_IRQn);DMA1->IFCR=DMA_IFCR_CGIF1;
+-    HAL_StatusTypeDef st=HAL_FLASH_Unlock();if(st==HAL_OK)st=erase_page(next);if(st==HAL_OK)st=write_commit(CFG_REGION_ADDR+next*CFG_FLASH_PAGE_SIZE,&s_stage);(void)HAL_FLASH_Lock();
++    HAL_StatusTypeDef st = HAL_FLASH_Unlock();
++    if (st == HAL_OK) {
++        st = erase_page(next);
++    }
++    if (st == HAL_OK) {
++        st = write_commit(CFG_REGION_ADDR + next * CFG_FLASH_PAGE_SIZE, &s_stage);
++    }
++    (void)HAL_FLASH_Lock();
+     DMA1->IFCR=DMA_IFCR_CGIF1;HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+     if(st==HAL_OK&&rec_valid_page(next)&&page_hdr(next)->sequence==s_stage.h.sequence){
+         s_valid=true;s_integrity_fault=false;s_save_count=s_stage.h.sequence;
+@@ -204,23 +225,45 @@
+ static uint8_t s_typed_mc_wire[VESC6_MCCONF_WIRE_SIZE];
+ static uint8_t s_typed_app_wire[VESC6_APPCONF_WIRE_SIZE];
+ 
+-void conf_general_read_app_configuration(app_configuration *conf){
+-    if(!conf)return;vesc_config_init_defaults();
+-    if(!confgenerator_deserialize_appconf(vesc_config_app_wire(false),conf))
++void conf_general_read_app_configuration(app_configuration *conf) {
++    if (conf == NULL) {
++        return;
++    }
++    vesc_config_init_defaults();
++    if (!confgenerator_deserialize_appconf(vesc_config_app_wire(false), conf)) {
+         confgenerator_set_defaults_appconf(conf);
++    }
++}
++
++bool conf_general_store_app_configuration(app_configuration *conf) {
++    if (conf == NULL) {
++        return false;
++    }
++    if (confgenerator_serialize_appconf(s_typed_app_wire, conf) != (int32_t)VESC6_APPCONF_WIRE_SIZE) {
++        return false;
++    }
++    return vesc_config_set_app_wire(s_typed_app_wire, VESC6_APPCONF_WIRE_SIZE, true);
+ }
+-bool conf_general_store_app_configuration(app_configuration *conf){
+-    if(!conf)return false;
+-    if(confgenerator_serialize_appconf(s_typed_app_wire,conf)!=(int32_t)VESC6_APPCONF_WIRE_SIZE)return false;
+-    return vesc_config_set_app_wire(s_typed_app_wire,VESC6_APPCONF_WIRE_SIZE,true);
+-}
+-void conf_general_read_mc_configuration(mc_configuration *conf,bool is_motor_2){
+-    if(!conf)return;motor_id_t id=is_motor_2?MOTOR_RIGHT:MOTOR_LEFT;vesc_config_init_defaults();
+-    if(!confgenerator_deserialize_mcconf(vesc_config_mc_wire(id,false),conf))
++
++void conf_general_read_mc_configuration(mc_configuration *conf, bool is_motor_2) {
++    if (conf == NULL) {
++        return;
++    }
++    motor_id_t id = is_motor_2 ? MOTOR_RIGHT : MOTOR_LEFT;
++    vesc_config_init_defaults();
++    if (!confgenerator_deserialize_mcconf(vesc_config_mc_wire(id, false), conf)) {
+         confgenerator_set_defaults_mcconf(conf);
++    }
+ }
+-bool conf_general_store_mc_configuration(mc_configuration *conf,bool is_motor_2){
+-    if(!conf)return false;motor_id_t id=is_motor_2?MOTOR_RIGHT:MOTOR_LEFT;
+-    if(confgenerator_serialize_mcconf_motor(s_typed_mc_wire,conf,id)!=(int32_t)VESC6_MCCONF_WIRE_SIZE)return false;
+-    return vesc_config_set_mc_wire(id,s_typed_mc_wire,VESC6_MCCONF_WIRE_SIZE,true);
++
++bool conf_general_store_mc_configuration(mc_configuration *conf, bool is_motor_2) {
++    if (conf == NULL) {
++        return false;
++    }
++    motor_id_t id = is_motor_2 ? MOTOR_RIGHT : MOTOR_LEFT;
++    if (confgenerator_serialize_mcconf_motor(s_typed_mc_wire, conf, id) !=
++        (int32_t)VESC6_MCCONF_WIRE_SIZE) {
++        return false;
++    }
++    return vesc_config_set_mc_wire(id, s_typed_mc_wire, VESC6_MCCONF_WIRE_SIZE, true);
+ }
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/src/debug_sample.c /mnt/data/ramfix/src/debug_sample.c
+--- /mnt/data/ramfix_base/src/debug_sample.c	2026-08-19 17:19:35.000000000 +0000
++++ /mnt/data/ramfix/src/debug_sample.c	2026-08-20 17:10:30.963167501 +0000
+@@ -58,7 +58,10 @@
+ 
+ bool debug_sample_control(debug_sampling_mode mode, motor_id_t motor,
+                           uint16_t len, uint16_t decimation, bool raw) {
+-    if (mode < DEBUG_SAMPLING_OFF || mode > DEBUG_SAMPLING_SEND_SINGLE_SAMPLE) return false;
++    /* debug_sampling_mode is an enum with DEBUG_SAMPLING_OFF as its lowest
++       valid value; checking mode < 0 is both redundant and triggers
++       -Wtype-limits on ARM GCC when the enum is represented unsigned. */
++    if (mode > DEBUG_SAMPLING_SEND_SINGLE_SAMPLE) return false;
+     if (len == 0U || len > SAMPLE_BUFFER_LEN) len = SAMPLE_BUFFER_LEN;
+     if (decimation == 0U) decimation = 1U;
+ 
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/src/hwconf/hw.c /mnt/data/ramfix/src/hwconf/hw.c
+--- /mnt/data/ramfix_base/src/hwconf/hw.c	2026-08-20 13:58:54.000000000 +0000
++++ /mnt/data/ramfix/src/hwconf/hw.c	2026-08-20 17:10:30.963395868 +0000
+@@ -610,9 +610,12 @@
+ void motor_hw_set_pwm_duty(MotorRuntime *m, float du, float dv, float dw) {
+     /* This helper is not the FOC current-control path. Bound only to the timer
+        domain; callers that need the current-sampling window must use SVM. */
+-    if (du < 0.0f) du = 0.0f; if (du > 0.999969f) du = 0.999969f;
+-    if (dv < 0.0f) dv = 0.0f; if (dv > 0.999969f) dv = 0.999969f;
+-    if (dw < 0.0f) dw = 0.0f; if (dw > 0.999969f) dw = 0.999969f;
++    if (du < 0.0f) du = 0.0f;
++    if (du > 0.999969f) du = 0.999969f;
++    if (dv < 0.0f) dv = 0.0f;
++    if (dv > 0.999969f) dv = 0.999969f;
++    if (dw < 0.0f) dw = 0.0f;
++    if (dw > 0.999969f) dw = 0.999969f;
+     motor_hw_set_pwm_q15(m,
+         (uint16_t)(du * 32768.0f),
+         (uint16_t)(dv * 32768.0f),
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/src/motor_tasks.c /mnt/data/ramfix/src/motor_tasks.c
+--- /mnt/data/ramfix_base/src/motor_tasks.c	2026-08-20 16:44:11.000000000 +0000
++++ /mnt/data/ramfix/src/motor_tasks.c	2026-08-20 17:11:15.123187542 +0000
+@@ -6,6 +6,7 @@
+ #include "telemetry.h"
+ #include "comm/commands.h"
+ #include "cmsis_os2.h"
++#include "FreeRTOS.h"
+ #include "applications/appconf_default.h"
+ #include "timeout.h"
+ #include "status_io.h"
+@@ -20,6 +21,15 @@
+ static osThreadId_t status_thread_tp;
+ static bool status_threads_started = false;
+ 
++/* Refuse to advertise a motor-ready controller if task creation consumes
++ * nearly all heap. This reserve is runtime headroom for RTOS queue/mutex
++ * operations and future transient control-path allocations. */
++#define RTOS_READY_HEAP_RESERVE_BYTES 2048U
++
++uint32_t motor_threads_free_heap_bytes(void) {
++    return (uint32_t)xPortGetFreeHeapSize();
++}
++
+ static void timer_thread(void *arg);
+ static void sample_send_thread(void *arg);
+ static void fault_stop_thread(void *arg);
+@@ -312,8 +322,10 @@
+     sample_send_tp  = osThreadNew(sample_send_thread, NULL, &sample_attr);
+     fault_stop_tp   = osThreadNew(fault_stop_thread, NULL, &fault_attr);
+ 
+-    const bool ok = timer_thread_tp != NULL && sample_send_tp != NULL &&
+-                    fault_stop_tp != NULL && timeout_ok;
++    const bool threads_ok = timer_thread_tp != NULL && sample_send_tp != NULL &&
++                            fault_stop_tp != NULL && timeout_ok;
++    const bool heap_ok = motor_threads_free_heap_bytes() >= RTOS_READY_HEAP_RESERVE_BYTES;
++    const bool ok = threads_ok && heap_ok;
+     if (ok) timeout_watchdog_start();
+     return ok;
+ }
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/src/motor_tasks.h /mnt/data/ramfix/src/motor_tasks.h
+--- /mnt/data/ramfix_base/src/motor_tasks.h	2026-08-17 16:18:14.000000000 +0000
++++ /mnt/data/ramfix/src/motor_tasks.h	2026-08-20 17:11:15.122970146 +0000
+@@ -1,7 +1,10 @@
+ #pragma once
+ #include "motor_types.h"
++#include <stdint.h>
+ 
+ bool status_threads_init(void);
+ bool motor_threads_init(void);
+ void motor_threads_fault_signal(motor_id_t id);
+ void motor_threads_sample_signal(void);
++
++uint32_t motor_threads_free_heap_bytes(void);
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/tools/test_batch9_part1.py /mnt/data/ramfix/tools/test_batch9_part1.py
+--- /mnt/data/ramfix_base/tools/test_batch9_part1.py	2026-08-20 13:43:45.000000000 +0000
++++ /mnt/data/ramfix/tools/test_batch9_part1.py	2026-08-20 17:12:10.478257338 +0000
+@@ -26,9 +26,12 @@
+     ok(hashlib.sha256((ROOT/'src/motor/mcpwm_foc.c').read_bytes()).hexdigest()==
+        'c8ca737180b6223615b59aff565c636c92d153a1abe11a6479a6bcbbed997ffc',
+        'Batch 9 Part-1 leaves the proven hard mcpwm_foc.c byte-identical to Batch 8 best')
+-ok(hashlib.sha256((ROOT/'platformio.ini').read_bytes()).hexdigest()==
+-   '479deb46cb12327add827d80f0bae4a95fe7a1d06cf5803dd44c8a87574a08d0',
+-   'PlatformIO clock/build configuration is unchanged')
++pio=read('platformio.ini')
++ok(all(x in pio for x in ['platform = ststm32','board = genericSTM32F103RC',
++                           'framework = stm32cube','board_build.ldscript = src/stm32f103rc_flash.ld']),
++   'PlatformIO keeps the STM32F103RC/Cube hardware target and linker script')
++ok('board_build.f_cpu' not in pio,
++   'PlatformIO does not override the firmware-owned 64-MHz HSI clock configuration')
+ 
+ # VESC6 ABI fields that already existed on the pinned wire image become real backends.
+ for sym,val in [('VESC6_MC_OFF_L_TEMP_FET_START','63U'),('VESC6_MC_OFF_L_TEMP_FET_END','65U'),
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/tools/test_batch9_part2.py /mnt/data/ramfix/tools/test_batch9_part2.py
+--- /mnt/data/ramfix_base/tools/test_batch9_part2.py	2026-08-20 13:43:57.000000000 +0000
++++ /mnt/data/ramfix/tools/test_batch9_part2.py	2026-08-20 17:12:21.012439256 +0000
+@@ -16,9 +16,11 @@
+ # Target and ABI/build policy remain pinned.
+ ok('-DSTM32F103xE' in pio and 'genericSTM32F103RC' in pio,
+    'target remains STM32F103RCT6/high-density')
+-ok(hashlib.sha256((ROOT/'platformio.ini').read_bytes()).hexdigest()==
+-   '479deb46cb12327add827d80f0bae4a95fe7a1d06cf5803dd44c8a87574a08d0',
+-   'clock/build flags remain unchanged from the validated 64-MHz baseline')
++ok(all(x in pio for x in ['platform = ststm32','board = genericSTM32F103RC',
++                           'framework = stm32cube','board_build.ldscript = src/stm32f103rc_flash.ld']),
++   'PlatformIO keeps the STM32F103RC/Cube target and linker script')
++ok('board_build.f_cpu' not in pio,
++   'firmware-owned 64-MHz HSI clock is not overridden by PlatformIO')
+ 
+ # Current acquisition contract remains unchanged.
+ fast_expected=[
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/tools/test_batch9_part3.py /mnt/data/ramfix/tools/test_batch9_part3.py
+--- /mnt/data/ramfix_base/tools/test_batch9_part3.py	2026-08-20 14:02:45.000000000 +0000
++++ /mnt/data/ramfix/tools/test_batch9_part3.py	2026-08-20 17:12:21.012607942 +0000
+@@ -17,9 +17,11 @@
+ 
+ ok('-DSTM32F103xE' in pio and 'genericSTM32F103RC' in pio,
+    'target remains STM32F103RCT6/high-density')
+-ok(hashlib.sha256((ROOT/'platformio.ini').read_bytes()).hexdigest()==
+-   '479deb46cb12327add827d80f0bae4a95fe7a1d06cf5803dd44c8a87574a08d0',
+-   '64-MHz clock/build configuration remains unchanged')
++ok(all(x in pio for x in ['platform = ststm32','board = genericSTM32F103RC',
++                           'framework = stm32cube','board_build.ldscript = src/stm32f103rc_flash.ld']),
++   'PlatformIO keeps the STM32F103RC/Cube target and linker script')
++ok('board_build.f_cpu' not in pio,
++   'firmware-owned 64-MHz HSI clock is not overridden by PlatformIO')
+ 
+ # PVD: internal, default enabled, highest threshold, IRQ-latched and MOE-gated.
+ ok('HOVERBOARD_PVD_ENABLE                 1' in hwh and 'HOVERBOARD_PVD_PLS_BITS               (7U << 5)' in hwh,
+diff -ruN '--exclude=.pio' /mnt/data/ramfix_base/tools/test_f103_ram_budget.py /mnt/data/ramfix/tools/test_f103_ram_budget.py
+--- /mnt/data/ramfix_base/tools/test_f103_ram_budget.py	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/ramfix/tools/test_f103_ram_budget.py	2026-08-20 17:13:38.821510042 +0000
+@@ -0,0 +1,62 @@
++#!/usr/bin/env python3
++from pathlib import Path
++import re, subprocess, tempfile, sys
++ROOT = Path(__file__).resolve().parents[1]
++
++def read(p): return (ROOT / p).read_text()
++def ok(cond, msg):
++    if not cond:
++        print('FAIL:', msg); sys.exit(1)
++    print('PASS:', msg)
++
++ld = read('src/stm32f103rc_flash.ld')
++pio = read('platformio.ini')
++fr = read('src/FreeRTOSConfig.h')
++app = read('src/applications/appconf_default.h')
++mt = read('src/motor_tasks.c')
++dbg = read('src/debug_sample.c')
++
++ok('LENGTH = 48K' in ld and 'ORIGIN = 0x20000000' in ld,
++   'linker remains locked to real STM32F103RCT6 48-KiB SRAM')
++ok('board_upload.maximum_ram_size = 49152' in pio,
++   'PlatformIO RAM checker is explicitly locked to 49152 bytes')
++ok(re.search(r'configTOTAL_HEAP_SIZE\s+\(\(size_t\)\(18 \* 1024\)\)', fr) is not None,
++   'FreeRTOS heap is bounded to 18 KiB')
++ok(re.search(r'#define\s+SAMPLE_BUFFER_LEN\s+64U', app) is not None,
++   'debug sampler is capped at 64 samples')
++ok('RTOS_READY_HEAP_RESERVE_BYTES 2048U' in mt and 'xPortGetFreeHeapSize()' in mt,
++   'motor-ready state requires at least 2 KiB runtime FreeRTOS heap reserve')
++ok('mode < DEBUG_SAMPLING_OFF' not in dbg,
++   'debug sampling enum no longer triggers ARM -Wtype-limits')
++
++# Compile only enough to get the exact ABI size of debug_sample_t.
++with tempfile.TemporaryDirectory() as td:
++    src = Path(td) / 'sizeof_debug.c'
++    exe = Path(td) / 'sizeof_debug'
++    src.write_text('#include <stdio.h>\n#include "datatypes.h"\nint main(void){printf("%zu\\n",sizeof(debug_sample_t));return 0;}\n')
++    cp = subprocess.run(['gcc','-std=c11','-Itools/host_stubs','-Isrc',str(src),'-o',str(exe)],
++                        cwd=ROOT,text=True,capture_output=True)
++    if cp.returncode != 0:
++        print(cp.stdout, cp.stderr); sys.exit(cp.returncode)
++    rp = subprocess.run([str(exe)],cwd=ROOT,text=True,capture_output=True)
++    size = int(rp.stdout.strip())
++    ok(size == 30, 'debug_sample_t remains 30 bytes')
++
++old_debug = 256 * 30
++new_debug = 64 * 30
++saved_debug = old_debug - new_debug
++saved_heap = (22 - 18) * 1024
++saved_total = saved_debug + saved_heap
++ok(saved_debug == 5760, 'debug-buffer reduction saves 5760 bytes of static SRAM')
++ok(saved_heap == 4096, 'RTOS-heap reduction saves 4096 bytes of static SRAM')
++ok(saved_total == 9856, 'combined RAM fix saves 9856 bytes versus the failing build')
++
++# User's real linker report overflowed by 6184 bytes. This is not used as a
++# substitute for pio run, but verifies the selected reductions exceed that
++# measured overflow with useful link-time margin.
++measured_overflow = 6184
++projected_headroom = saved_total - measured_overflow
++ok(projected_headroom >= 3000,
++   f'RAM changes exceed measured overflow with ~{projected_headroom} bytes projected linker headroom')
++
++print('ALL STM32F103RCT6 RAM-BUDGET REGRESSIONS: PASS')

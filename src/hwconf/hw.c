@@ -108,7 +108,7 @@ static void init_gpio(void) {
     HAL_GPIO_Init(GPIOC, &g);
 
     /* PB2 LED, PA4 buzzer and PA5 power-hold are initialized before the
-       RTOS/motor subsystem by status_io_early_gpio_init(). Do not reset them
+       RTOS/motor subsystem by hw_status_early_init(). Do not reset them
        here; they are our boot-liveness indicators. */
 
     /* Button */
@@ -576,7 +576,6 @@ void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled) {
                to guarantee the preload is active in hardware. */
             motor_hw_restore_foc_outputs(m);
             motor_hw_set_pwm_q15(m, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
-            motor_hw_gate_global(true);
             m->pwm_enable_blank_cycles = 0U;
             m->pwm_enable_pending_events = PWM_ENABLE_PRELOAD_EVENTS;
             m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
@@ -726,14 +725,6 @@ void motor_hw_set_pwm_duty(MotorRuntime *m, float du, float dv, float dw) {
         (uint16_t)(dw * 32768.0f));
 }
 
-void motor_hw_gate_global(bool enable) {
-    (void)enable;
-    /* PA5 is NOT the MOSFET gate-enable on this hoverboard mainboard. Holding
-     * it HIGH keeps board power latched. TIM1/TIM8 MOE is the only bridge gate
-     * enable used by this firmware. */
-    HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, GPIO_PIN_SET);
-}
-
 uint8_t motor_hw_read_hall_raw(motor_id_t id) {
     /* Stock hoverboard Hall inputs are active-low. This function is called
        from the hard FOC path, so use one IDR snapshot per GPIO port rather
@@ -845,11 +836,6 @@ void motor_hw_led(bool on) {
     HAL_GPIO_WritePin(LED_PORT, LED_PIN, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
-void motor_hw_buzzer(bool on) {
-    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
-}
-
-
 void motor_hw_emergency_all_off(void) {
     TIM1->BDTR &= ~TIM_BDTR_MOE;
     TIM8->BDTR &= ~TIM_BDTR_MOE;
@@ -859,7 +845,6 @@ void motor_hw_emergency_all_off(void) {
     g_motor_right.pwm_enable_blank_cycles = 0U;
     g_motor_left.pwm_enable_pending_events = 0U;
     g_motor_right.pwm_enable_pending_events = 0U;
-    motor_hw_gate_global(false);
 }
 
 

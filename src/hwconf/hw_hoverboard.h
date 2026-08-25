@@ -1,6 +1,6 @@
 #pragma once
 #include "stm32f1xx_hal.h"
-#include "app_config.h"
+#include "applications/appconf_default.h"
 
 /* LEFT HALL */
 #define LEFT_HALL_U_PIN GPIO_PIN_5

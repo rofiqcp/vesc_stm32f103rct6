@@ -1,0 +1,49 @@
+STAGE3 v32 TARGET BUILD + FIRST BENCH CHECKLIST
+===============================================
+
+1) CLEAN BUILD
+   pio run -t clean
+   pio run
+
+Expected build blocker from v31 that must NOT reappear:
+- task.h/list.h parser cascade in src/comm/commands.c
+- expected '=', ',', ';' before '{' repeated for every function
+- old-style parameter declaration error in list.h
+
+2) REPORT THESE LINES
+- RAM usage
+- Flash usage
+- [SUCCESS]
+- every warning whose path begins with src/
+
+3) DO NOT FLASH IF
+- source project compile warning indicates implicit declaration / return-type mismatch
+- RAM > 49152 bytes
+- Flash > 253952 bytes
+- unresolved/duplicate symbol
+
+4) AFTER FLASH, NO MOTOR POWER FIRST
+- verify boot LED/buzzer behavior
+- verify UART / terminal
+- run: timing
+- run: resources
+- run: appadc
+- run: integrity
+
+5) POWER-STAGE BENCH
+- current-limited supply
+- wheel/motor unloaded
+- scope TIM1/TIM8 six gate signals
+- verify HS active-HIGH / LS active-LOW and deadtime
+- verify MOE remains off until calibration valid
+- verify ADC/current zero offsets
+
+6) SENSOR / APPLICATION
+- LEFT Hall
+- LEFT Encoder A/B
+- RIGHT Hall
+- LEFT/RIGHT sensorless startup/handover
+- Detect-All rollback on failure
+- PA2 throttle safe-start
+- PA3 brake priority
+- UART command ownership and timeout

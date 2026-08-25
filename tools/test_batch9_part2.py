@@ -85,10 +85,10 @@ claims=re.findall(r'\.Instance\s*=\s*(DMA2_Channel[1-5])',all_src)
 ok(claims == ['DMA2_Channel5'], 'DMA2 Channel5 is the only DMA2 channel claimed by a peripheral handle')
 
 # Debug visibility is appended, not standard ABI mutation.
-ok('p[i++] = 16U; /* calibration diagnostic revision */' in cmd and
+ok('p[i++] = 17U; /* calibration diagnostic revision */' in cmd and
    'foc_vbus_dma_stale_events()' in cmd and 'DMA2_Channel5->CNDTR' in cmd,
-   'custom calibration diagnostics expose ADC3/DMA2 Vbus health as revision 16')
+   'custom calibration diagnostics retain ADC3/DMA2 Vbus health in revision 17')
 ok('cal_diag_revision",0) >= 16' in dbg and 'ADC3 DCLINK PATH' in dbg,
-   'host debug parser understands revision-16 ADC3/DMA2 diagnostics')
+   'host debug parser retains revision-16 ADC3/DMA2 prefix compatibility')
 
 print('ALL BATCH 9 PART-2 ADC3/VBUS REGRESSIONS: PASS')

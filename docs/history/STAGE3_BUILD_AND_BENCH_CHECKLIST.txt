@@ -1,0 +1,70 @@
+STAGE3 BUILD + BENCH CHECKLIST
+==============================
+
+A. CLEAN TARGET BUILD (WAJIB)
+[ ] cd <project>
+[ ] pio run -t clean
+[ ] pio run
+[ ] Build = SUCCESS
+[ ] Catat RAM used/total/%
+[ ] Catat Flash used/total/%
+[ ] Pastikan tidak ada project-source warning kritis
+
+B. PRE-POWER / GATE SAFETY
+[ ] Supply current-limited
+[ ] Motor unloaded/roda terangkat untuk initial test
+[ ] High-side MOSFET active HIGH terverifikasi scope
+[ ] Low-side complementary output active LOW terverifikasi scope
+[ ] Dead-time tidak menghasilkan shoot-through
+[ ] MOE OFF saat boot/calibration/fault
+[ ] sampling contract tidak fault saat boot
+
+C. TERMINAL DIAGNOSTIC
+Jalankan:
+    timing
+    resources
+    appadc
+    integrity
+
+Acceptance awal:
+[ ] sampling contract flags = 0
+[ ] FOC event = 16 kHz
+[ ] CPU firmware = 64 MHz => nominal ISR period ~4000 cycles
+[ ] dual ISR max < 4000 cycles
+[ ] target normal dual ISR max < 3400 cycles (85% slot)
+[ ] near-deadline count tidak terus bertambah
+[ ] ISR period min/max tetap dekat cadence nominal tanpa outlier berulang
+[ ] minimum-ever heap > 2048 B selama stress test
+[ ] setiap critical stack free watermark tidak mendekati 0; target dev >256 B bila memungkinkan
+[ ] TX queue HWM <= 3 (depth 4 ring effective capacity 3)
+[ ] TX busy/full drops = 0 pada operasi VESC Tool normal
+
+D. STRESS TEST
+[ ] Dual motor Hall running + telemetry streaming
+[ ] LEFT encoder running + telemetry streaming
+[ ] Sensorless acquisition/transition
+[ ] APP ADC PA2 throttle + PA3 brake aktif
+[ ] Rapid GET_VALUES / GET_VALUES_SELECTIVE
+[ ] Config read/write saat bridge idle
+[ ] UART unplug/replug and timeout recovery
+[ ] Fault inject -> PWM safe + LED/buzzer + telemetry
+[ ] Jalankan `timing` dan `resources` sesudah stress
+
+E. ADC/PWM SCOPE QUALIFICATION
+[ ] Scope TIM1/TIM8 switching and ADC trigger relationship
+[ ] Current sample tidak jatuh di switching edge
+[ ] Current polarity/current reconstruction benar forward/reverse
+[ ] High-duty waveform masih valid di safe 10–90% window
+
+F. DYNAMIC SAMPLING / OVERMODULATION
+JANGAN aktifkan sebelum seluruh E PASS.
+[ ] V0/V7 sample mode masih rejected = expected
+[ ] high-current sample mode masih rejected = expected
+[ ] full overmodulation belum diaktifkan = expected
+
+G. RESULT TO SEND BACK
+Kirim:
+- output `pio run` bagian RAM/Flash/SUCCESS atau error pertama,
+- output `timing`,
+- output `resources`,
+- screenshot/scope timing bila tersedia.

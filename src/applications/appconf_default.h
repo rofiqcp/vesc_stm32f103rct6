@@ -119,9 +119,10 @@
 #define ADC_OFFSET_HARD_MAX_COUNT       3967
 #define ADC_OFFSET_WARN_SPREAD_COUNT    160U
 #define ADC_OFFSET_WARN_STDDEV_COUNT    16U
-#define ADC_OFFSET_HARD_SPREAD_COUNT    800U
 #define ADC_OFFSET_HARD_STDDEV_COUNT    80U
-#define ADC_OFFSET_TRACK_SHIFT          12U /* retained ABI constant; this port does not track driven offsets while OFF */
+#define ADC_OFFSET_INLIER_WINDOW_COUNT  256U
+#define ADC_OFFSET_HARD_OUTLIER_COUNT   10U
+#define ADC_OFFSET_MOE_WAIT_EVENTS      128U
 
 /* Incremental A/B has no absolute electrical origin after cold boot.
  * FOC_SENSOR_MODE_ENCODER_AB uses observer/open-loop startup to establish

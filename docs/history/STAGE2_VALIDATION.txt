@@ -1,0 +1,8 @@
+STAGE2 v30 VALIDATION
+=====================
+Regression scripts: 24 PASS / 0 FAIL
+Target ARM build: NOT EXECUTED (PlatformIO/arm-none-eabi-gcc unavailable here)
+MotorRuntime host ABI size: 2128 bytes (unchanged from Stage1)
+motor_telemetry_t host ABI size: 200 bytes (unchanged from Stage1)
+VESC standard wire ABI: 6.00 retained
+Dynamic V0/V7/high-current sampling and full overmodulation: intentionally deferred to Stage3 hardware-qualified work.

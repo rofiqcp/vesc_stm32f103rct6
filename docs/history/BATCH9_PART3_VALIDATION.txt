@@ -1,0 +1,21 @@
+Batch 9 Part 3 validation summary
+================================
+PASS verify_vesc_port.py
+PASS test_batch2.py
+PASS test_batch3.py
+PASS test_batch4.py
+PASS test_batch5.py
+PASS test_batch6.py
+PASS test_batch7.py
+PASS test_batch8.py
+PASS test_batch9_part1.py
+PASS test_batch9_part2.py
+PASS test_batch9_part3.py
+PASS debug.py --self-test
+PASS strict host syntax: mc_interface.c
+PASS strict host syntax: mcpwm_foc.c
+PASS strict host syntax: terminal.c
+PASS VESC6 short-ls non-persistence round-trip test
+
+Target build policy unchanged: STM32F103RCT6 / 64 MHz / VESC6 ABI.
+No pio or arm-none-eabi-gcc exists in this environment; real ARM build and physical PCB validation remain required.

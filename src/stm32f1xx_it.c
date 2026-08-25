@@ -8,7 +8,6 @@
 #include "applications/app_uartcomm.h"
 #include "applications/appconf_default.h"
 #include "hwconf/hw_hoverboard.h"
-#include "status_io.h"
 
 extern void xPortSysTickHandler(void);
 
@@ -90,7 +89,7 @@ void USART3_IRQHandler(void) {
 }
 
 void TIM3_IRQHandler(void) {
-    status_io_tim3_irq_handler();
+    hw_status_tim3_irq_handler();
 }
 
 void EXTI9_5_IRQHandler(void) {

@@ -157,10 +157,19 @@ typedef struct {
     uint16_t ccr1,ccr2,ccr3,tim_cnt,dma_cndtr; uint32_t adc_isr_count; uint16_t blank_cycles;
     uint8_t pwm_enabled,moe,pending_events,reserved;
 } foc_fault_snapshot_t;
-typedef struct { int32_t mean; uint16_t min,max; uint32_t variance_x100; } foc_cal_channel_diag_t;
 typedef struct {
-    uint8_t stage,reserved; uint16_t shift_warn_mask,warn_mask,fail_range_mask,fail_noise_mask;
-    foc_cal_channel_diag_t ch[6]; int32_t undriven_mean[6],driven_mean[6];
+    int32_t mean;
+    uint16_t min, max;
+    uint32_t variance_x100;
+} foc_cal_channel_diag_t;
+typedef struct {
+    uint8_t stage, reserved;
+    uint16_t shift_warn_mask, warn_mask, fail_range_mask, fail_noise_mask;
+    foc_cal_channel_diag_t ch[6];
+    int32_t undriven_mean[6], driven_mean[6];
+    uint16_t outlier_count[6];
+    uint8_t moe_fail_mask, moe_confirmed_mask;
+    uint32_t moe_request_adc[2], moe_confirm_adc[2], first_sample_adc[2];
 } foc_cal_diag_t;
 bool foc_calibration_done(void);
 bool foc_calibration_valid(void);

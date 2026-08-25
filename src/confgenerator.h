@@ -119,6 +119,7 @@
 #define VESC6_APP_OFF_UART_BAUD              139U
 
 void vesc_config_init_defaults(void);
+bool vesc_config_apply_defaults(void);
 bool vesc_config_layout_ok(void);
 const uint8_t *vesc_config_mc_wire(motor_id_t id, bool defaults);
 const uint8_t *vesc_config_app_wire(bool defaults);

@@ -3,7 +3,6 @@
 #include "motor/mc_interface.h"
 #include "telemetry.h"
 #include "timeout.h"
-#include "motor_tasks.h"
 #include "motor/mcpwm_foc.h"
 #include "applications/app_uartcomm.h"
 #include "applications/app.h"
@@ -127,9 +126,9 @@ void terminal_process_string(char *str) {
                 (unsigned long)timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_MOTOR_SERVICE),
                 (unsigned long)timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_COMM));
     } else if (strcmp(str, "resources") == 0) {
-        motor_runtime_resource_stats_t r;
+        mc_interface_resource_stats_t r;
         vesc_comm_resource_stats_t c;
-        motor_threads_get_resource_stats(&r);
+        mc_interface_get_resource_stats(&r);
         vesc_comm_get_resource_stats(&c);
         const app_uartcomm_stats_t *u = app_uartcomm_get_stats();
         commands_printf("heap=%lu min=%lu stack_free motor/sample/fault/status/packet/block=%lu/%lu/%lu/%lu/%lu/%lu TXq_hwm=%lu busy_drop=%lu",

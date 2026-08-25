@@ -1,0 +1,42 @@
+STAGE3 v32 FULL RE-AUDIT VALIDATION
+==================================
+
+ROOT CAUSE FROM USER ARM BUILD LOG
+---------------------------------
+Stage3 v31 commands.c directly included FreeRTOS task.h without FreeRTOS.h first.
+This corrupts FreeRTOS header parsing and causes the observed commands.c/list.h/stdio cascade.
+Stage3 v32 removes direct task.h dependency and uses CMSIS-RTOS2 osThreadGetStackSpace().
+
+VALIDATION RESULTS
+------------------
+Functional/regression scripts excluding dedicated compile/analyzer gates: 25/25 PASS
+Strict GCC syntax/warning TU checks: 20/20 PASS
+Strict Clang syntax/warning TU checks: 20/20 PASS
+Clang Static Analyzer critical TUs: 10/10 PASS
+GCC -fanalyzer critical TUs: 10/10 PASS
+tools/debug.py --self-test: PASS
+python3 -m compileall tools: PASS
+FreeRTOS public-header include-order scan: PASS
+Source hygiene scan: PASS
+Excluded subsystem runtime include scan: PASS
+
+IMPORTANT LIMIT
+---------------
+PlatformIO and arm-none-eabi-gcc are unavailable in this audit environment.
+Therefore target STM32F103RC compile/link is NOT claimed here.
+Run on the target development machine:
+
+    pio run -t clean
+    pio run
+
+The v31 parser-cascade root cause is fixed at source level and protected by a permanent regression test.
+
+STATIC ANALYZER BUGS FOUND AND FIXED
+------------------------------------
+1. app_adc_get_status(): possible uninitialized second seqlock sequence value on odd first read.
+2. mcpwm_foc_measure_inductance_current_motor(): explicit null MotorRuntime guard added.
+
+HAL/CMSIS TARGET SYMBOL REVIEW
+------------------------------
+New Stage3 v32 sampling-contract register/HAL symbols were checked against STM32F103xE / STM32F1 HAL definitions, including TIM master/slave bits, DMA size/flag bits and ADC dual-mode definitions.
+CMSIS-RTOS2 osThreadGetStackSpace is a standard FreeRTOS wrapper API.

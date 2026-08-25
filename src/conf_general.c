@@ -128,7 +128,7 @@ static HAL_StatusTypeDef write_commit(uint32_t addr,const config_record_t*r){
 }
 
 static bool store_stage(void){
-    motor_stop(&g_motor_left);motor_stop(&g_motor_right);motor_hw_gate_global(false);if(osKernelGetState()==osKernelRunning)osDelay(5);
+    motor_stop(&g_motor_left);motor_stop(&g_motor_right);if(osKernelGetState()==osKernelRunning)osDelay(5);
     s_stage.h.magic=CFG_MAGIC;s_stage.h.version=CFG_VERSION;s_stage.h.payload_len=CFG_PAYLOAD_LEN;s_stage.h.sequence=s_save_count+1U;
     put_u64_be8(s_stage.payload.odometer_left_be,mc_interface_get_odometer_motor(MOTOR_LEFT));
     put_u64_be8(s_stage.payload.odometer_right_be,mc_interface_get_odometer_motor(MOTOR_RIGHT));

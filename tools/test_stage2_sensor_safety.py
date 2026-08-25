@@ -6,7 +6,7 @@ def req(c,m):
     if not c: raise AssertionError(m)
 
 dt=read('src/datatypes.h'); fm=read('src/motor/foc_math.c'); mi=read('src/motor/mc_interface.c')
-cmd=read('src/comm/commands.c'); cg=read('src/conf_general.c'); th=read('src/timeout.h'); mt=read('src/motor_tasks.c'); tel=read('src/telemetry.c')
+cmd=read('src/comm/commands.c'); cg=read('src/conf_general.c'); th=read('src/timeout.h'); mt=read('src/motor/mc_interface_tasks.c'); tel=read('src/telemetry.c')
 req('sensorless_start_failures' in dt,'missing sensorless failure counter')
 req('True handover blend' in fm and 'max_corr = 546' in fm,'missing bounded sensorless phase blend')
 req('MOTOR_FAULT_SENSORLESS_OBSERVER' in dt and 'sensorless_start_failures >= 3U' in mi,'missing sensorless lock fault escalation')

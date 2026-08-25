@@ -1,0 +1,1317 @@
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/comm/commands.c /mnt/data/vesc_part2_work/src/comm/commands.c
+--- /mnt/data/vesc_part2_pristine/src/comm/commands.c	2026-08-22 12:35:12.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/comm/commands.c	2026-08-22 12:53:35.712550294 +0000
+@@ -263,7 +263,7 @@
+     p[i++] = 0U; /* qml app */
+     p[i++] = 0U; /* nrf flags */
+ 
+-    const char fw[] = "vesc-f103-hoverboard-v27-part1";
++    const char fw[] = "vesc-f103-hoverboard-v28-part2";
+     memcpy(&p[i], fw, sizeof(fw));
+     i = (uint16_t)(i + sizeof(fw));
+ 
+@@ -1651,7 +1651,7 @@
+ static void vesc_comm_reply_diag(void) {
+     const app_uartcomm_stats_t *u = app_uartcomm_get_stats();
+     uint8_t p[128]; uint16_t i = 0U;
+-    p[i++] = COMM_CUSTOM_APP_DATA; p[i++] = CUSTOM_COMM_DIAG; p[i++] = 9U;
++    p[i++] = COMM_CUSTOM_APP_DATA; p[i++] = CUSTOM_COMM_DIAG; p[i++] = 10U;
+     put_u32(p, &i, u->rx_bytes); put_u32(p, &i, u->rx_overruns); put_u32(p, &i, s_diag.rx_frames_ok);
+     put_u32(p, &i, u->tx_bytes); put_u32(p, &i, u->uart_errors); put_u32(p, &i, s_diag.tx_frames);
+     put_u32(p, &i, u->tx_overruns); put_u32(p, &i, u->tx_complete_count); put_u32(p, &i, s_diag.blocking_busy_drops);
+@@ -1673,6 +1673,14 @@
+     put_u32(p, &i, timeout_heartbeat_count(TIMEOUT_HEARTBEAT_FOC));
+     put_u32(p, &i, timeout_heartbeat_count(TIMEOUT_HEARTBEAT_MOTOR_SERVICE));
+     put_u32(p, &i, timeout_heartbeat_count(TIMEOUT_HEARTBEAT_COMM));
++    put_u32(p, &i, timeout_watchdog_unhealthy_mask());
++    put_u32(p, &i, timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_FOC));
++    put_u32(p, &i, timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_MOTOR_SERVICE));
++    put_u32(p, &i, timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_COMM));
++    put_u32(p, &i, g_motor_left.sampling_window_clamp_count);
++    put_u32(p, &i, g_motor_right.sampling_window_clamp_count);
++    put_u16(p, &i, g_motor_left.sampling_margin_min_q15);
++    put_u16(p, &i, g_motor_right.sampling_margin_min_q15);
+     vesc_comm_send_payload(p, i);
+ }
+ 
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/confgenerator.c /mnt/data/vesc_part2_work/src/confgenerator.c
+--- /mnt/data/vesc_part2_pristine/src/confgenerator.c	2026-08-22 12:30:16.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/confgenerator.c	2026-08-22 13:16:34.214188916 +0000
+@@ -171,6 +171,8 @@
+     const uint8_t sat_comp_mode = w[VESC6_MC_OFF_FOC_SAT_COMP_MODE];
+     const float sat_comp = get_f16_at(w, VESC6_MC_OFF_FOC_SAT_COMP, 1000.0f);
+     const uint8_t observer_type = w[VESC6_MC_OFF_FOC_OBSERVER_TYPE];
++    const bool sample_v0_v7 = w[VESC6_MC_OFF_FOC_SAMPLE_V0_V7] != 0U;
++    const bool sample_high_current = w[VESC6_MC_OFF_FOC_SAMPLE_HIGH_CURRENT] != 0U;
+     const float openloop_rpm = get_auto_at(w, 201U);
+     const float openloop_rpm_low = get_f16_at(w, 205U, 1000.0f);
+     const float sl_hyst = get_f16_at(w, 211U, 100.0f);
+@@ -193,6 +195,7 @@
+     const float fw_duty = get_f16_at(w, VESC6_MC_OFF_FOC_FW_DUTY_START, 10000.0f);
+     const float fw_ramp = get_f16_at(w, VESC6_MC_OFF_FOC_FW_RAMP_TIME, 1000.0f);
+     const float fw_q = get_f16_at(w, VESC6_MC_OFF_FOC_FW_Q_CURRENT_FACTOR, 10000.0f);
++    const uint8_t foc_speed_source = w[VESC6_MC_OFF_FOC_SPEED_SOURCE];
+     if (current_kp < 0.00001f || current_kp > 10.0f ||
+         current_ki < 0.0f || current_ki > 200000.0f ||
+         pll_kp < 0.0f || pll_kp > 100000.0f ||
+@@ -203,9 +206,14 @@
+         flux < 1.0e-6f || flux > (FOC_FLUX_Q_BASE_WB * 1.90f) ||
+         observer_gain < 0.0f || observer_gain > 1000000.0f ||
+         observer_gain_slow < 0.0f || observer_gain_slow > 1.0f ||
+-        sat_comp_mode > SAT_COMP_FACTOR ||
++        sat_comp_mode > SAT_COMP_LAMBDA_AND_FACTOR ||
+         !isfinite(sat_comp) || sat_comp < 0.0f || sat_comp > 1.0f ||
+-        observer_type != FOC_OBSERVER_ORTEGA_ORIGINAL ||
++        observer_type > FOC_OBSERVER_MXV_LAMBDA_COMP_LIN ||
++        foc_speed_source > FOC_SPEED_SRC_OBSERVER ||
++        /* Shared ADC1/2 dual-motor topology has one coherent sample instant
++           per PWM period. V0/V7 alternation and high-current resampling cannot
++           be represented safely on this board and must never be ACKed. */
++        sample_v0_v7 || sample_high_current ||
+         openloop_rpm < 10.0f || openloop_rpm > MOTOR_DEFAULT_MAX_ERPM ||
+         openloop_rpm_low < 0.0f || openloop_rpm_low > MOTOR_DEFAULT_MAX_ERPM ||
+         sl_hyst < 0.0f || sl_hyst > 100.0f ||
+@@ -305,8 +313,14 @@
+     if (i == VESC6_MC_OFF_FOC_SAT_COMP_MODE ||
+         byte_in_range(i, VESC6_MC_OFF_FOC_SAT_COMP, 2U)) return true;
+     if (byte_in_range(i, VESC6_MC_OFF_FOC_CURRENT_FILTER_CONST, 3U)) return true; /* filter + decoupling */
++    /* Part 2 implements the VESC-6 observer family (0..3) plus the later MXV
++       family (4..6) in the fixed-point F103 backend. The same one-byte wire
++       slot is used without changing the advertised 6.00 MCCONF size. */
++    if (i == VESC6_MC_OFF_FOC_OBSERVER_TYPE) return true;
+     if (i == VESC6_MC_OFF_FOC_MTPA_MODE) return true;
+     if (byte_in_range(i, VESC6_MC_OFF_FOC_FW_CURRENT_MAX, 10U)) return true;
++    /* VESC 6.00 already owns byte 314 as foc_speed_soure (sic upstream). */
++    if (i == VESC6_MC_OFF_FOC_SPEED_SOURCE) return true;
+     /* VESC6 speed PID: kp/ki/kd, D-filter, min-ERPM, allow-braking, ramp. */
+     if (byte_in_range(i, VESC6_MC_OFF_S_PID_KP, 23U)) return true;
+     /* VESC6 position PID: kp/ki/kd/kd_proc/filter/ang_div/gain-dec/offset. */
+@@ -452,7 +466,7 @@
+     F(b,25,100,&i);
+     F(b,mr?m->foc_current_filter_const:MCCONF_FOC_CURRENT_FILTER_CONST_DEFAULT,10000,&i);
+     b[i++]=(uint8_t)(mr?m->foc_cc_decoupling:MCCONF_FOC_CC_DECOUPLING_DEFAULT);
+-    b[i++]=(uint8_t)FOC_OBSERVER_ORTEGA_ORIGINAL; /* only validated backend */
++    b[i++]=(uint8_t)(mr?m->foc_observer_type:MCCONF_FOC_OBSERVER_TYPE_DEFAULT); /* Ortega remains compiled default */
+     F(b,0,10,&i);F(b,0,10,&i);F(b,0,10,&i);F(b,0,1000,&i);F(b,0,100,&i);A(b,0,&i);vesc_buf_append_u16(b,0,&i);A(b,0,&i);b[i++]=0;
+     b[i++]=1; /* offsets calibrated on boot */ A(b,0,&i);A(b,0,&i);A(b,0,&i);
+     for(unsigned k=0;k<6;k++){F(b,0,10000,&i);} b[i++]=0;b[i++]=0;A(b,0,&i);
+@@ -464,7 +478,7 @@
+     F(b,mr?m->foc_fw_duty_start:MCCONF_FOC_FW_DUTY_START_DEFAULT,10000,&i);
+     F(b,mr?m->foc_fw_ramp_time:MCCONF_FOC_FW_RAMP_TIME_DEFAULT,1000,&i);
+     F(b,mr?m->foc_fw_q_current_factor:MCCONF_FOC_FW_Q_CURRENT_FACTOR_DEFAULT,10000,&i);
+-    b[i++]=0; /* foc_speed_source: observer */
++    b[i++]=(uint8_t)(mr?m->foc_speed_source:MCCONF_FOC_SPEED_SOURCE_DEFAULT);
+     vesc_buf_append_i16(b,0,&i);vesc_buf_append_i16(b,0,&i);F(b,0,10000,&i);A(b,0,&i);A(b,0,&i);b[i++]=5; /* 1 kHz */
+     A(b,mr?m->speed_pid.kp:SPEED_PID_KP,&i);A(b,mr?m->speed_pid.ki:SPEED_PID_KI,&i);A(b,mr?m->speed_pid.kd:SPEED_PID_KD,&i);
+     F(b,mr?m->speed_kd_filter:SPEED_PID_D_FILTER,10000,&i);
+@@ -670,6 +684,7 @@
+     m->foc_fw_duty_start=clampf(get_f16_at(w,VESC6_MC_OFF_FOC_FW_DUTY_START,10000.0f),0.0f,1.0f);
+     m->foc_fw_ramp_time=clampf(get_f16_at(w,VESC6_MC_OFF_FOC_FW_RAMP_TIME,1000.0f),0.01f,30.0f);
+     m->foc_fw_q_current_factor=clampf(get_f16_at(w,VESC6_MC_OFF_FOC_FW_Q_CURRENT_FACTOR,10000.0f),0.0f,1.0f);
++    m->foc_speed_source=(FOC_SPEED_SRC)w[VESC6_MC_OFF_FOC_SPEED_SOURCE];
+     m->foc_fw_backoff=MCCONF_FOC_FW_BACKOFF_DEFAULT;
+     m->foc_mag_vd_max=MCCONF_FOC_MAG_VD_MAX_DEFAULT;
+     m->foc_overmod_factor=MCCONF_FOC_OVERMOD_FACTOR_DEFAULT;
+@@ -1089,7 +1104,7 @@
+     c->foc_sl_erpm_start=MCCONF_FOC_SL_ERPM_START_DEFAULT;
+     c->foc_sample_v0_v7=w[VESC6_MC_OFF_FOC_SAMPLE_V0_V7]!=0U;
+     c->foc_sample_high_current=w[VESC6_MC_OFF_FOC_SAMPLE_HIGH_CURRENT]!=0U;
+-    c->foc_speed_source=MCCONF_FOC_SPEED_SOURCE_DEFAULT; /* VESC6 wire has no selector */
++    c->foc_speed_source=(FOC_SPEED_SRC)w[VESC6_MC_OFF_FOC_SPEED_SOURCE];
+     c->foc_sat_comp_mode=(SAT_COMP_MODE)w[VESC6_MC_OFF_FOC_SAT_COMP_MODE];
+     c->foc_sat_comp=get_f16_at(w,VESC6_MC_OFF_FOC_SAT_COMP,1000.0f);
+     c->foc_current_filter_const=get_f16_at(w,VESC6_MC_OFF_FOC_CURRENT_FILTER_CONST,10000.0f);
+@@ -1165,6 +1180,7 @@
+     w[VESC6_MC_OFF_FOC_OBSERVER_TYPE]=(uint8_t)c->foc_observer_type; w[VESC6_MC_OFF_FOC_MTPA_MODE]=(uint8_t)c->foc_mtpa_mode;
+     put_auto_at(w,VESC6_MC_OFF_FOC_FW_CURRENT_MAX,c->foc_fw_current_max); put_f16_at(w,VESC6_MC_OFF_FOC_FW_DUTY_START,c->foc_fw_duty_start,10000.0f);
+     put_f16_at(w,VESC6_MC_OFF_FOC_FW_RAMP_TIME,c->foc_fw_ramp_time,1000.0f); put_f16_at(w,VESC6_MC_OFF_FOC_FW_Q_CURRENT_FACTOR,c->foc_fw_q_current_factor,10000.0f);
++    w[VESC6_MC_OFF_FOC_SPEED_SOURCE]=(uint8_t)c->foc_speed_source;
+     put_auto_at(w,VESC6_MC_OFF_S_PID_KP,c->s_pid_kp); put_auto_at(w,VESC6_MC_OFF_S_PID_KI,c->s_pid_ki); put_auto_at(w,VESC6_MC_OFF_S_PID_KD,c->s_pid_kd);
+     put_f16_at(w,342U,c->s_pid_kd_filter,10000.0f); put_auto_at(w,344U,c->s_pid_min_erpm); w[348U]=c->s_pid_allow_braking?1U:0U; put_auto_at(w,349U,c->s_pid_ramp_erpms_s);
+     put_auto_at(w,VESC6_MC_OFF_P_PID_KP,c->p_pid_kp); put_auto_at(w,VESC6_MC_OFF_P_PID_KI,c->p_pid_ki); put_auto_at(w,VESC6_MC_OFF_P_PID_KD,c->p_pid_kd);
+@@ -1190,7 +1206,6 @@
+     /* VESC6 has no s_pid_speed_source field. Refuse to persist a runtime-only
+        FAST/FASTER selection instead of silently serializing it as PLL. */
+     if(conf->s_pid_speed_source!=S_PID_SPEED_SRC_PLL)return -1;
+-    if(conf->foc_speed_source!=MCCONF_FOC_SPEED_SOURCE_DEFAULT)return -1;
+     if(fabsf(conf->l_in_current_map_start-MCCONF_L_IN_CURRENT_MAP_START_DEFAULT)>1.0e-6f ||
+        fabsf(conf->l_in_current_map_filter-MCCONF_L_IN_CURRENT_MAP_FILTER_DEFAULT)>1.0e-6f)return -1;
+     if(conf->l_additional_faults!=MCCONF_L_ADDITIONAL_FAULTS_DEFAULT)return -1;
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/datatypes.h /mnt/data/vesc_part2_work/src/datatypes.h
+--- /mnt/data/vesc_part2_pristine/src/datatypes.h	2026-08-20 16:44:11.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/datatypes.h	2026-08-22 12:58:26.271437251 +0000
+@@ -188,18 +188,16 @@
+     S_PID_SPEED_SRC_FASTER
+ } S_PID_SPEED_SRC;
+ 
+-/* Current VESC separates the speed estimator phase source from the outer
+- * speed-PID source. Keep this selector runtime-only while the wire ABI is
+- * pinned to VESC 6.00. */
++/* VESC 6.00 already serializes the FOC phase/speed source at MCCONF byte 314.
++ * This is separate from the outer speed-PID source. */
+ typedef enum {
+     FOC_SPEED_SRC_CORRECTED = 0,
+     FOC_SPEED_SRC_OBSERVER
+ } FOC_SPEED_SRC;
+ 
+-/* Keep the canonical VESC observer numbering in the public configuration.
+- * This F103 port intentionally executes only ORTEGA_ORIGINAL in Batch 3;
+- * other values remain protocol-known but are rejected by the hardware
+- * validator instead of being silently mapped to a different observer. */
++/* Canonical VESC observer numbering. Part 2 implements every non-HFI FOC
++ * observer below in the fixed-point 16-kHz backend. Keep the upstream values
++ * unchanged so the VESC 6.00 MCCONF wire image remains byte-compatible. */
+ typedef enum {
+     FOC_OBSERVER_ORTEGA_ORIGINAL = 0,
+     FOC_OBSERVER_MXLEMMING,
+@@ -765,6 +763,11 @@
+     volatile uint16_t duty_u_q15;
+     volatile uint16_t duty_v_q15;
+     volatile uint16_t duty_w_q15;
++    /* Shared ADC1/2 current sampling has one hardware-valid 10..90% window.
++       These counters make modulation saturation visible during commissioning
++       instead of pretending unsupported V0/V7/high-current sample modes work. */
++    volatile uint32_t sampling_window_clamp_count;
++    volatile uint16_t sampling_margin_min_q15;
+     volatile int32_t vbus_q15;
+     volatile int32_t abs_current_trip_q15;
+     volatile int32_t abs_phase_current_filter_q15;
+@@ -942,8 +945,15 @@
+     int32_t observer_l_i_to_flux_q15;
+     int32_t observer_vdt_to_flux_q15;
+     int32_t observer_flux_target_q30;
+-    /* Ortega correction coefficient in Q2.30. It already includes dt and the
+-       normalization by FOC_FLUX_Q_BASE_WB, so the 16-kHz ISR only performs
++    /* Adaptive flux estimate used by the VESC lambda-compensated Ortega,
++       MXLEMMING and MXV observers. Q2.30 on FOC_FLUX_Q_BASE_WB. */
++    volatile int32_t observer_lambda_est_q30;
++    /* Previous alpha/beta currents for the MXLEMMING current-difference term.
++       Keeping them in Q15 avoids any floating point in the hard FOC ISR. */
++    volatile int32_t observer_i_alpha_last_q15;
++    volatile int32_t observer_i_beta_last_q15;
++    /* Observer correction coefficient in Q2.30. It already includes dt and
++       the normalization by FOC_FLUX_Q_BASE_WB, so the 16-kHz ISR only performs
+        fixed-point multiplies. Updated by the 1-kHz observer service. */
+     int32_t observer_gamma_coeff_q30;
+ 
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/motor/foc_math.c /mnt/data/vesc_part2_work/src/motor/foc_math.c
+--- /mnt/data/vesc_part2_pristine/src/motor/foc_math.c	2026-08-22 12:35:12.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/motor/foc_math.c	2026-08-22 13:10:54.780057254 +0000
+@@ -217,6 +217,122 @@
+     return sat_i32_from_i64(m);
+ }
+ 
++/* Exact-enough vector magnitude for VESC clamp semantics without libm or a
++ * 64-bit divide. Inputs are Q2.30; shifting to Q14 guarantees that a^2+b^2
++ * fits a signed 32-bit word even at the defensive INT32 state limit. The
++ * restoring integer square-root is 16 cheap shift/subtract iterations and is
++ * only used when MXV clipping/adaptive-linear magnitude actually needs it. */
++static uint32_t isqrt_u32(uint32_t x) {
++    uint32_t res = 0U;
++    uint32_t bit = 1UL << 30;
++    while (bit > x) bit >>= 2;
++    while (bit != 0U) {
++        if (x >= res + bit) {
++            x -= res + bit;
++            res = (res >> 1) + bit;
++        } else {
++            res >>= 1;
++        }
++        bit >>= 2;
++    }
++    return res;
++}
++
++static int32_t mag_sqrt_q30_fast(int32_t a, int32_t b) {
++    int32_t aq14 = a >> 16;
++    int32_t bq14 = b >> 16;
++    uint32_t sq = (uint32_t)((int64_t)aq14 * aq14 + (int64_t)bq14 * bq14);
++    uint32_t mag_q14 = isqrt_u32(sq);
++    if (mag_q14 > 32767U) mag_q14 = 32767U;
++    return (int32_t)(mag_q14 << 16);
++}
++
++static bool observer_uses_lambda_comp(mc_foc_observer_type type) {
++    return type == FOC_OBSERVER_ORTEGA_LAMBDA_COMP ||
++           type == FOC_OBSERVER_MXLEMMING_LAMBDA_COMP ||
++           type == FOC_OBSERVER_MXV_LAMBDA_COMP ||
++           type == FOC_OBSERVER_MXV_LAMBDA_COMP_LIN;
++}
++
++/* Square of a Q2.30 vector, returned as Q2.30. Inputs are shifted once before
++ * squaring so even the defensive INT32 flux bounds cannot overflow int64. */
++static int32_t flux_mag_sq_q30(int32_t a, int32_t b) {
++    const int64_t ah = (int64_t)(a >> 1);
++    const int64_t bh = (int64_t)(b >> 1);
++    return sat_i32_from_i64(((ah * ah) + (bh * bh)) >> 28);
++}
++
++static void lambda_bounds_q30(const MotorRuntime *m, int32_t *lo, int32_t *hi) {
++    const int32_t target = m->observer_flux_target_q30 > 0 ? m->observer_flux_target_q30 : 1024;
++    *lo = (int32_t)(((int64_t)target * 3LL) / 10LL);
++    int64_t h = ((int64_t)target * 5LL) / 2LL;
++    if (h > INT32_MAX) h = INT32_MAX;
++    *hi = (int32_t)h;
++    if (*lo < 1024) *lo = 1024;
++    if (*hi < *lo) *hi = *lo;
++}
++
++static int32_t lambda_clamp_q30(const MotorRuntime *m, int32_t v) {
++    int32_t lo, hi;
++    lambda_bounds_q30(m, &lo, &hi);
++    if (v < lo) return lo;
++    if (v > hi) return hi;
++    return v;
++}
++
++/* VESC lambda estimator:
++ *   lambda += gain * gamma_half * lambda * (-err) * dt
++ * observer_gamma_coeff_q30 already represents gamma_half*dt*flux_base^2 in
++ * normalized Q30. gain_q15 is 0.2 for Ortega/MXV and 0.1 for MXLEMMING. */
++static int32_t lambda_adapt_nonlinear_q30(const MotorRuntime *m, int32_t lambda_q30,
++                                           int32_t err_q30, int32_t gain_q15) {
++    int32_t gl = sat_i32_from_i64(((int64_t)m->observer_gamma_coeff_q30 * lambda_q30) >> 30);
++    int64_t neg_err = -(int64_t)err_q30;
++    int32_t d = sat_i32_from_i64(((int64_t)gl * neg_err) >> 30);
++    d = sat_i32_from_i64(((int64_t)d * gain_q15) >> 15);
++    return lambda_clamp_q30(m, sat_i32_from_i64((int64_t)lambda_q30 + d));
++}
++
++/* Return numerator/denominator in Q15 for 0 <= numerator <= denominator.
++ * Shift both operands together until the 32-bit numerator shift is safe; this
++ * avoids a costly 64-bit divide in the 16-kHz path. */
++static int32_t ratio_le_one_q15(int32_t numerator, int32_t denominator) {
++    if (numerator <= 0 || denominator <= 0) return 0;
++    if (numerator >= denominator) return 32768;
++    uint32_t n = (uint32_t)numerator;
++    uint32_t d = (uint32_t)denominator;
++    while (d > 32767U) {
++        n >>= 1;
++        d >>= 1;
++        if (d == 0U) return 32768;
++    }
++    return (int32_t)((n << 15) / d);
++}
++
++static void clamp_observer_state_vector(MotorRuntime *m, int32_t rotor_a, int32_t rotor_b,
++                                         int32_t limit_q30) {
++    /* Match VESC's `if (NORM2(rotor_flux) > lambda)` decision using a squared
++       Q30 comparison first. The cheap alpha-max magnitude is deliberately NOT
++       used for the decision: it can over-estimate by several percent at some
++       vector angles and would then clamp a perfectly valid lambda-radius
++       trajectory every electrical revolution, creating observer phase lag. */
++    const int32_t mag_sq = flux_mag_sq_q30(rotor_a, rotor_b);
++    const int32_t lim_sq = flux_mag_sq_q30(limit_q30, 0);
++    if (mag_sq <= lim_sq || mag_sq <= 0) return;
++
++    /* Once clipping is required, use the small restoring integer square-root
++       for the scale denominator. This matches VESC NORM2 closely enough to
++       avoid the repeated over-clamp/phase-lag that alpha-max approximations
++       create on a rotating flux vector. */
++    const int32_t mag = mag_sqrt_q30_fast(rotor_a, rotor_b);
++    if (mag <= 0) return;
++    const int32_t scale_q15 = ratio_le_one_q15(limit_q30, mag);
++    int32_t sx = sat_i32_from_i64(m->observer_stator_flux_alpha_q30);
++    int32_t sy = sat_i32_from_i64(m->observer_stator_flux_beta_q30);
++    m->observer_stator_flux_alpha_q30 = ((int64_t)sx * scale_q15) >> 15;
++    m->observer_stator_flux_beta_q30 = ((int64_t)sy * scale_q15) >> 15;
++}
++
+ void foc_observer_precalc(MotorRuntime *m) {
+     if (!m) return;
+     float r = fmaxf(m->foc_motor_r, 1.0e-6f);
+@@ -281,6 +397,9 @@
+     m->observer_stator_flux_beta_q30 = fb;
+     m->observer_rotor_flux_alpha_q30 = fa;
+     m->observer_rotor_flux_beta_q30 = fb;
++    m->observer_lambda_est_q30 = target;
++    m->observer_i_alpha_last_q15 = 0;
++    m->observer_i_beta_last_q15 = 0;
+     m->observer_v_alpha_q15_prev = 0;
+     m->observer_v_beta_q15_prev = 0;
+     m->observer_phase_u16 = phase_u16;
+@@ -302,97 +421,165 @@
+                          int32_t i_alpha_q15, int32_t i_beta_q15) {
+     if (!m) return;
+ 
+-    /* Voltage model, algebraically equivalent to integrating V-RI and then
+-       subtracting L*I. All operations in this 16-kHz path are integer. */
+-    int32_t ri_a = foc_q15_mul(i_alpha_q15, m->observer_r_i_to_v_q15);
+-    int32_t ri_b = foc_q15_mul(i_beta_q15, m->observer_r_i_to_v_q15);
+-    int32_t emf_a = v_alpha_q15 - ri_a;
+-    int32_t emf_b = v_beta_q15 - ri_b;
+-    m->observer_stator_flux_alpha_q30 += (int64_t)emf_a * m->observer_vdt_to_flux_q15;
+-    m->observer_stator_flux_beta_q30 += (int64_t)emf_b * m->observer_vdt_to_flux_q15;
+-
+-    /* Bound integrator grossly to avoid numeric runaway after a bad config. */
+-    const int64_t flux_lim = (int64_t)2147483647;
+-    if (m->observer_stator_flux_alpha_q30 > flux_lim) m->observer_stator_flux_alpha_q30 = flux_lim;
+-    if (m->observer_stator_flux_alpha_q30 < -flux_lim) m->observer_stator_flux_alpha_q30 = -flux_lim;
+-    if (m->observer_stator_flux_beta_q30 > flux_lim) m->observer_stator_flux_beta_q30 = flux_lim;
+-    if (m->observer_stator_flux_beta_q30 < -flux_lim) m->observer_stator_flux_beta_q30 = -flux_lim;
+-
+-    int32_t li_a = (int32_t)((int64_t)i_alpha_q15 * m->observer_l_i_to_flux_q15);
+-    int32_t li_b = (int32_t)((int64_t)i_beta_q15 * m->observer_l_i_to_flux_q15);
+-    int32_t fa = sat_i32_from_i64(m->observer_stator_flux_alpha_q30 - li_a);
+-    int32_t fb = sat_i32_from_i64(m->observer_stator_flux_beta_q30 - li_b);
+-
+-    /* Fixed-point ORTEGA_ORIGINAL correction. Upstream only corrects when the
+-       estimated rotor-flux magnitude exceeds lambda (positive error is
+-       clamped to zero). Shift operands once before squaring so the sum cannot
+-       overflow int64 even at the defensive Q30 flux bounds. */
+-    int64_t fa29 = (int64_t)(fa >> 1);
+-    int64_t fb29 = (int64_t)(fb >> 1);
+-    int64_t t29 = (int64_t)(m->observer_flux_target_q30 >> 1);
+-    int64_t mag_sq_q30 = ((fa29 * fa29) + (fb29 * fb29)) >> 28;
+-    int64_t target_sq_q30 = (t29 * t29) >> 28;
+-    int64_t err_sq_q30 = target_sq_q30 - mag_sq_q30;
+-    if (err_sq_q30 > 0) err_sq_q30 = 0;
+-    if (err_sq_q30 < INT32_MIN) err_sq_q30 = INT32_MIN;
+-    int32_t err_q30 = (int32_t)err_sq_q30;
+-    int32_t gamma_q30 = m->observer_gamma_coeff_q30;
+-    if (gamma_q30 > 0 && err_q30 < 0) {
+-        int32_t corr_a_q30 = sat_i32_from_i64(((int64_t)err_q30 * fa) >> 30);
+-        int32_t corr_b_q30 = sat_i32_from_i64(((int64_t)err_q30 * fb) >> 30);
+-        int32_t delta_a_q30 = sat_i32_from_i64(((int64_t)corr_a_q30 * gamma_q30) >> 30);
+-        int32_t delta_b_q30 = sat_i32_from_i64(((int64_t)corr_b_q30 * gamma_q30) >> 30);
+-        m->observer_stator_flux_alpha_q30 += delta_a_q30;
+-        m->observer_stator_flux_beta_q30 += delta_b_q30;
+-        fa = sat_i32_from_i64(m->observer_stator_flux_alpha_q30 - li_a);
+-        fb = sat_i32_from_i64(m->observer_stator_flux_beta_q30 - li_b);
+-    }
++    /* All observer variants below follow the current VESC observer equations,
++       but the STM32F103 hard path remains integer-only. VESC/MESC attribution
++       for MXLEMMING is retained below as required by the upstream source. */
++    const int32_t ri_a = foc_q15_mul(i_alpha_q15, m->observer_r_i_to_v_q15);
++    const int32_t ri_b = foc_q15_mul(i_beta_q15, m->observer_r_i_to_v_q15);
++    const int32_t emf_a = v_alpha_q15 - ri_a;
++    const int32_t emf_b = v_beta_q15 - ri_b;
++    const int32_t li_a = (int32_t)((int64_t)i_alpha_q15 * m->observer_l_i_to_flux_q15);
++    const int32_t li_b = (int32_t)((int64_t)i_beta_q15 * m->observer_l_i_to_flux_q15);
++    int32_t fa = 0, fb = 0;
++
++    switch (m->foc_observer_type) {
++    case FOC_OBSERVER_MXLEMMING:
++    case FOC_OBSERVER_MXLEMMING_LAMBDA_COMP: {
++        /* LICENCE/ATTRIBUTION NOTE from upstream VESC/MESC implementation:
++         * This observer work is original to the MESC FOC project. Preserve
++         * credit to David Molony as the original author when modifying it. */
++        const int32_t dia = i_alpha_q15 - m->observer_i_alpha_last_q15;
++        const int32_t dib = i_beta_q15 - m->observer_i_beta_last_q15;
++        const int32_t dli_a = (int32_t)((int64_t)dia * m->observer_l_i_to_flux_q15);
++        const int32_t dli_b = (int32_t)((int64_t)dib * m->observer_l_i_to_flux_q15);
++        m->observer_stator_flux_alpha_q30 += (int64_t)emf_a * m->observer_vdt_to_flux_q15 - dli_a;
++        m->observer_stator_flux_beta_q30  += (int64_t)emf_b * m->observer_vdt_to_flux_q15 - dli_b;
++        int32_t sx = sat_i32_from_i64(m->observer_stator_flux_alpha_q30);
++        int32_t sy = sat_i32_from_i64(m->observer_stator_flux_beta_q30);
++        int32_t limit = m->observer_flux_target_q30;
++        if (m->foc_observer_type == FOC_OBSERVER_MXLEMMING_LAMBDA_COMP) {
++            const int32_t err = sat_i32_from_i64((int64_t)flux_mag_sq_q30(m->observer_lambda_est_q30, 0) -
++                                                  flux_mag_sq_q30(sx, sy));
++            m->observer_lambda_est_q30 = lambda_adapt_nonlinear_q30(m, m->observer_lambda_est_q30,
++                                                                     err, 3277); /* 0.1 */
++            limit = m->observer_lambda_est_q30;
++        }
++        if (sx > limit) sx = limit; else if (sx < -limit) sx = -limit;
++        if (sy > limit) sy = limit; else if (sy < -limit) sy = -limit;
++        m->observer_stator_flux_alpha_q30 = sx;
++        m->observer_stator_flux_beta_q30 = sy;
++        /* MXLEMMING state is already rotor flux, so L*i must not be subtracted
++           again before atan2. */
++        fa = sx; fb = sy;
++    } break;
++
++    case FOC_OBSERVER_MXV:
++    case FOC_OBSERVER_MXV_LAMBDA_COMP:
++    case FOC_OBSERVER_MXV_LAMBDA_COMP_LIN: {
++        m->observer_stator_flux_alpha_q30 += (int64_t)emf_a * m->observer_vdt_to_flux_q15;
++        m->observer_stator_flux_beta_q30  += (int64_t)emf_b * m->observer_vdt_to_flux_q15;
++        int32_t sx = sat_i32_from_i64(m->observer_stator_flux_alpha_q30);
++        int32_t sy = sat_i32_from_i64(m->observer_stator_flux_beta_q30);
++        fa = sat_i32_from_i64((int64_t)sx - li_a);
++        fb = sat_i32_from_i64((int64_t)sy - li_b);
++        int32_t limit = m->observer_flux_target_q30;
++
++        if (m->foc_observer_type == FOC_OBSERVER_MXV_LAMBDA_COMP) {
++            const int32_t err = sat_i32_from_i64((int64_t)flux_mag_sq_q30(m->observer_lambda_est_q30, 0) -
++                                                  flux_mag_sq_q30(fa, fb));
++            m->observer_lambda_est_q30 = lambda_adapt_nonlinear_q30(m, m->observer_lambda_est_q30,
++                                                                     err, 6554); /* 0.2 */
++            limit = m->observer_lambda_est_q30;
++        } else if (m->foc_observer_type == FOC_OBSERVER_MXV_LAMBDA_COMP_LIN) {
++            const int32_t mag = mag_sqrt_q30_fast(fa, fb);
++            const int32_t lam = m->observer_lambda_est_q30;
++            const int32_t lam_sq = flux_mag_sq_q30(lam, 0);
++            int32_t alpha = sat_i32_from_i64(((int64_t)m->observer_gamma_coeff_q30 * lam_sq) >> 30);
++            alpha = sat_i32_from_i64(((int64_t)alpha * 3277) >> 15); /* 0.1 */
++            if (alpha > 1073741824) alpha = 1073741824; /* alpha <= 1.0 in Q30 */
++            const int32_t dl = sat_i32_from_i64(((int64_t)(mag - lam) * alpha) >> 30);
++            m->observer_lambda_est_q30 = lambda_clamp_q30(m, sat_i32_from_i64((int64_t)lam + dl));
++            limit = m->observer_lambda_est_q30;
++        }
+ 
+-    /* Upstream keeps the observer state from collapsing below roughly half
+-       the configured flux linkage, where atan2 becomes very noise-sensitive.
+-       Apply the same safeguard to the Ortega state with a 1.1 fixed-point
+-       expansion; it is still entirely integer and bounded afterwards. */
+-    {
++        clamp_observer_state_vector(m, fa, fb, limit);
++        sx = sat_i32_from_i64(m->observer_stator_flux_alpha_q30);
++        sy = sat_i32_from_i64(m->observer_stator_flux_beta_q30);
++        fa = sat_i32_from_i64((int64_t)sx - li_a);
++        fb = sat_i32_from_i64((int64_t)sy - li_b);
++    } break;
++
++    case FOC_OBSERVER_ORTEGA_LAMBDA_COMP:
++    case FOC_OBSERVER_ORTEGA_ORIGINAL:
++    default: {
++        m->observer_stator_flux_alpha_q30 += (int64_t)emf_a * m->observer_vdt_to_flux_q15;
++        m->observer_stator_flux_beta_q30  += (int64_t)emf_b * m->observer_vdt_to_flux_q15;
+         int32_t sx = sat_i32_from_i64(m->observer_stator_flux_alpha_q30);
+         int32_t sy = sat_i32_from_i64(m->observer_stator_flux_beta_q30);
+-        if (mag_approx_q30(sx, sy) < (m->observer_flux_target_q30 / 2)) {
+-            const int32_t grow_q15 = 36045; /* round(1.1 * 32768) */
+-            m->observer_stator_flux_alpha_q30 =
+-                sat_i32_from_i64(((int64_t)sx * grow_q15) >> 15);
+-            m->observer_stator_flux_beta_q30 =
+-                sat_i32_from_i64(((int64_t)sy * grow_q15) >> 15);
+-            fa = sat_i32_from_i64(m->observer_stator_flux_alpha_q30 - li_a);
+-            fb = sat_i32_from_i64(m->observer_stator_flux_beta_q30 - li_b);
++        fa = sat_i32_from_i64((int64_t)sx - li_a);
++        fb = sat_i32_from_i64((int64_t)sy - li_b);
++        int32_t lambda = m->observer_flux_target_q30;
++        if (m->foc_observer_type == FOC_OBSERVER_ORTEGA_LAMBDA_COMP) lambda = m->observer_lambda_est_q30;
++        int32_t err = sat_i32_from_i64((int64_t)flux_mag_sq_q30(lambda, 0) - flux_mag_sq_q30(fa, fb));
++        if (m->foc_observer_type == FOC_OBSERVER_ORTEGA_LAMBDA_COMP) {
++            m->observer_lambda_est_q30 = lambda_adapt_nonlinear_q30(m, m->observer_lambda_est_q30,
++                                                                     err, 6554); /* 0.2 */
+         }
++        /* VESC/Ortega convergence is improved by keeping the correction error
++           non-positive. */
++        if (err > 0) err = 0;
++        const int32_t gamma = m->observer_gamma_coeff_q30;
++        if (gamma > 0 && err < 0) {
++            const int32_t ca = sat_i32_from_i64(((int64_t)err * fa) >> 30);
++            const int32_t cb = sat_i32_from_i64(((int64_t)err * fb) >> 30);
++            m->observer_stator_flux_alpha_q30 += ((int64_t)ca * gamma) >> 30;
++            m->observer_stator_flux_beta_q30  += ((int64_t)cb * gamma) >> 30;
++            sx = sat_i32_from_i64(m->observer_stator_flux_alpha_q30);
++            sy = sat_i32_from_i64(m->observer_stator_flux_beta_q30);
++            fa = sat_i32_from_i64((int64_t)sx - li_a);
++            fb = sat_i32_from_i64((int64_t)sy - li_b);
++        }
++    } break;
+     }
++
++    /* Defensive state bounds and the same anti-collapse principle as VESC.
++       The bound protects a corrupt configuration from numeric runaway. */
++    int32_t sx = sat_i32_from_i64(m->observer_stator_flux_alpha_q30);
++    int32_t sy = sat_i32_from_i64(m->observer_stator_flux_beta_q30);
++    m->observer_stator_flux_alpha_q30 = sx;
++    m->observer_stator_flux_beta_q30 = sy;
++    if (mag_approx_q30(sx, sy) < (m->observer_flux_target_q30 / 2)) {
++        const int32_t grow_q15 = 36045; /* round(1.1 * 32768) */
++        sx = sat_i32_from_i64(((int64_t)sx * grow_q15) >> 15);
++        sy = sat_i32_from_i64(((int64_t)sy * grow_q15) >> 15);
++        m->observer_stator_flux_alpha_q30 = sx;
++        m->observer_stator_flux_beta_q30 = sy;
++        if (m->foc_observer_type == FOC_OBSERVER_MXLEMMING ||
++            m->foc_observer_type == FOC_OBSERVER_MXLEMMING_LAMBDA_COMP) {
++            fa = sx; fb = sy;
++        } else {
++            fa = sat_i32_from_i64((int64_t)sx - li_a);
++            fb = sat_i32_from_i64((int64_t)sy - li_b);
++        }
++    }
++
++    m->observer_i_alpha_last_q15 = i_alpha_q15;
++    m->observer_i_beta_last_q15 = i_beta_q15;
+     m->observer_rotor_flux_alpha_q30 = fa;
+     m->observer_rotor_flux_beta_q30 = fb;
+ 
+-    uint16_t phase = atan2_u16_q30(fb, fa);
+-    int16_t dphase = (int16_t)(phase - m->observer_phase_last_u16);
++    const uint16_t phase = atan2_u16_q30(fb, fa);
++    const int16_t dphase = (int16_t)(phase - m->observer_phase_last_u16);
+     m->observer_phase_last_u16 = phase;
+     m->observer_phase_u16 = phase;
+ 
+-    /* 1 phase-count/sample = Fsample*60/65536 ERPM. Q16 coefficient reduces
+-       to Fsample*60 for this representation. */
+     int64_t erpm_inst64 = (int64_t)dphase * (int64_t)(FOC_ISR_EVENT_HZ * 60UL);
+-    if (erpm_inst64 > 2147483647LL) erpm_inst64 = 2147483647LL;
+-    if (erpm_inst64 < (-2147483647LL - 1LL)) erpm_inst64 = (-2147483647LL - 1LL);
+-    int32_t erpm_inst_q16 = (int32_t)erpm_inst64;
++    if (erpm_inst64 > INT32_MAX) erpm_inst64 = INT32_MAX;
++    if (erpm_inst64 < INT32_MIN) erpm_inst64 = INT32_MIN;
++    const int32_t erpm_inst_q16 = (int32_t)erpm_inst64;
+     int64_t de64 = (int64_t)erpm_inst_q16 - (int64_t)m->observer_erpm_q16;
+-    if (de64 > 2147483647LL) de64 = 2147483647LL;
+-    if (de64 < (-2147483647LL - 1LL)) de64 = (-2147483647LL - 1LL);
+-    int32_t de = (int32_t)de64;
+-    m->observer_erpm_q16 += (int32_t)(((int64_t)de * FOC_OBSERVER_SPEED_ALPHA_Q15) >> 15);
++    if (de64 > INT32_MAX) de64 = INT32_MAX;
++    if (de64 < INT32_MIN) de64 = INT32_MIN;
++    m->observer_erpm_q16 += (int32_t)(((int64_t)(int32_t)de64 * FOC_OBSERVER_SPEED_ALPHA_Q15) >> 15);
+     m->observer_update_cycle = DWT->CYCCNT;
+ 
+-    int32_t mag = mag_approx_q30(fa, fb);
+-    int32_t target = m->observer_flux_target_q30;
+-    int32_t lo = (int32_t)((int64_t)target * 45 / 100);
+-    int32_t hi = (int32_t)((int64_t)target * 180 / 100);
+-    int32_t erpm_abs_q16 = abs_i32_sat(m->observer_erpm_q16);
++    const int32_t mag = mag_approx_q30(fa, fb);
++    const int32_t target = observer_uses_lambda_comp(m->foc_observer_type) ?
++                           m->observer_lambda_est_q30 : m->observer_flux_target_q30;
++    const int32_t lo = (int32_t)((int64_t)target * 45 / 100);
++    const int32_t hi = sat_i32_from_i64((int64_t)target * 180 / 100);
++    const int32_t erpm_abs_q16 = abs_i32_sat(m->observer_erpm_q16);
+     m->observer_valid = (mag >= lo && mag <= hi && erpm_abs_q16 >= m->foc_sl_erpm_start_q16);
+-
+ }
+ 
+ void foc_pll_run_fixed(MotorRuntime *m, uint16_t phase_u16) {
+@@ -433,13 +620,29 @@
+     }
+ 
+     float flux_eff = fmaxf(m->foc_motor_flux_linkage, 1.0e-6f);
+-    if (m->foc_sat_comp_mode == SAT_COMP_FACTOR && m->foc_sat_comp > 0.0f) {
+-        const float i_abs = sqrtf(i2);
+-        const float i_lim = fmaxf(m->current_max_a, 0.1f);
+-        const float comp = foc_clampf(m->foc_sat_comp * i_abs / i_lim, 0.0f, 0.95f);
++    const bool lambda_observer = observer_uses_lambda_comp(m->foc_observer_type);
++    const float lambda_est = fmaxf((float)m->observer_lambda_est_q30 *
++                                   (FOC_FLUX_Q_BASE_WB / 1073741824.0f), 1.0e-6f);
++    const float i_abs = sqrtf(i2);
++    const float i_lim = fmaxf(m->current_max_a, 0.1f);
++    const float comp = foc_clampf(m->foc_sat_comp * i_abs / i_lim, 0.0f, 0.95f);
++    switch (m->foc_sat_comp_mode) {
++    case SAT_COMP_LAMBDA:
++        if (lambda_observer) l_eff *= lambda_est / fmaxf(m->foc_motor_flux_linkage, 1.0e-6f);
++        break;
++    case SAT_COMP_FACTOR:
+         l_eff *= (1.0f - comp);
+         flux_eff *= (1.0f - comp);
++        break;
++    case SAT_COMP_LAMBDA_AND_FACTOR:
++        if (lambda_observer) l_eff *= lambda_est / fmaxf(m->foc_motor_flux_linkage, 1.0e-6f);
++        l_eff *= (1.0f - comp);
++        break;
++    case SAT_COMP_DISABLED:
++    default:
++        break;
+     }
++    l_eff = fmaxf(l_eff, 1.0e-8f);
+ 
+     float lf = l_eff * (FOC_CURRENT_Q_BASE_A / FOC_FLUX_Q_BASE_WB);
+     float ft = flux_eff / FOC_FLUX_Q_BASE_WB;
+@@ -468,7 +671,8 @@
+     m->observer_l_i_to_flux_q15 = l_coeff_q15;
+     m->observer_flux_target_q30 = flux_target_q30;
+     m->observer_gamma_coeff_q30 = gamma_coeff_q30;
+-    int32_t target = flux_target_q30;
++    int32_t target = observer_uses_lambda_comp(m->foc_observer_type) ?
++                     m->observer_lambda_est_q30 : flux_target_q30;
+     if (!primask) __enable_irq();
+     int32_t mag = mag_approx_q30(fa, fb);
+ 
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/motor/mc_interface.c /mnt/data/vesc_part2_work/src/motor/mc_interface.c
+--- /mnt/data/vesc_part2_pristine/src/motor/mc_interface.c	2026-08-22 12:31:50.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/motor/mc_interface.c	2026-08-22 12:53:35.712059013 +0000
+@@ -109,6 +109,8 @@
+     m->current_kp_q16 = (int32_t)((m->current_kp * FOC_CURRENT_Q_BASE_A / FOC_VOLTAGE_Q_BASE_V) * 65536.0f);
+     m->current_ki_dt_q16 = (int32_t)((m->current_ki * FOC_DT_S * FOC_CURRENT_Q_BASE_A / FOC_VOLTAGE_Q_BASE_V) * 65536.0f);
+     m->duty_u_q15 = m->duty_v_q15 = m->duty_w_q15 = FOC_Q15_HALF;
++    m->sampling_window_clamp_count = 0U;
++    m->sampling_margin_min_q15 = (uint16_t)(FOC_Q15_HALF - PWM_MIN_DUTY_Q15);
+     m->current_max_a = FOC_MAX_CURRENT_A; m->current_min_a = -FOC_MAX_CURRENT_A;
+     m->input_current_max_a = FOC_MAX_CURRENT_A; m->input_current_min_a = -FOC_MAX_CURRENT_A;
+     m->abs_current_max_a = FOC_ABS_CURRENT_TRIP_A;
+@@ -1499,7 +1501,6 @@
+         !SAME_F(l_battery_regen_cut_end) ||
+         c->foc_sample_v0_v7 != expected.foc_sample_v0_v7 ||
+         c->foc_sample_high_current != expected.foc_sample_high_current ||
+-        c->foc_observer_type != expected.foc_observer_type ||
+         !SAME_F(foc_fw_backoff) ||
+         !SAME_F(foc_mag_vd_max) ||
+         !SAME_F(foc_overmod_factor) ||
+@@ -1524,8 +1525,9 @@
+     if (!mc_interface_unsupported_configuration_unchanged(c, m)) return false;
+     const bool encoder_ab = (c->foc_sensor_mode == FOC_SENSOR_MODE_ENCODER ||
+                              c->foc_sensor_mode == FOC_SENSOR_MODE_ENCODER_AB);
++    const bool sensorless = c->foc_sensor_mode == FOC_SENSOR_MODE_SENSORLESS;
+     if (m->id == MOTOR_LEFT) {
+-        if (!encoder_ab && c->foc_sensor_mode != FOC_SENSOR_MODE_HALL) return false;
++        if (!sensorless && !encoder_ab && c->foc_sensor_mode != FOC_SENSOR_MODE_HALL) return false;
+         if (encoder_ab) {
+             if (c->m_sensor_port_mode != SENSOR_PORT_MODE_ABI ||
+                 c->m_encoder_counts < 4U || c->m_encoder_counts > 65535U ||
+@@ -1535,10 +1537,13 @@
+             if (rq == 0U || rq > UINT32_MAX ||
+                 ((rq << 16) / c->m_encoder_counts) > UINT32_MAX) return false;
+         } else if (c->m_sensor_port_mode != SENSOR_PORT_MODE_HALL) {
++            /* Sensorless still leaves the physical sensor pins in the benign
++               Hall-input configuration; no fictitious encoder peripheral is
++               enabled while the observer is the phase source. */
+             return false;
+         }
+     } else {
+-        if (c->foc_sensor_mode != FOC_SENSOR_MODE_HALL || encoder_ab ||
++        if ((!sensorless && c->foc_sensor_mode != FOC_SENSOR_MODE_HALL) || encoder_ab ||
+             c->m_sensor_port_mode != SENSOR_PORT_MODE_HALL) return false;
+     }
+ 
+@@ -1604,7 +1609,7 @@
+         c->foc_observer_gain_slow < 0.0f || c->foc_observer_gain_slow > 1.0f ||
+         c->foc_pll_kp < 0.0f || c->foc_pll_kp > 100000.0f ||
+         c->foc_pll_ki < 0.0f || c->foc_pll_ki > 1000000.0f ||
+-        c->foc_sat_comp_mode > SAT_COMP_FACTOR ||
++        c->foc_sat_comp_mode > SAT_COMP_LAMBDA_AND_FACTOR ||
+         c->foc_sat_comp < 0.0f || c->foc_sat_comp > 1.0f ||
+         c->foc_openloop_rpm < 10.0f || c->foc_openloop_rpm > MOTOR_DEFAULT_MAX_ERPM ||
+         c->foc_openloop_rpm_low < 0.0f || c->foc_openloop_rpm_low > MOTOR_DEFAULT_MAX_ERPM ||
+@@ -1623,6 +1628,7 @@
+         c->foc_start_curr_dec_rpm < 0.0f || c->foc_start_curr_dec_rpm > MOTOR_DEFAULT_MAX_ERPM ||
+         c->foc_current_filter_const < 0.0f || c->foc_current_filter_const > 1.0f ||
+         c->foc_speed_source > FOC_SPEED_SRC_OBSERVER ||
++        c->foc_observer_type > FOC_OBSERVER_MXV_LAMBDA_COMP_LIN ||
+         c->foc_cc_decoupling > FOC_CC_DECOUPLING_CROSS_BEMF || c->foc_mtpa_mode > MTPA_MODE_IQ_MEASURED ||
+         c->foc_fw_current_max < 0.0f || c->foc_fw_current_max > FOC_MAX_CURRENT_A ||
+         c->foc_fw_duty_start < 0.0f || c->foc_fw_duty_start > 1.0f ||
+@@ -1786,7 +1792,7 @@
+         m->encoder.electrical_ratio = c->foc_encoder_ratio;
+         m->encoder.electrical_ratio_q16 = encoder_ratio_q16;
+         m->encoder.phase_per_count_q16 = (uint32_t)step_q16;
+-        m->foc_sensor_mode = encoder_ab ? FOC_SENSOR_MODE_ENCODER_AB : FOC_SENSOR_MODE_HALL;
++        m->foc_sensor_mode = encoder_ab ? FOC_SENSOR_MODE_ENCODER_AB : c->foc_sensor_mode;
+         m->sensor_request_mode = encoder_ab ? SENSOR_MODE_ENCODER : SENSOR_MODE_HALL;
+ 
+         if (encoder_ab) {
+@@ -1808,13 +1814,14 @@
+             if (m->foc_sensor_mode == FOC_SENSOR_MODE_HALL) motor_hall_edge_isr(m);
+         }
+     } else {
+-        m->foc_sensor_mode = FOC_SENSOR_MODE_HALL;
++        m->foc_sensor_mode = c->foc_sensor_mode;
+         m->sensor_mode = SENSOR_MODE_HALL;
+         m->sensor_request_mode = SENSOR_MODE_HALL;
+         motor_hw_configure_sensor(m, SENSOR_MODE_HALL);
+-        motor_hall_edge_isr(m);
++        if (m->foc_sensor_mode == FOC_SENSOR_MODE_HALL) motor_hall_edge_isr(m);
+     }
+     foc_precalc_values(m);
++    foc_observer_reset(m, m->observer_phase_u16);
+     mirror_from_runtime(m, &s_mcconf_mirror[m->id]);
+ }
+ unsigned mc_interface_calc_crc(mc_configuration*c,bool is_motor_2){(void)is_motor_2;if(!c)return 0;const uint8_t*p=(const uint8_t*)c;uint32_t crc=0xFFFFU;for(size_t i=0;i<sizeof(*c);i++){crc^=(uint32_t)p[i]<<8;for(int b=0;b<8;b++)crc=(crc&0x8000U)?((crc<<1)^0x1021U):(crc<<1);}return crc&0xFFFFU;}
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/motor/mcpwm_foc.c /mnt/data/vesc_part2_work/src/motor/mcpwm_foc.c
+--- /mnt/data/vesc_part2_pristine/src/motor/mcpwm_foc.c	2026-08-20 16:50:54.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/motor/mcpwm_foc.c	2026-08-22 12:53:35.712242396 +0000
+@@ -1226,6 +1226,18 @@
+     uint16_t du, dv, dw;
+     foc_svm_q15(v_alpha, v_beta, inv_vbus_q30, &du, &dv, &dw);
+ 
++    /* Sampling-window integrity instrumentation. This board has one shared
++       coherent current sample per PWM period, so reaching either 10/90% edge
++       is recorded rather than enabling unsafe V0/V7 or high-current retiming. */
++    uint16_t margin = (uint16_t)(du - PWM_MIN_DUTY_Q15);
++    uint16_t t = (uint16_t)(PWM_MAX_DUTY_Q15 - du); if (t < margin) margin = t;
++    t = (uint16_t)(dv - PWM_MIN_DUTY_Q15); if (t < margin) margin = t;
++    t = (uint16_t)(PWM_MAX_DUTY_Q15 - dv); if (t < margin) margin = t;
++    t = (uint16_t)(dw - PWM_MIN_DUTY_Q15); if (t < margin) margin = t;
++    t = (uint16_t)(PWM_MAX_DUTY_Q15 - dw); if (t < margin) margin = t;
++    if (margin < m->sampling_margin_min_q15) m->sampling_margin_min_q15 = margin;
++    if (margin == 0U && (v_alpha != 0 || v_beta != 0)) m->sampling_window_clamp_count++;
++
+     /* Reconstruct the voltage from the duties that will actually reach the
+        timers. This includes Batch-1 vector scaling for the 10..90% sampling
+        window. Apply VESC dead-time compensation to that applied-voltage model,
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/terminal.c /mnt/data/vesc_part2_work/src/terminal.c
+--- /mnt/data/vesc_part2_pristine/src/terminal.c	2026-08-20 16:47:22.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/terminal.c	2026-08-22 13:14:37.862369976 +0000
+@@ -11,7 +11,7 @@
+ #include <stdlib.h>
+ 
+ static void print_help(void) {
+-    commands_printf("VESC F103 terminal: help, faults, currents, foc, sensor, observer, timing, powerstage, config, integrity, stats, reset_stats, odometer, stop");
++    commands_printf("VESC F103 terminal: help, faults, currents, foc, sensor, observer [set N|sat N|speed N], timing, powerstage, config, integrity, stats, reset_stats, odometer, stop");
+ }
+ 
+ void terminal_process_string(char *str) {
+@@ -41,17 +41,71 @@
+         commands_printf("sensor=%d foc_sensor=%d hall=%u hall_valid=%d enc_cnt=%ld enc_sync=%d using_enc=%d",
+                 (int)m->sensor_mode,(int)m->foc_sensor_mode,(unsigned)m->hall.raw_state,m->hall.valid?1:0,
+                 (long)motor_encoder_extended_count(m),m->encoder.synced?1:0,m->using_encoder?1:0);
+-    } else if (strcmp(str, "observer") == 0) {
+-        commands_printf("obs_valid=%d obs_phase=%.2f pll_erpm=%.1f gain=%.1f slow=%.3f Rcfg=%.5f Rest=%.5f Rvalid=%d speed_src=%d",
+-                m->observer_valid?1:0,(double)(((float)m->observer_phase_u16*360.0f)/65536.0f),
++    } else if (strncmp(str, "observer", 8) == 0 && (str[8] == '\0' || str[8] == ' ' || str[8] == '\t')) {
++        char *arg = str + 8;
++        while (*arg == ' ' || *arg == '\t') arg++;
++        if (*arg != '\0') {
++            /* VESC 6.00 exposes observer IDs 0..3 in its native schema.
++             * Part 2 also implements the later MXV family (4..6), so expose a
++             * safe terminal path without changing the advertised wire ABI.
++             * Every change still goes through the canonical serializer, motor
++             * stopped check, apply path, CRC/transactional flash persistence. */
++            char *value_s = arg;
++            int field = 0; /* 1=type, 2=sat-comp, 3=speed-source */
++            if (strncmp(arg, "set", 3) == 0 && (arg[3] == ' ' || arg[3] == '\t')) {
++                field = 1; value_s = arg + 3;
++            } else if (strncmp(arg, "sat", 3) == 0 && (arg[3] == ' ' || arg[3] == '\t')) {
++                field = 2; value_s = arg + 3;
++            } else if (strncmp(arg, "speed", 5) == 0 && (arg[5] == ' ' || arg[5] == '\t')) {
++                field = 3; value_s = arg + 5;
++            }
++            while (*value_s == ' ' || *value_s == '\t') value_s++;
++            char *parse_end = value_s;
++            long value = strtol(value_s, &parse_end, 10);
++            while (*parse_end == ' ' || *parse_end == '\t') parse_end++;
++            bool range_ok = (field == 1 && value >= 0 && value <= 6) ||
++                            (field == 2 && value >= 0 && value <= 3) ||
++                            (field == 3 && value >= 0 && value <= 1);
++            if (field == 0 || value_s == parse_end || *parse_end != '\0' || !range_ok) {
++                commands_printf("usage: observer [set 0..6 | sat 0..3 | speed 0..1]");
++                return;
++            }
++            if (m->pwm_enabled || m->detect.busy) {
++                commands_printf("observer config rejected: stop motor/detect first");
++                return;
++            }
++            mc_configuration cfg;
++            conf_general_read_mc_configuration(&cfg, m->id == MOTOR_RIGHT);
++            if (field == 1) cfg.foc_observer_type = (mc_foc_observer_type)value;
++            if (field == 2) cfg.foc_sat_comp_mode = (SAT_COMP_MODE)value;
++            if (field == 3) cfg.foc_speed_source = (FOC_SPEED_SRC)value;
++            if (!conf_general_store_mc_configuration(&cfg, m->id == MOTOR_RIGHT)) {
++                commands_printf("observer config rejected by validation/store");
++                return;
++            }
++            m = mc_interface_motor_runtime_now();
++            commands_printf("observer config stored: motor=%d type=%d sat=%d speed_src=%d",
++                    mc_interface_get_motor_thread(), (int)m->foc_observer_type,
++                    (int)m->foc_sat_comp_mode, (int)m->foc_speed_source);
++            return;
++        }
++        commands_printf("obs_valid=%d type=%d sat=%d lambda=%.6f obs_phase=%.2f pll_erpm=%.1f gain=%.1f slow=%.3f Rcfg=%.5f Rest=%.5f Rvalid=%d speed_src=%d",
++                m->observer_valid?1:0,(int)m->foc_observer_type,(int)m->foc_sat_comp_mode,
++                (double)((float)m->observer_lambda_est_q30*(FOC_FLUX_Q_BASE_WB/1073741824.0f)),
++                (double)(((float)m->observer_phase_u16*360.0f)/65536.0f),
+                 (double)((float)m->pll_erpm_q16/65536.0f),(double)m->foc_observer_gain,
+                 (double)m->foc_observer_gain_slow,(double)m->foc_motor_r,(double)m->res_est_ohm,
+                 m->res_est_valid?1:0,(int)m->foc_speed_source);
+     } else if (strcmp(str, "timing") == 0) {
+-        commands_printf("FOC=%.0f Hz ISR_last=%.2f us ISR_max_cycles=%lu WDT=%d healthy=%d",
++        commands_printf("FOC=%.0f Hz ISR_last=%.2f us ISR_max_cycles=%lu samp_clamp=%lu samp_margin=%u WDT=%d healthy=%d badmask=0x%lx misses=%lu/%lu/%lu",
+                 (double)mc_interface_get_sampling_frequency_now(),
+                 (double)(mc_interface_get_last_inj_adc_isr_duration()*1.0e6f),
+-                (unsigned long)m->isr_max_cycles,timeout_watchdog_started()?1:0,timeout_watchdog_healthy()?1:0);
++                (unsigned long)m->isr_max_cycles,(unsigned long)m->sampling_window_clamp_count,
++                (unsigned)m->sampling_margin_min_q15,timeout_watchdog_started()?1:0,timeout_watchdog_healthy()?1:0,
++                (unsigned long)timeout_watchdog_unhealthy_mask(),
++                (unsigned long)timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_FOC),
++                (unsigned long)timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_MOTOR_SERVICE),
++                (unsigned long)timeout_watchdog_miss_count(TIMEOUT_HEARTBEAT_COMM));
+     } else if (strcmp(str, "powerstage") == 0) {
+         commands_printf("latch=0x%08lx pvd_low=%d brk1_en=%d brk8_en=%d short_ls=%d full_brake=%d",
+                 (unsigned long)motor_hw_powerstage_fault_flags(), motor_hw_pvd_low()?1:0,
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/timeout.c /mnt/data/vesc_part2_work/src/timeout.c
+--- /mnt/data/vesc_part2_pristine/src/timeout.c	2026-08-19 21:49:53.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/timeout.c	2026-08-22 12:53:35.712383145 +0000
+@@ -15,6 +15,8 @@
+ static volatile uint32_t s_reset_flags = 0U;
+ static volatile uint32_t s_hb[TIMEOUT_HEARTBEAT_COUNT] = {0U, 0U, 0U};
+ static uint32_t s_hb_last[TIMEOUT_HEARTBEAT_COUNT] = {0U, 0U, 0U};
++static volatile uint32_t s_hb_miss[TIMEOUT_HEARTBEAT_COUNT] = {0U, 0U, 0U};
++static volatile uint32_t s_unhealthy_mask = 0U;
+ static volatile uint32_t s_required_mask =
+     (1UL << TIMEOUT_HEARTBEAT_MOTOR_SERVICE) |
+     (1UL << TIMEOUT_HEARTBEAT_COMM);
+@@ -62,7 +64,9 @@
+     for (uint32_t i = 0U; i < TIMEOUT_HEARTBEAT_COUNT; i++) {
+         s_hb[i] = 0U;
+         s_hb_last[i] = 0U;
++        s_hb_miss[i] = 0U;
+     }
++    s_unhealthy_mask = 0U;
+     s_health_window_start_ms = s_last_update_ms;
+     s_watchdog_grace_until_ms = s_last_update_ms + WATCHDOG_START_GRACE_MS;
+     return true;
+@@ -171,13 +175,17 @@
+      * cannot execute this function at all, so it naturally stops feeding. */
+     if ((uint32_t)(now - s_health_window_start_ms) >= WATCHDOG_HEALTH_WINDOW_MS) {
+         uint32_t required = s_required_mask;
+-        bool healthy = true;
++        uint32_t unhealthy = 0U;
+         for (uint32_t i = 0U; i < TIMEOUT_HEARTBEAT_COUNT; i++) {
+             uint32_t cur = s_hb[i];
+-            if ((required & (1UL << i)) != 0U && cur == s_hb_last[i]) healthy = false;
++            if ((required & (1UL << i)) != 0U && cur == s_hb_last[i]) {
++                unhealthy |= 1UL << i;
++                s_hb_miss[i]++;
++            }
+             s_hb_last[i] = cur;
+         }
+-        s_watchdog_healthy = healthy;
++        s_unhealthy_mask = unhealthy;
++        s_watchdog_healthy = unhealthy == 0U;
+         s_health_window_start_ms = now;
+     }
+ 
+@@ -187,6 +195,10 @@
+ bool timeout_watchdog_started(void) { return s_watchdog_started; }
+ bool timeout_watchdog_healthy(void) { return s_watchdog_healthy; }
+ uint32_t timeout_watchdog_required_mask(void) { return s_required_mask; }
++uint32_t timeout_watchdog_unhealthy_mask(void) { return s_unhealthy_mask; }
++uint32_t timeout_watchdog_miss_count(timeout_heartbeat_id_t id) {
++    return ((uint32_t)id < TIMEOUT_HEARTBEAT_COUNT) ? s_hb_miss[(uint32_t)id] : 0U;
++}
+ uint32_t timeout_heartbeat_count(timeout_heartbeat_id_t id) {
+     return ((uint32_t)id < TIMEOUT_HEARTBEAT_COUNT) ? s_hb[(uint32_t)id] : 0U;
+ }
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/src/timeout.h /mnt/data/vesc_part2_work/src/timeout.h
+--- /mnt/data/vesc_part2_pristine/src/timeout.h	2026-08-19 21:44:31.000000000 +0000
++++ /mnt/data/vesc_part2_work/src/timeout.h	2026-08-22 12:53:35.712322996 +0000
+@@ -33,4 +33,6 @@
+ bool timeout_watchdog_started(void);
+ bool timeout_watchdog_healthy(void);
+ uint32_t timeout_watchdog_required_mask(void);
++uint32_t timeout_watchdog_unhealthy_mask(void);
++uint32_t timeout_watchdog_miss_count(timeout_heartbeat_id_t id);
+ uint32_t timeout_heartbeat_count(timeout_heartbeat_id_t id);
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/debug.py /mnt/data/vesc_part2_work/tools/debug.py
+--- /mnt/data/vesc_part2_pristine/tools/debug.py	2026-08-20 16:50:36.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/debug.py	2026-08-22 12:55:15.849023196 +0000
+@@ -692,6 +692,11 @@
+             if len(p)-r.i >= 16:
+                 d['watchdog_required_mask']=r.u32()
+                 d['heartbeat_foc']=r.u32(); d['heartbeat_motor_service']=r.u32(); d['heartbeat_comm']=r.u32()
++            if revision >= 10 and len(p)-r.i >= 28:
++                d['watchdog_unhealthy_mask']=r.u32()
++                d['watchdog_miss_foc']=r.u32(); d['watchdog_miss_motor_service']=r.u32(); d['watchdog_miss_comm']=r.u32()
++                d['sample_clamp_left']=r.u32(); d['sample_clamp_right']=r.u32()
++                d['sample_margin_left_q15']=r.u16(); d['sample_margin_right_q15']=r.u16()
+     elif revision >= 5:
+         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames','tx_ring_overruns','tx_complete_count','blocking_busy_drops','baud']
+         for name in names: d[name]=r.u32()
+@@ -1530,7 +1535,20 @@
+     assert dd9['config_integrity_ok'] and dd9['config_integrity_checks']==41 and dd9['config_integrity_failures']==42
+     assert dd9['power_hold'] and not dd9['shutdown_latched'] and dd9['heartbeat_comm']==54
+ 
+-    print("SELF-TEST PASS: CRC, framing, VESC-6.00 FW/config parser, VESC Tool local-ID2 scan + motor-2 forwarding, sample parser, EXT-v6 phase/dq telemetry, COMM_DIAG-v9, sensor/observer diagnostics, standard Hall/encoder detect ABI")
++    d10=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,10))
++    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d10 += struct.pack(">I",v)
++    d10 += bytes((2,1,1))
++    for v in (31,32,33,34,35): d10 += struct.pack(">I",v)
++    d10 += bytes((1,1,1,1)); d10 += struct.pack(">II",41,42); d10 += bytes((1,0))
++    for v in (51,52,53,54): d10 += struct.pack(">I",v)
++    for v in (61,62,63,64,65,66): d10 += struct.pack(">I",v)
++    d10 += struct.pack(">HH",777,888)
++    dd10=parse_comm_diag(bytes(d10))
++    assert dd10['watchdog_unhealthy_mask']==61 and dd10['watchdog_miss_comm']==64
++    assert dd10['sample_clamp_left']==65 and dd10['sample_clamp_right']==66
++    assert dd10['sample_margin_left_q15']==777 and dd10['sample_margin_right_q15']==888
++
++    print("SELF-TEST PASS: CRC, framing, VESC-6.00 FW/config parser, VESC Tool local-ID2 scan + motor-2 forwarding, sample parser, EXT-v6 phase/dq telemetry, COMM_DIAG-v10, sensor/observer diagnostics, standard Hall/encoder detect ABI")
+     return 0
+ 
+ def add_live_args(p: argparse.ArgumentParser) -> None:
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_batch10_part2.py /mnt/data/vesc_part2_work/tools/test_batch10_part2.py
+--- /mnt/data/vesc_part2_pristine/tools/test_batch10_part2.py	2026-08-20 15:36:23.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_batch10_part2.py	2026-08-22 12:58:44.041058490 +0000
+@@ -12,8 +12,10 @@
+ conf=read('src/confgenerator.c'); defs=read('src/motor/mcconf_default.h'); term=read('src/terminal.c')
+ 
+ ok('FOC_SPEED_SRC_CORRECTED' in dt and 'FOC_SPEED_SRC_OBSERVER' in dt, 'FOC speed phase-source enum exists')
+-ok('foc_speed_source=MCCONF_FOC_SPEED_SOURCE_DEFAULT' in conf, 'VESC6 decode defaults FOC speed source to corrected')
+-ok('if(conf->foc_speed_source!=MCCONF_FOC_SPEED_SOURCE_DEFAULT)return -1;' in conf, 'VESC6 serializer refuses fake persistence of newer FOC speed source')
++ok('c->foc_speed_source=(FOC_SPEED_SRC)w[VESC6_MC_OFF_FOC_SPEED_SOURCE]' in conf, 'VESC6 byte 314 decodes the canonical FOC speed source')
++ok('w[VESC6_MC_OFF_FOC_SPEED_SOURCE]=(uint8_t)c->foc_speed_source' in conf and
++   'if (i == VESC6_MC_OFF_FOC_SPEED_SOURCE) return true;' in conf,
++   'VESC6 FOC speed source is writable and persistent rather than fake runtime-only state')
+ ok('speed_phase = observer_phase_compensated_u16(m)' in foc, 'observer phase can source PLL/fast estimator')
+ ok('speed_est_fast_corrected_erpm_q16' in foc and 'phase_before_speed_est_corrected_u16' in foc, 'corrected fast speed remains available independently')
+ 
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_batch11_part1.py /mnt/data/vesc_part2_work/tools/test_batch11_part1.py
+--- /mnt/data/vesc_part2_pristine/tools/test_batch11_part1.py	2026-08-22 12:36:44.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_batch11_part1.py	2026-08-22 12:55:15.849342971 +0000
+@@ -23,7 +23,7 @@
+ port = read('PORTING_NOTES.md')
+ 
+ # ---- Identity and VESC Tool dual-controller basics ----
+-ok('vesc-f103-hoverboard-v27-part1' in cmd, 'Part-1 FW identity is v27-part1 while preserving VESC6 protocol target')
++ok(('vesc-f103-hoverboard-v27-part1' in cmd or 'vesc-f103-hoverboard-v28-part2' in cmd), 'firmware identity is Part-1 or later while preserving VESC6 protocol target')
+ ok('uint8_t p[2] = {COMM_PING_CAN, VESC_LOCAL_MOTOR2_FORWARD_ID};' in cmd, 'direct VESC Tool scan advertises local Motor-2 ID')
+ ok('sv->num_vescs' in cmd and 'p[(*i)++] = sv->num_vescs' in cmd, 'setup telemetry carries VESC count')
+ ok('controller_id' in cmd and 'p[(*i)++] = t->controller_id' in cmd, 'standard telemetry carries selected controller ID')
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_batch11_part2.py /mnt/data/vesc_part2_work/tools/test_batch11_part2.py
+--- /mnt/data/vesc_part2_pristine/tools/test_batch11_part2.py	2026-08-22 12:35:12.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_batch11_part2.py	2026-08-22 12:55:15.849500015 +0000
+@@ -12,7 +12,7 @@
+ status=read('src/status_io.c'); statush=read('src/status_io.h'); tasks=read('src/motor_tasks.c')
+ cfg=read('src/confgenerator.c'); dt=read('src/datatypes.h'); term=read('src/terminal.c')
+ 
+-ok('vesc-f103-hoverboard-v27-part1' in cmd, 'Part-1 FW identity is v27-part1 while protocol remains VESC6')
++ok(('vesc-f103-hoverboard-v27-part1' in cmd or 'vesc-f103-hoverboard-v28-part2' in cmd), 'firmware identity is Part-1 or later while protocol remains VESC6')
+ ok('case COMM_SET_BATTERY_CUT:' in cmd and 'case COMM_GET_BATTERY_CUT:' in cmd, 'VESC battery-cut SET/GET commands are implemented')
+ ok('return len == 11U;' in cmd and 'forward_all' in cmd, 'battery-cut payload length and forward-all flag follow VESC command format')
+ ok('battery_cut_apply_both' in cmd and 'conf_general_store_all()' in cmd, 'forward-all battery cut applies local M1+M2 with one transactional store')
+@@ -51,7 +51,7 @@
+    'persistent config corruption fault cannot be cleared while integrity remains bad')
+ ok('MOTOR_FAULT_FLASH_CONFIG' in tasks, 'flash integrity fault participates in canonical LED+buzzer fault reporting')
+ ok('s_integrity_fault=false;s_save_count=s_stage.h.sequence' in conf, 'a verified replacement record can repair the integrity latch before fault clear')
+-ok('diag_revision' not in cmd or '9U' in cmd, 'custom communications diagnostics are revisioned for new integrity/power fields')
++ok('p[i++] = 10U' in cmd, 'custom communications diagnostics are revisioned through Part-2 watchdog/sampling fields')
+ ok('conf_general_integrity_ok()' in cmd and 'status_io_power_is_held()' in cmd, 'communications diagnostics expose integrity and power-latch status')
+ ok('strcmp(str, "integrity")' in term, 'terminal exposes config integrity counters')
+ 
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_batch3.py /mnt/data/vesc_part2_work/tools/test_batch3.py
+--- /mnt/data/vesc_part2_pristine/tools/test_batch3.py	2026-08-19 20:23:30.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_batch3.py	2026-08-22 12:52:40.981922661 +0000
+@@ -99,10 +99,10 @@
+ 
+ # Observer correction remains fixed-point in the hard ISR.
+ obs_body = function_body(foc, "void foc_observer_update_fixed")
+-req("observer_gamma_coeff_q30" in obs_body and "err_sq_q30" in obs_body,
++req("observer_gamma_coeff_q30" in obs_body and "flux_mag_sq_q30" in obs_body,
+     "fixed observer applies Ortega magnitude correction using Q30 coefficients")
+-req("if (err_sq_q30 > 0) err_sq_q30 = 0;" in obs_body,
+-    "Ortega original correction clamps positive lambda error to zero")
++req("if (err > 0) err = 0;" in obs_body,
++    "Ortega correction clamps positive lambda error to zero")
+ req("grow_q15 = 36045" in obs_body and "observer_flux_target_q30 / 2" in obs_body,
+     "observer state has the VESC-style low-flux anti-collapse safeguard")
+ 
+@@ -110,7 +110,7 @@
+ slow_body = function_body(foc, "void foc_observer_update_1khz")
+ req("m->foc_motor_ld_lq_diff * (iq * iq / i2)" in slow_body,
+     "observer effective inductance includes Ld-Lq saliency correction")
+-req("m->foc_sat_comp_mode == SAT_COMP_FACTOR" in slow_body and
++req("case SAT_COMP_FACTOR:" in slow_body and
+     "l_eff *= (1.0f - comp);" in slow_body and "flux_eff *= (1.0f - comp);" in slow_body,
+     "SAT_COMP_FACTOR reduces both effective L and flux linkage")
+ req("fabsf(m->duty_now) * vbus / 40.0f" in slow_body and
+@@ -122,10 +122,11 @@
+     "VESC6 PLL Kp/Ki wire fields are runtime-writable")
+ req("if (byte_in_range(i, 177U, 8U)) return true" in conf,
+     "VESC6 observer gain/slow-gain wire fields are runtime-writable")
+-req("VESC6_MC_OFF_FOC_SAT_COMP_MODE" in conf and "SAT_COMP_FACTOR" in conf,
+-    "VESC6 saturation-factor configuration has a real backend")
+-req("observer_type != FOC_OBSERVER_ORTEGA_ORIGINAL" in conf,
+-    "unsupported VESC observer types are rejected instead of silently mapped")
++req("VESC6_MC_OFF_FOC_SAT_COMP_MODE" in conf and "SAT_COMP_LAMBDA_AND_FACTOR" in conf,
++    "VESC6 saturation-compensation configuration has a real backend")
++req("observer_type > FOC_OBSERVER_MXV_LAMBDA_COMP_LIN" in conf and
++    "VESC6_MC_OFF_FOC_OBSERVER_TYPE) return true" in conf,
++    "all implemented VESC observer types are range-checked and writable")
+ req("legacy_gain - 1000.0f" in conf and "legacy_slow - 1000.0f" in conf,
+     "Batch-2 observer placeholder defaults are migrated on flash import")
+ 
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_batch4.py /mnt/data/vesc_part2_work/tools/test_batch4.py
+--- /mnt/data/vesc_part2_pristine/tools/test_batch4.py	2026-08-20 16:51:13.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_batch4.py	2026-08-22 12:55:15.849733963 +0000
+@@ -92,7 +92,7 @@
+     'watchdog model rejects a stalled communication heartbeat')
+ 
+ # Custom comm diagnostic must expose DMA + reset/watchdog status without changing VESC6 ABI.
+-req(('CUSTOM_COMM_DIAG; p[i++] = 8U' in commands or 'CUSTOM_COMM_DIAG; p[i++] = 9U' in commands) and
++req(any(x in commands for x in ['CUSTOM_COMM_DIAG; p[i++] = 8U','CUSTOM_COMM_DIAG; p[i++] = 9U','CUSTOM_COMM_DIAG; p[i++] = 10U']) and
+     'timeout_get_reset_flags()' in commands and 'u->rx_dma_irq_count' in commands,
+     'custom communication diagnostics expose DMA and reset/watchdog state')
+ 
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_part1_sensorless_autodetect.py /mnt/data/vesc_part2_work/tools/test_part1_sensorless_autodetect.py
+--- /mnt/data/vesc_part2_pristine/tools/test_part1_sensorless_autodetect.py	2026-08-22 12:35:26.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_part1_sensorless_autodetect.py	2026-08-22 12:55:15.849623338 +0000
+@@ -71,8 +71,8 @@
+ ok('openloop_erpm_now != 0.0f' in sb and
+    '((m->openloop_erpm_now > 0.0f) != (dir > 0))' in sb,
+    'sensorless command reversal re-arms startup alignment')
+-ok('vesc-f103-hoverboard-v27-part1' in cmd,
+-   'firmware identity distinguishes Part-1 while VESC wire ABI stays 6.00')
++ok(('vesc-f103-hoverboard-v27-part1' in cmd or 'vesc-f103-hoverboard-v28-part2' in cmd),
++   'firmware identity distinguishes Part-1 or later while VESC wire ABI stays 6.00')
+ 
+ # Fault status and gate contract remain safe.
+ ok('MOTOR_FAULT_COMMAND_TIMEOUT' not in re.search(r'static motor_fault_t audible_fault\(void\).*?\n\}',tasks,re.S).group(0),
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_part2_modern_observers.py /mnt/data/vesc_part2_work/tools/test_part2_modern_observers.py
+--- /mnt/data/vesc_part2_pristine/tools/test_part2_modern_observers.py	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_part2_modern_observers.py	2026-08-22 13:15:02.538216252 +0000
+@@ -0,0 +1,97 @@
++#!/usr/bin/env python3
++from pathlib import Path
++import re, subprocess, sys
++ROOT=Path(__file__).resolve().parents[1]
++def t(p): return (ROOT/p).read_text(errors='replace')
++def ok(c,m):
++    if not c:
++        print('FAIL:',m); sys.exit(1)
++    print('PASS:',m)
++
++dt=t('src/datatypes.h'); fm=t('src/motor/foc_math.c'); cfg=t('src/confgenerator.c')
++mc=t('src/motor/mc_interface.c'); foc=t('src/motor/mcpwm_foc.c')
++timeout=t('src/timeout.c'); timeh=t('src/timeout.h'); term=t('src/terminal.c')
++cmd=t('src/comm/commands.c'); hw=t('src/hwconf/hw.c'); dbg=t('tools/debug.py')
++
++# All non-HFI VESC observer families are executable, not enum-only placeholders.
++for name in ['FOC_OBSERVER_ORTEGA_ORIGINAL','FOC_OBSERVER_MXLEMMING','FOC_OBSERVER_ORTEGA_LAMBDA_COMP',
++             'FOC_OBSERVER_MXLEMMING_LAMBDA_COMP','FOC_OBSERVER_MXV','FOC_OBSERVER_MXV_LAMBDA_COMP',
++             'FOC_OBSERVER_MXV_LAMBDA_COMP_LIN']:
++    ok(name in dt and ('case '+name) in fm, name+' has a fixed-point execution branch')
++ok('observer_lambda_est_q30' in dt and 'observer_i_alpha_last_q15' in dt and 'observer_i_beta_last_q15' in dt,
++   'observer runtime carries adaptive-lambda and previous-current state')
++ok('David Molony' in fm and 'MESC' in fm, 'MXLEMMING attribution is preserved')
++body=re.search(r'void foc_observer_update_fixed\(.*?\n\}',fm,re.S)
++ok(body is not None,'fixed observer update body found')
++for tok in ['sqrtf(','sinf(','cosf(','atan2f(','powf(','double ']:
++    ok(tok not in body.group(0), 'hard observer update avoids '+tok.strip())
++ok('lambda_adapt_nonlinear_q30' in fm and 'lambda_clamp_q30' in fm,
++   'lambda-comp observers use bounded adaptive flux estimate')
++
++# Observer and sat-comp choices are persistent through the existing VESC6 wire ABI.
++ok('i == VESC6_MC_OFF_FOC_OBSERVER_TYPE' in cfg, 'observer type byte is runtime-mutable/persistent')
++ok('observer_type > FOC_OBSERVER_MXV_LAMBDA_COMP_LIN' in cfg, 'wire validator accepts all implemented observer types')
++ok('sat_comp_mode > SAT_COMP_LAMBDA_AND_FACTOR' in cfg, 'all implemented saturation compensation modes validate')
++ok('c->foc_speed_source=(FOC_SPEED_SRC)w[VESC6_MC_OFF_FOC_SPEED_SOURCE]' in cfg and
++   'w[VESC6_MC_OFF_FOC_SPEED_SOURCE]=(uint8_t)c->foc_speed_source' in cfg,
++   'canonical VESC6 FOC speed-source byte 314 now round-trips and persists')
++
++# Do not fake unsupported dynamic sampling on this shared ADC topology.
++ok('sample_v0_v7 || sample_high_current' in cfg and 'return false' in cfg,
++   'unsupported V0/V7/high-current sampling requests are explicitly rejected')
++ok('sampling_window_clamp_count' in dt and 'sampling_margin_min_q15' in dt,
++   'safe fixed sampling window is instrumented at runtime')
++ok('PWM_MIN_DUTY_Q15' in foc and 'PWM_MAX_DUTY_Q15' in foc and 'sampling_window_clamp_count' in foc,
++   'FOC ISR records approach to the hardware-qualified 10-90% sampling window')
++
++# Typed and wire configuration paths agree on Part-1 sensor policy.
++ok('const bool sensorless = c->foc_sensor_mode == FOC_SENSOR_MODE_SENSORLESS;' in mc and
++   'if ((!sensorless && c->foc_sensor_mode != FOC_SENSOR_MODE_HALL) || encoder_ab' in mc,
++   'typed config preserves sensorless and still rejects RIGHT physical encoder')
++ok('m->foc_sensor_mode = encoder_ab ? FOC_SENSOR_MODE_ENCODER_AB : c->foc_sensor_mode;' in mc and
++   'm->foc_sensor_mode = c->foc_sensor_mode;' in mc,
++   'typed apply no longer silently forces sensorless to Hall')
++
++# Watchdog diagnostics retain conservative IWDG timing but make missed owners observable.
++ok('timeout_watchdog_unhealthy_mask' in timeh and 'timeout_watchdog_miss_count' in timeh,
++   'watchdog exposes unhealthy-owner mask and miss counters')
++ok('s_unhealthy_mask' in timeout and 's_hb_miss' in timeout,
++   'watchdog records per-owner missed heartbeat windows')
++ok('watchdog_unhealthy_mask' in dbg and 'sample_margin_left_q15' in dbg,
++   'debug tool decodes Part-2 watchdog and sampling diagnostics')
++ok('p[i++] = 10U;' in cmd, 'custom diagnostic protocol revision is 10')
++ok('vesc-f103-hoverboard-v28-part2' in cmd, 'Part-2 firmware identity is explicit')
++
++# MXV 4..6 are later-than-VESC6 backend extensions. They remain selectable
++# safely from VESC Tool's terminal while the advertised MCCONF ABI stays 6.00.
++ok('observer [set N|sat N|speed N]' in term and 'set 0..6 | sat 0..3 | speed 0..1' in term,
++   'terminal exposes safe observer/saturation/speed-source tuning commands')
++ok('m->pwm_enabled || m->detect.busy' in term and 'conf_general_store_mc_configuration' in term,
++   'terminal tuning requires a stopped motor and uses canonical validated transactional config path')
++ok('value >= 0 && value <= 6' in term and 'value >= 0 && value <= 3' in term and
++   'value >= 0 && value <= 1' in term,
++   'terminal observer/saturation/speed-source ranges are bounded')
++
++# Safety/hardware invariants remain untouched.
++ok('oc.OCPolarity = TIM_OCPOLARITY_HIGH;' in hw, 'high-side PWM remains active HIGH')
++ok('oc.OCNPolarity = TIM_OCNPOLARITY_LOW;' in hw, 'low-side complementary PWM remains active LOW')
++combined='\n'.join([dt,fm,cfg,mc,foc,timeout,term,cmd,hw]).lower()
++for token in ['#include "comm_can.h"','#include "imu/','#include "bms/','#include "bm_if','#include "nrf',
++              '#include "ledpwm','#include "comm_usb','#include "qml','#include "lispif','#include "lzo']:
++    ok(token not in combined,'excluded subsystem not introduced: '+token)
++
++# Strict host syntax/warnings for all portable Part-2 touched units.
++incs=['-Itools/host_stubs','-Isrc','-Isrc/motor','-Isrc/hwconf','-Isrc/encoder','-Isrc/util','-Isrc/applications','-Isrc/comm']
++base=['gcc','-std=c11','-Wall','-Wextra','-Wshadow','-Wdouble-promotion','-Wformat=2','-Werror']
++for unit,extra in [('src/motor/foc_math.c',[]),('src/motor/mc_interface.c',[]),
++                   ('src/motor/mcpwm_foc.c',['-DDMA1_Channel1=DMA2_Channel5']),('src/confgenerator.c',[]),
++                   ('src/terminal.c',[])]:
++    cp=subprocess.run(base+incs+extra+['-fsyntax-only',unit],cwd=ROOT,text=True,capture_output=True)
++    if cp.returncode:
++        print(cp.stdout,cp.stderr); sys.exit(cp.returncode)
++    ok(True,unit+' passes strict host syntax/warning check')
++cp=subprocess.run([sys.executable,'tools/debug.py','--self-test'],cwd=ROOT,text=True,capture_output=True)
++if cp.returncode:
++    print(cp.stdout,cp.stderr); sys.exit(cp.returncode)
++ok('COMM_DIAG-v10' in cp.stdout,'debug.py self-test validates COMM_DIAG revision 10')
++print('ALL PART-2 MODERN-OBSERVER/HARDENING REGRESSIONS: PASS')
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_part2_observer_runtime.c /mnt/data/vesc_part2_work/tools/test_part2_observer_runtime.c
+--- /mnt/data/vesc_part2_pristine/tools/test_part2_observer_runtime.c	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_part2_observer_runtime.c	2026-08-22 13:11:25.419130009 +0000
+@@ -0,0 +1,138 @@
++#include <stdio.h>
++#include <string.h>
++#include <math.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include "datatypes.h"
++#include "motor/foc_math.h"
++#include "applications/appconf_default.h"
++
++/* Host symbols required by the STM32 stubs. */
++TIM_TypeDef _stub_tim1, _stub_tim8;
++DMA_Channel_TypeDef _stub_dma2_ch5;
++DWT_Type _stub_dwt;
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++static int32_t volt_to_q15(float v) {
++    float q = v / FOC_VOLTAGE_Q_BASE_V * 32768.0f;
++    if (q > 32767.0f) q = 32767.0f;
++    if (q < -32768.0f) q = -32768.0f;
++    return (int32_t)lrintf(q);
++}
++
++static int32_t amp_to_q15(float a) {
++    float q = a / FOC_CURRENT_Q_BASE_A * 32768.0f;
++    if (q > 32767.0f) q = 32767.0f;
++    if (q < -32768.0f) q = -32768.0f;
++    return (int32_t)lrintf(q);
++}
++
++static float phase_error_deg(uint16_t estimate, float theta) {
++    float wrapped = fmodf(theta, 2.0f * (float)M_PI);
++    if (wrapped < 0.0f) wrapped += 2.0f * (float)M_PI;
++    const uint16_t truth = (uint16_t)lrintf(wrapped * (65536.0f / (2.0f * (float)M_PI)));
++    const int16_t delta = (int16_t)(truth - estimate);
++    return fabsf((float)delta * (360.0f / 65536.0f));
++}
++
++static bool lambda_type(int type) {
++    return type == FOC_OBSERVER_ORTEGA_LAMBDA_COMP ||
++           type == FOC_OBSERVER_MXLEMMING_LAMBDA_COMP ||
++           type == FOC_OBSERVER_MXV_LAMBDA_COMP ||
++           type == FOC_OBSERVER_MXV_LAMBDA_COMP_LIN;
++}
++
++static int run_case(int type, float erpm, float iq_a) {
++    const float flux = 0.012f;
++    const float r = 0.10f;
++    const float l = 0.00020f;
++    const float dt = FOC_DT_S;
++    const float omega = erpm * (2.0f * (float)M_PI / 60.0f);
++    const float dtheta = omega * dt;
++
++    MotorRuntime m;
++    memset(&m, 0, sizeof(m));
++    m.foc_motor_r = r;
++    m.foc_motor_l = l;
++    m.foc_motor_ld_lq_diff = 0.0f;
++    m.foc_motor_flux_linkage = flux;
++    m.foc_observer_gain = 2000.0f;
++    m.foc_observer_gain_slow = 0.10f;
++    m.foc_pll_kp = 1000.0f;
++    m.foc_pll_ki = 50000.0f;
++    m.foc_sl_erpm_start = 100.0f;
++    m.foc_sl_erpm = 800.0f;
++    m.current_max_a = 30.0f;
++    m.foc_observer_type = (mc_foc_observer_type)type;
++    foc_observer_reset(&m, 0U);
++
++    float theta_prev = 0.0f;
++    float ia_prev = 0.0f;
++    float ib_prev = iq_a;
++    float psi_a_prev = flux + l * ia_prev;
++    float psi_b_prev = l * ib_prev;
++
++    /* Reset assumes zero current. Give the observer one coherent initial sample
++       at theta=0 before entering the trajectory so L*i state has a causal start. */
++    foc_observer_update_fixed(&m, volt_to_q15(r * ia_prev), volt_to_q15(r * ib_prev),
++                              amp_to_q15(ia_prev), amp_to_q15(ib_prev));
++
++    for (int k = 1; k <= 4000; k++) {
++        const float theta = dtheta * (float)k;
++        const float c = cosf(theta);
++        const float s = sinf(theta);
++        /* q-axis current rotating with the rotor. */
++        const float ia = -iq_a * s;
++        const float ib =  iq_a * c;
++        const float psi_a = flux * c + l * ia;
++        const float psi_b = flux * s + l * ib;
++        /* PMSM alpha/beta voltage equation: v = R*i + d(psi_s)/dt. */
++        const float va = r * ia + (psi_a - psi_a_prev) / dt;
++        const float vb = r * ib + (psi_b - psi_b_prev) / dt;
++        foc_observer_update_fixed(&m, volt_to_q15(va), volt_to_q15(vb),
++                                  amp_to_q15(ia), amp_to_q15(ib));
++        ia_prev = ia;
++        ib_prev = ib;
++        psi_a_prev = psi_a;
++        psi_b_prev = psi_b;
++        theta_prev = theta;
++    }
++
++    const float err = phase_error_deg(m.observer_phase_u16, theta_prev);
++    const float lam = (float)m.observer_lambda_est_q30 *
++                      (FOC_FLUX_Q_BASE_WB / 1073741824.0f);
++    const float fa = (float)m.observer_rotor_flux_alpha_q30 *
++                     (FOC_FLUX_Q_BASE_WB / 1073741824.0f);
++    const float fb = (float)m.observer_rotor_flux_beta_q30 *
++                     (FOC_FLUX_Q_BASE_WB / 1073741824.0f);
++    const float mag = sqrtf(fa * fa + fb * fb);
++
++    printf("observer=%d erpm=%+.0f iq=%+.1f err_deg=%.3f flux=%.6f lambda=%.6f valid=%d\n",
++           type, (double)erpm, (double)iq_a, (double)err,
++           (double)mag, (double)lam, m.observer_valid ? 1 : 0);
++
++    if (!isfinite(err) || err > 5.0f) return 1;
++    if (!isfinite(mag) || mag < flux * 0.25f || mag > flux * 3.0f) return 1;
++    if (lambda_type(type) &&
++        (!isfinite(lam) || lam < flux * 0.30f || lam > flux * 2.50f)) return 1;
++    return 0;
++}
++
++int main(void) {
++    int failures = 0;
++    for (int type = FOC_OBSERVER_ORTEGA_ORIGINAL;
++         type <= FOC_OBSERVER_MXV_LAMBDA_COMP_LIN; type++) {
++        failures += run_case(type, 3000.0f, 0.0f);
++        failures += run_case(type, 3000.0f, 4.0f);
++        failures += run_case(type, -2500.0f, -3.0f);
++    }
++    if (failures != 0) {
++        fprintf(stderr, "observer runtime failures=%d\n", failures);
++        return 1;
++    }
++    puts("ALL OBSERVER RUNTIME TRAJECTORIES: PASS");
++    return 0;
++}
+diff -ruN '--exclude=PART2_*' /mnt/data/vesc_part2_pristine/tools/test_part2_observer_runtime.py /mnt/data/vesc_part2_work/tools/test_part2_observer_runtime.py
+--- /mnt/data/vesc_part2_pristine/tools/test_part2_observer_runtime.py	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/vesc_part2_work/tools/test_part2_observer_runtime.py	2026-08-22 13:11:25.419870495 +0000
+@@ -0,0 +1,35 @@
++#!/usr/bin/env python3
++from pathlib import Path
++import shutil, subprocess, tempfile, sys
++
++ROOT = Path(__file__).resolve().parents[1]
++gcc = shutil.which("gcc")
++if not gcc:
++    raise SystemExit("gcc is required for Part-2 observer runtime regression")
++incs = ["-Itools/host_stubs", "-Isrc", "-Isrc/motor", "-Isrc/hwconf", "-Isrc/encoder",
++        "-Isrc/util", "-Isrc/applications", "-Isrc/comm"]
++common = [gcc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
++          "-ffunction-sections", "-fdata-sections"] + incs
++with tempfile.TemporaryDirectory(prefix="vesc_obs_rt_") as td:
++    td = Path(td)
++    foc_o = td / "foc_math.o"
++    test_o = td / "test.o"
++    exe = td / "observer_runtime"
++    for src, out in [("src/motor/foc_math.c", foc_o), ("tools/test_part2_observer_runtime.c", test_o)]:
++        cp = subprocess.run(common + ["-c", src, "-o", str(out)], cwd=ROOT, text=True,
++                            capture_output=True)
++        if cp.returncode:
++            print(cp.stdout, cp.stderr)
++            raise SystemExit(cp.returncode)
++    cp = subprocess.run([gcc, "-Wl,--gc-sections", str(test_o), str(foc_o), "-lm", "-o", str(exe)],
++                        cwd=ROOT, text=True, capture_output=True)
++    if cp.returncode:
++        print(cp.stdout, cp.stderr)
++        raise SystemExit(cp.returncode)
++    cp = subprocess.run([str(exe)], cwd=ROOT, text=True, capture_output=True)
++    print(cp.stdout, end="")
++    if cp.stderr:
++        print(cp.stderr, file=sys.stderr, end="")
++    if cp.returncode:
++        raise SystemExit(cp.returncode)
++print("PASS: actual fixed-point C observer runtime tracks synthetic PMSM flux trajectories")

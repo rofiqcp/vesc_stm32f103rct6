@@ -11,7 +11,8 @@ def ok(c,msg):
 hw=read('src/hwconf/hw.c'); hwh=read('src/hwconf/hw_hoverboard.h')
 irq=read('src/stm32f1xx_it.c'); foc=read('src/motor/mcpwm_foc.c')
 dt=read('src/datatypes.h'); mc=read('src/motor/mc_interface.c')
-mt=read('src/motor_tasks.c'); cg=read('src/confgenerator.c')
+mt=read('src/motor/mc_interface_tasks.c'); status=read('src/hwconf/hw_status.c')
+cg=read('src/confgenerator.c')
 defs=read('src/motor/mcconf_default.h'); term=read('src/terminal.c')
 pio=read('platformio.ini')
 
@@ -51,7 +52,7 @@ ok('TIM1_BRK_IRQHandler' in irq and 'TIM8_BRK_IRQHandler' in irq and
    'TIM1/TIM8 Break IRQs latch/report the asynchronous hardware shutdown')
 ok('MOTOR_FAULT_BREAK' in dt and 'FAULT_CODE_BRK' in mc and 'FAULT_CODE_MCU_UNDER_VOLTAGE' in mc,
    'new local power-stage faults map explicitly to canonical VESC fault codes')
-ok('MOTOR_FAULT_BREAK, MOTOR_FAULT_MCU_UNDER_VOLTAGE' in mt,
+ok('MOTOR_FAULT_BREAK' in status and 'MOTOR_FAULT_MCU_UNDER_VOLTAGE' in status,
    'status/fault diagnostics prioritize the new reset-latched power-stage faults')
 
 # VESC-style low-side zero-vector brake backend, safely runtime-only for VESC6.

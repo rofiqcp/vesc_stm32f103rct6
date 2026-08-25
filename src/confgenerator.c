@@ -1079,6 +1079,15 @@ bool vesc_config_import_wire(const uint8_t l[VESC6_MCCONF_WIRE_SIZE],const uint8
     return true;
 }
 
+bool vesc_config_apply_defaults(void) {
+    vesc_config_init_defaults();
+    if (!s_layout_ok) {
+        return false;
+    }
+    return vesc_config_import_wire(s_mc_factory[MOTOR_LEFT],
+            s_mc_factory[MOTOR_RIGHT], s_app_factory);
+}
+
 /* ==================== Canonical confgenerator front-end ====================
  * The 481/493-byte VESC-6 image remains the source of truth. These functions
  * provide upstream-style typed access without duplicating persistent state. */

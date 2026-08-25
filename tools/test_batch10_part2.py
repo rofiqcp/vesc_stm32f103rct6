@@ -39,8 +39,11 @@ ok('!m->pwm_enabled || !m->observer_valid || m->detect.busy' in mc, 'resistance 
 ok('m->res_est_valid && isfinite(m->res_est_ohm)' in foc, 'public live estimated resistance reports adaptive estimate when valid')
 ok('Rcfg=%.5f Rest=%.5f' in term, 'terminal observer diagnostics expose configured and estimated resistance')
 
-# Offset tracking was already present; Part 2 must not add another competing backend.
-ok(foc.count('static inline void offset_track_isr') == 1, 'existing current-offset drift tracking remains single-owner')
+# The previous offset tracker was an empty function with unused accumulators.
+# A fake runtime calibration path is worse than an explicit calibrated-only
+# policy; reintroducing drift compensation requires a real, tested backend.
+ok('offset_track_isr' not in foc and 'current_offset_u_acc_q16' not in foc,
+   'empty current-offset drift tracker and dead state stay removed')
 
 # Preserve exclusion contract.
 for token in ['#include "comm_can.h"','#include "imu/','#include "bms','#include "bm_if','#include "nrf','#include "ledpwm','#include "comm_usb','#include "lispif','#include "lzo']:

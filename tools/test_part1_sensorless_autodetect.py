@@ -13,7 +13,8 @@ cmd=text('src/comm/commands.c')
 mc=text('src/motor/mc_interface.c')
 fm=text('src/motor/foc_math.c')
 fh=text('src/motor/foc_math.h')
-tasks=text('src/motor_tasks.c')
+tasks=text('src/motor/mc_interface_tasks.c')
+status=text('src/hwconf/hw_status.c')
 hw=text('src/hwconf/hw.c')
 
 # MCCONF policy: sensorless is a real VESC mode, HFI remains forbidden.
@@ -75,7 +76,8 @@ ok(re.search(r'vesc-f103-hoverboard-v(?:2[7-9]|[3-9][0-9])-', cmd) is not None,
    'firmware identity distinguishes Part-1 or later while VESC wire ABI stays 6.00')
 
 # Fault status and gate contract remain safe.
-ok('MOTOR_FAULT_COMMAND_TIMEOUT' not in re.search(r'static motor_fault_t audible_fault\(void\).*?\n\}',tasks,re.S).group(0),
+status_fault=re.search(r'static motor_fault_t highest_priority_fault\(void\).*?\n\}',status,re.S)
+ok(status_fault is not None and 'MOTOR_FAULT_COMMAND_TIMEOUT' not in status_fault.group(0),
    'non-VESC command timeout no longer produces fake fault-code 00 pulses')
 ok('oc.OCPolarity = TIM_OCPOLARITY_HIGH;' in hw,
    'high-side PWM remains active HIGH')
@@ -83,7 +85,7 @@ ok('oc.OCNPolarity = TIM_OCNPOLARITY_LOW;' in hw,
    'low-side complementary PWM remains active LOW')
 
 # Excluded subsystems stay excluded.
-combined='\n'.join([cfg,cmd,mc,fm,tasks,hw]).lower()
+combined='\n'.join([cfg,cmd,mc,fm,tasks,status,hw]).lower()
 for token in ['#include "comm_can.h"','#include "imu/','#include "bms','#include "bm_if',
               '#include "nrf','#include "ledpwm','#include "comm_usb','#include "lispif','#include "lzo']:
     ok(token not in combined,f'excluded subsystem not introduced: {token}')

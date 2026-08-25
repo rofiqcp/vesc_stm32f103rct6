@@ -105,8 +105,8 @@ def verify_fixed_point_isr() -> None:
         ("src/motor/foc_math.c", "void foc_pll_run_fixed", "fixed PLL"),
         ("src/motor/foc_math.c", "void foc_fast_sincos_u16_q15", "fixed sin/cos"),
         ("src/motor/foc_math.c", "void foc_svm_q15", "fixed SVM"),
-        ("src/debug_sample.c", "static void sample_fill", "ISR sample packer"),
-        ("src/debug_sample.c", "void debug_sample_capture_isr", "debug sample ISR"),
+        ("src/motor/mc_interface_sample.c", "static void sample_fill", "ISR sample packer"),
+        ("src/motor/mc_interface_sample.c", "void mc_interface_sample_capture_isr", "debug sample ISR"),
         ("src/hwconf/hw.c", "void motor_hw_set_pwm_q15", "fixed PWM writer"),
     ]
     for rel, sig, label in checks:

@@ -1,0 +1,29 @@
+STAGE3 SOFTWARE VALIDATION
+==========================
+Base: Stage2 v30 sensor/detection safety
+Stage3 identity: vesc-f103-hoverboard-v31-stage3-production
+
+Project regression scripts: 25 PASS / 0 FAIL
+Python tools compileall: PASS
+Stage3 static/runtime-contract test: PASS
+COMM_DIAG v13 parser self-test: PASS
+TODO/FIXME/XXX/HACK scan src/: none found
+Forbidden runtime include scan: none found
+Dead audio/injected sample compatibility hooks: removed
+
+Key invariants checked:
+- high-side active HIGH retained
+- complementary low-side active LOW retained
+- TIM8 LEFT / TIM1 RIGHT retained
+- FOC current ADC ranks retained
+- V0/V7/high-current sampling remains explicitly unsupported/rejected
+- sampling-contract boot gate present
+- complete dual-motor ISR timing/jitter instrumentation present
+- UART TX queue non-blocking, depth 4
+- FreeRTOS stack/heap watermark instrumentation present
+- COMM_DIAG revision 13 buffer headroom present
+
+TARGET ARM BUILD STATUS
+-----------------------
+NOT VERIFIED IN THIS ENVIRONMENT: PlatformIO (`pio`) and `arm-none-eabi-gcc` are unavailable here.
+User must run clean PlatformIO build before hardware use.

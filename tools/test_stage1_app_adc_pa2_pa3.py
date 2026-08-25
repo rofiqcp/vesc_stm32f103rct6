@@ -12,7 +12,7 @@ hw=read('src/hwconf/hw.c'); it=read('src/stm32f1xx_it.c')
 app=read('src/applications/app.c'); adc=read('src/applications/app_adc.c')
 cmdsrc=read('src/applications/app_command.c'); commands=read('src/comm/commands.c')
 cg=read('src/confgenerator.c'); cgh=read('src/confgenerator.h'); dt=read('src/datatypes.h')
-tasks=read('src/motor_tasks.c'); term=read('src/terminal.c')
+tasks=read('src/motor/mc_interface_tasks.c'); term=read('src/terminal.c')
 
 # P0 target-build regression from the user's real PlatformIO log.
 ok('#include "encoder/encoder.h"' in commands and 'encoder_deinit(m)' in commands,
