@@ -3,15 +3,25 @@
 #include "motor/foc_math.h"
 #include "motor/mc_math.h"
 #include "motor/mcpwm_foc.h"
-#include "motor/mc_interface_sample.h"
+#include "comm/packet.h"
 #include "telemetry.h"
 #include "encoder/encoder.h"
 #include "motor/mcconf_default.h"
 #include "hwconf/hw_hoverboard.h"
 #include "conf_general.h"
+#include "confgenerator.h"
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include "applications/app_adc.h"
+#include "applications/app_command.h"
+#include "comm/commands.h"
+#include "hwconf/hw.h"
+#include "motor/mcpwm_foc.h"
+#include "telemetry.h"
+#include "timeout.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "cmsis_os2.h"
 
 MotorRuntime g_motor_left;
@@ -343,9 +353,43 @@ void motor_clear_fault(MotorRuntime *m) {
         motor_stop(m);
         return;
     }
-    motor_stop(m); m->fault=MOTOR_FAULT_NONE; m->vd_int=m->vq_int=0.0f;
+    motor_stop(m);
+    m->fault=MOTOR_FAULT_NONE;
+    /* A stale observer-speed filter can immediately recreate an
+     * ABS_OVERSPEED fault on the next 1-kHz service tick, preventing a safe
+     * stopped current recalibration from ever arming MOE. */
+    m->erpm_fault_filter = 0.0f;
+    m->erpm = 0.0f;
+    m->pll_erpm_q16 = 0;
+    m->speed_est_fast_erpm_q16 = 0;
+    m->vd_int=m->vq_int=0.0f;
     m->vd_int_q31=m->vq_int_q31=0; m->vd_int_q15=m->vq_int_q15=0;
     m->hall.invalid_count=0U; m->hall.sequence_error_count=0U; m->hall.recovery_valid_ticks=0U;
+}
+
+void motor_clear_fault_for_cal(MotorRuntime *m) {
+    if (m == NULL) return;
+    /* PVD/BKIN faults are hardware-latched and must never be silently cleared.
+     * A config-flash fault is cleared here so a stopped zero-vector calibration
+     * can always re-arm the bridge MOE for driven offset measurement. */
+    if (motor_hw_powerstage_fault_latched() ||
+        m->fault == MOTOR_FAULT_MCU_UNDER_VOLTAGE ||
+        m->fault == MOTOR_FAULT_BREAK) {
+        motor_stop(m);
+        return;
+    }
+    motor_stop(m);
+    m->fault = MOTOR_FAULT_NONE;
+    m->erpm_fault_filter = 0.0f;
+    m->erpm = 0.0f;
+    m->pll_erpm_q16 = 0;
+    m->speed_est_fast_erpm_q16 = 0;
+    m->vd_int = m->vq_int = 0.0f;
+    m->vd_int_q31 = m->vq_int_q31 = 0;
+    m->vd_int_q15 = m->vq_int_q15 = 0;
+    m->hall.invalid_count = 0U;
+    m->hall.sequence_error_count = 0U;
+    m->hall.recovery_valid_ticks = 0U;
 }
 
 void motor_raise_fault_from_task(MotorRuntime *m, motor_fault_t fault) {
@@ -739,6 +783,23 @@ static void update_encoder_slip_fault_1khz(MotorRuntime *m) {
  * resulting lo_* values and therefore stays deterministic/fixed-point. */
 static void update_runtime_limits_1khz(MotorRuntime *m) {
     if (!m) return;
+
+    /* Do not latch optional speed faults while current-offset calibration has not
+     * completed successfully. The observer and Hall/encoder state are untrusted
+     * before driven offsets exist, and a stale ABS_OVERSPEED fault permanently
+     * blocks the safe 50% zero-vector MOE handshake needed to calibrate.
+     * Checking s_cal_done (not s_cal_valid) keeps the guard active both during
+     * the in-progress boot calibration and after it fails, so the 1-kHz task
+     * cannot re-raise speed faults while recalibration is attempted. */
+    if (!foc_calibration_done()) {
+        m->erpm_fault_filter = 0.0f;
+        if (m->fault == MOTOR_FAULT_ABS_OVERSPEED ||
+            m->fault == MOTOR_FAULT_OVERSPEED ||
+            m->fault == MOTOR_FAULT_UNDERSPEED) {
+            m->fault = MOTOR_FAULT_NONE;
+        }
+        return;
+    }
 
     const float base_max = fmaxf(0.0f, m->current_max_a * fmaxf(m->current_max_scale, 0.0f));
     const float base_min = fminf(0.0f, m->current_min_a * fmaxf(m->current_min_scale, 0.0f));
@@ -1389,6 +1450,7 @@ static volatile bool s_mc_locked=false;
 static volatile bool s_mc_lock_override_once=false;
 static volatile uint32_t s_ignore_until[2]={0,0};
 static void (*s_pwm_callback)(void)=NULL;
+static void (* volatile s_sample_reply_func)(unsigned char *data, unsigned int len)=NULL;
 static mc_configuration s_mcconf_mirror[2];
 static volatile gnss_data s_gnss={0};
 static uint64_t s_odometer[2]={0U,0U};
@@ -1422,8 +1484,19 @@ void mc_interface_select_motor_thread(int motor) {
     }
 }
 int mc_interface_get_motor_thread(void){osThreadId_t tid=osThreadGetId();int i=sel_index(tid,false);return i>=0?s_motor_sel[i].motor:1;}
-int mc_interface_motor_now(void){return mc_interface_get_motor_thread();}
-MotorRuntime *mc_interface_motor_runtime_now(void){return motor_get(mc_interface_get_motor_thread()==2?MOTOR_RIGHT:MOTOR_LEFT);}
+int mc_interface_motor_now(void){
+    /* VESC: the motor active in the FOC ISR wins over the thread-selected one. */
+    int isr_motor = mcpwm_foc_isr_motor();
+    if (isr_motor == 1 || isr_motor == 2) {
+        return isr_motor;
+    }
+    int selected = mc_interface_get_motor_thread();
+    return selected == 2 ? 2 : 1;
+}
+MotorRuntime *mc_interface_motor_runtime_now(void){
+    int m = mc_interface_motor_now();
+    return motor_get(m == 2 ? MOTOR_RIGHT : MOTOR_LEFT);
+}
 
 static void mirror_from_runtime(const MotorRuntime*m,mc_configuration*c){
     memset(c,0,sizeof(*c));
@@ -1483,7 +1556,28 @@ static void mirror_from_runtime(const MotorRuntime*m,mc_configuration*c){
     c->si_battery_ah=m->si_battery_ah;c->si_motor_nl_current=m->si_motor_nl_current;
 }
 
-void mc_interface_init(bool reset_conf){(void)reset_conf;if(!s_mc_interface_inited){motor_control_init();s_mc_interface_inited=true;}mirror_from_runtime(&g_motor_left,&s_mcconf_mirror[0]);mirror_from_runtime(&g_motor_right,&s_mcconf_mirror[1]);}
+void mc_interface_init(bool reset_conf){
+	if(!s_mc_interface_inited){
+		motor_control_init();
+		s_mc_interface_inited=true;
+	}
+	if(reset_conf){
+		/* Factory reset the live VESC-6.00 wire configs, then persist them so
+		 * a later boot does not reload the old transactional record. VESC Tool
+		 * issues this path via the standard GET/SET MCCONF reset command. */
+		vesc_config_init_defaults();
+		if(!vesc_config_apply_defaults()){
+			motor_raise_fault_from_task(&g_motor_left,MOTOR_FAULT_FLASH_CONFIG);
+			motor_raise_fault_from_task(&g_motor_right,MOTOR_FAULT_FLASH_CONFIG);
+		}
+		if(!conf_general_store_all()){
+			motor_raise_fault_from_task(&g_motor_left,MOTOR_FAULT_FLASH_CONFIG);
+			motor_raise_fault_from_task(&g_motor_right,MOTOR_FAULT_FLASH_CONFIG);
+		}
+	}
+	mirror_from_runtime(&g_motor_left,&s_mcconf_mirror[0]);
+	mirror_from_runtime(&g_motor_right,&s_mcconf_mirror[1]);
+}
 const volatile mc_configuration* mc_interface_get_configuration(void){MotorRuntime*m=mc_interface_motor_runtime_now();mirror_from_runtime(m,&s_mcconf_mirror[m->id]);return &s_mcconf_mirror[m->id];}
 
 static bool config_float_same(float a, float b) {
@@ -1849,7 +1943,17 @@ void mc_interface_set_configuration(mc_configuration *c) {
     foc_observer_reset(m, m->observer_phase_u16);
     mirror_from_runtime(m, &s_mcconf_mirror[m->id]);
 }
-unsigned mc_interface_calc_crc(mc_configuration*c,bool is_motor_2){(void)is_motor_2;if(!c)return 0;const uint8_t*p=(const uint8_t*)c;uint32_t crc=0xFFFFU;for(size_t i=0;i<sizeof(*c);i++){crc^=(uint32_t)p[i]<<8;for(int b=0;b<8;b++)crc=(crc&0x8000U)?((crc<<1)^0x1021U):(crc<<1);}return crc&0xFFFFU;}
+unsigned mc_interface_calc_crc(mc_configuration *conf, bool is_motor_2) {
+    /* This pinned VESC-6 runtime mirror intentionally has no embedded crc
+     * member (unlike app_configuration). Support VESC's conf == NULL motor
+     * selection while using the one canonical project CRC16 implementation.
+     * Do not append a crc member here: that would silently change this port's
+     * mc_configuration ABI and every sizeof-based persistence/test contract. */
+    if (conf == NULL) {
+        conf = &s_mcconf_mirror[is_motor_2 ? 1 : 0];
+    }
+    return vesc_crc16((const uint8_t *)conf, (uint16_t)sizeof(*conf));
+}
 bool mc_interface_dccal_done(void){return foc_calibration_done();}
 void mc_interface_set_pwm_callback(void(*p)(void)){s_pwm_callback=p;}
 void mc_interface_lock(void){s_mc_locked=true;}
@@ -1971,7 +2075,7 @@ float mc_interface_get_amp_hours_charged(bool reset){return get_reset_f(&mc_inte
 float mc_interface_get_watt_hours(bool reset){return get_reset_f(&mc_interface_motor_runtime_now()->stats.watt_hours,reset);}
 float mc_interface_get_watt_hours_charged(bool reset){return get_reset_f(&mc_interface_motor_runtime_now()->stats.watt_hours_charged,reset);}
 float mc_interface_get_tot_current(void){return mcpwm_foc_get_tot_current_rt(mc_interface_motor_runtime_now());}
-float mc_interface_get_tot_current_filtered(void){return mc_interface_get_tot_current();}
+float mc_interface_get_tot_current_filtered(void){return mcpwm_foc_get_tot_current_filtered();}
 float mc_interface_get_tot_current_directional(void){return mc_interface_motor_runtime_now()->motor_current;}
 float mc_interface_get_tot_current_directional_filtered(void){return mc_interface_get_tot_current_directional();}
 float mc_interface_get_tot_current_in(void){return mc_interface_motor_runtime_now()->input_current;}
@@ -1980,7 +2084,7 @@ float mc_interface_get_input_voltage_filtered(void){return mc_interface_motor_ru
 float mc_interface_get_abs_motor_current_unbalance(void){MotorRuntime*m=mc_interface_motor_runtime_now();return fabsf(m->ia+m->ib+m->ic);}
 int mc_interface_get_tachometer_value(bool reset){MotorRuntime*m=mc_interface_motor_runtime_now();int v=m->stats.tachometer;if(reset)m->stats.tachometer=0;return v;}
 int mc_interface_get_tachometer_abs_value(bool reset){MotorRuntime*m=mc_interface_motor_runtime_now();int v=m->stats.tachometer_abs;if(reset)m->stats.tachometer_abs=0;return v;}
-float mc_interface_get_last_inj_adc_isr_duration(void){return 0.0f;}
+float mc_interface_get_last_inj_adc_isr_duration(void){return foc_last_isr_duration_s();}
 static motor_telemetry_avg_t read_reset_avg_mask(uint32_t mask){
     motor_telemetry_avg_t a;
     telemetry_read_reset_avg(mc_interface_motor_runtime_now()->id,mask,&a);
@@ -2004,11 +2108,17 @@ float mc_interface_get_last_sample_adc_isr_duration(void){MotorRuntime*m=mc_inte
 void mc_interface_sample_print_data(debug_sampling_mode mode, uint16_t len,
 		uint8_t decimation, bool raw,
 		void (*reply_func)(unsigned char *data, unsigned int len)) {
-	(void)reply_func;
+	/* Upstream retains this asynchronous route for the sample sender. A capture
+	 * may complete long after COMM_SAMPLE_PRINT returned, so default UART TX
+	 * would reply to the wrong peer for CAN-forwarded or alternate transports. */
+	s_sample_reply_func = reply_func;
 	MotorRuntime *motor = mc_interface_motor_runtime_now();
 	if (motor != NULL) {
 		(void)mc_interface_sample_control(mode, motor->id, len, decimation, raw);
 	}
+}
+void (*mc_interface_sample_reply_func(void))(unsigned char *data, unsigned int len) {
+	return s_sample_reply_func;
 }
 /* There is still no MOSFET NTC. VESC's FET-temperature API exposes the
  * explicitly documented MCU/board proxy. Motor temperature remains unavailable
@@ -2123,3 +2233,596 @@ void mc_interface_stat_reset(void){setup_stats*s=setup_stats_now();memset(s,0,si
 void mc_interface_set_fault_info(const char*str,int argn,float arg0,float arg1){(void)str;(void)argn;(void)arg0;(void)arg1;}
 void mc_interface_fault_stop(mc_fault_code f,bool is_second_motor,bool is_isr){MotorRuntime*m=motor_get(is_second_motor?MOTOR_RIGHT:MOTOR_LEFT);motor_fault_t native=motor_fault_from_vesc(f);if(is_isr)motor_request_fault_from_isr(m,native);else motor_raise_fault_from_task(m,native);}
 void mc_interface_mc_timer_isr(bool is_second_motor,float dt){(void)is_second_motor;(void)dt;if(s_pwm_callback)s_pwm_callback();}
+
+
+/* ============================================================================
+ * VESC-standard consolidation: debug sampler + RTOS service/sample/fault threads.
+ * Upstream VESC keeps these inside mc_interface.c (ChibiOS THD_FUNCTION + static
+ * working areas). This F103 port uses CMSIS-RTOS2/FreeRTOS, so the same
+ * ownership is retained here in the single compatibility translation unit.
+ * ============================================================================ */
+
+/* Some host compile stubs expose TaskHandle_t without the optional deletion
+ * prototype. The real FreeRTOS task.h declaration has this exact signature. */
+extern void vTaskDelete(TaskHandle_t task_to_delete);
+
+#include <stddef.h>
+
+/*
+ * Upstream VESC owns the service, sample sender and fault-stop threads in
+ * mc_interface.c. This F103 port keeps their implementation in this private
+ * translation unit to keep the already large compatibility layer reviewable.
+ * The public API and ownership still remain in mc_interface.
+ */
+#define RTOS_READY_HEAP_RESERVE_BYTES 2048U
+
+static osThreadId_t s_timer_thread;
+static osThreadId_t s_sample_send_thread;
+static osThreadId_t s_fault_stop_thread;
+static bool s_threads_started;
+
+static void timer_thread(void *argument);
+static void sample_send_thread(void *argument);
+static void fault_stop_thread(void *argument);
+
+static uint32_t thread_stack_free_bytes(osThreadId_t thread) {
+	if (thread == NULL) {
+		return 0U;
+	}
+	return (uint32_t)uxTaskGetStackHighWaterMark((TaskHandle_t)thread) *
+			(uint32_t)sizeof(StackType_t);
+}
+
+static void fault_signal(motor_id_t motor) {
+	if (s_fault_stop_thread != NULL) {
+		(void)osThreadFlagsSet(s_fault_stop_thread, 1UL << (uint32_t)motor);
+	}
+}
+
+static void sample_signal(void) {
+	if (s_sample_send_thread != NULL) {
+		(void)osThreadFlagsSet(s_sample_send_thread, 1UL);
+	}
+}
+
+uint32_t mc_interface_free_heap_bytes(void) {
+	return (uint32_t)xPortGetFreeHeapSize();
+}
+
+uint32_t mc_interface_min_ever_free_heap_bytes(void) {
+	return (uint32_t)xPortGetMinimumEverFreeHeapSize();
+}
+
+void mc_interface_get_resource_stats(mc_interface_resource_stats_t *stats) {
+	if (stats == NULL) {
+		return;
+	}
+
+	stats->heap_free_bytes = mc_interface_free_heap_bytes();
+	stats->heap_min_ever_bytes = mc_interface_min_ever_free_heap_bytes();
+	stats->motor_service_stack_free_bytes =
+			thread_stack_free_bytes(s_timer_thread);
+	stats->sample_sender_stack_free_bytes =
+			thread_stack_free_bytes(s_sample_send_thread);
+	stats->fault_stack_free_bytes =
+			thread_stack_free_bytes(s_fault_stop_thread);
+	stats->status_stack_free_bytes = hw_status_stack_free_bytes();
+}
+
+static void timer_thread(void *argument) {
+	(void)argument;
+	bool current_offset_fault_reported = false;
+	uint8_t calibration_divider = 0U;
+	uint8_t ten_ms_divider = 0U;
+	uint32_t next = osKernelGetTickCount();
+
+	for (;;) {
+		next += 1U;
+		const uint32_t now = osKernelGetTickCount();
+		timeout_heartbeat(TIMEOUT_HEARTBEAT_MOTOR_SERVICE);
+
+		motor_slow_update_1khz(&g_motor_left, now);
+		motor_slow_update_1khz(&g_motor_right, now);
+		motor_rpm_update_1khz(&g_motor_left);
+		motor_rpm_update_1khz(&g_motor_right);
+
+		/* APP ADC and serial commands share this central command arbitration. */
+		app_command_service_1khz(now);
+		app_adc_service_1khz(now);
+
+		motor_pid_update_1khz(&g_motor_left);
+		motor_pid_update_1khz(&g_motor_right);
+
+		ten_ms_divider++;
+		if (ten_ms_divider >= 10U) {
+			ten_ms_divider = 0U;
+			timeout_update_10ms(now);
+			timeout_watchdog_update_10ms(now);
+			telemetry_stats_update_100hz();
+			telemetry_snapshot_100hz();
+			vesc_comm_periodic_100hz();
+		}
+
+		/* The ISR only accumulates fixed-point calibration statistics. */
+		calibration_divider++;
+		if (calibration_divider >= 5U) {
+			calibration_divider = 0U;
+			foc_calibration_service_task();
+			if (foc_calibration_done()) {
+				if (!foc_calibration_valid() && !current_offset_fault_reported) {
+					current_offset_fault_reported = true;
+					motor_raise_fault_from_task(&g_motor_left,
+							MOTOR_FAULT_CURRENT_OFFSET);
+					motor_raise_fault_from_task(&g_motor_right,
+							MOTOR_FAULT_CURRENT_OFFSET);
+					fault_signal(MOTOR_LEFT);
+					fault_signal(MOTOR_RIGHT);
+				} else if (foc_calibration_valid()) {
+					current_offset_fault_reported = false;
+					if (g_motor_left.fault == MOTOR_FAULT_CURRENT_OFFSET) {
+						motor_clear_fault(&g_motor_left);
+					}
+					if (g_motor_right.fault == MOTOR_FAULT_CURRENT_OFFSET) {
+						motor_clear_fault(&g_motor_right);
+					}
+				}
+			}
+		}
+
+		const uint32_t pending = motor_take_pending_fault_mask();
+		if ((pending & (1UL << MOTOR_LEFT)) != 0U) {
+			fault_signal(MOTOR_LEFT);
+		}
+		if ((pending & (1UL << MOTOR_RIGHT)) != 0U) {
+			fault_signal(MOTOR_RIGHT);
+		}
+
+		if (mc_interface_sample_ready()) {
+			sample_signal();
+		}
+		osDelayUntil(next);
+	}
+}
+
+static void sample_send_thread(void *argument) {
+	(void)argument;
+	for (;;) {
+		const uint32_t flags = osThreadFlagsWait(1UL, osFlagsWaitAny,
+				osWaitForever);
+		if ((flags & osFlagsError) != 0U) {
+			continue;
+		}
+		if (mc_interface_sample_ready()) {
+			void (*reply)(unsigned char *, unsigned int) =
+					mc_interface_sample_reply_func();
+			if (reply != NULL) {
+				vesc_comm_send_sample_buffer_to(reply,
+						mc_interface_sample_count());
+			} else {
+				vesc_comm_send_sample_buffer(mc_interface_sample_data(),
+						mc_interface_sample_count());
+			}
+			mc_interface_sample_mark_sent();
+		}
+	}
+}
+
+static void fault_stop_thread(void *argument) {
+	(void)argument;
+	const uint32_t mask = (1UL << MOTOR_LEFT) | (1UL << MOTOR_RIGHT);
+
+	for (;;) {
+		const uint32_t flags = osThreadFlagsWait(mask, osFlagsWaitAny, 50U);
+		timeout_heartbeat(TIMEOUT_HEARTBEAT_FAULT);
+		if ((flags & osFlagsError) != 0U) {
+			continue;
+		}
+		/* A stale task-side fault-stop flag (for example FLASH_CONFIG raised at
+		 * boot) must not tear down the safe 50% zero-vector while offset
+		 * calibration is active. Hardware PVD/BKIN/ADC faults already clear MOE
+		 * synchronously in their ISR/emergency path, so deferring this task-side
+		 * stop during calibration does not weaken hard protection. */
+		if (!foc_calibration_in_progress()) {
+			if ((flags & (1UL << MOTOR_LEFT)) != 0U) {
+				motor_hw_set_pwm_enabled(&g_motor_left, false);
+			}
+			if ((flags & (1UL << MOTOR_RIGHT)) != 0U) {
+				motor_hw_set_pwm_enabled(&g_motor_right, false);
+			}
+		}
+	}
+}
+
+bool mc_interface_start_threads(void) {
+	if (s_threads_started) {
+		return s_timer_thread != NULL && s_sample_send_thread != NULL &&
+				s_fault_stop_thread != NULL;
+	}
+
+	app_command_init();
+	app_adc_init();
+	if (!timeout_init()) {
+		return false;
+	}
+
+	const osThreadAttr_t timer_attributes = {
+		.name = "mc timer",
+		.priority = osPriorityHigh,
+		.stack_size = 896U
+	};
+	const osThreadAttr_t sample_attributes = {
+		.name = "mc sample",
+		.priority = osPriorityBelowNormal,
+		.stack_size = 640U
+	};
+	const osThreadAttr_t fault_attributes = {
+		.name = "mc fault",
+		.priority = osPriorityHigh,
+		.stack_size = 512U
+	};
+
+	s_timer_thread = osThreadNew(timer_thread, NULL, &timer_attributes);
+	s_sample_send_thread = osThreadNew(sample_send_thread, NULL,
+			&sample_attributes);
+	s_fault_stop_thread = osThreadNew(fault_stop_thread, NULL,
+			&fault_attributes);
+
+	const bool threads_ok = s_timer_thread != NULL &&
+			s_sample_send_thread != NULL && s_fault_stop_thread != NULL;
+	const bool heap_ok = mc_interface_free_heap_bytes() >=
+			RTOS_READY_HEAP_RESERVE_BYTES;
+	if (!threads_ok || !heap_ok) {
+		/* Do not advertise a half-started controller. The three workers touch
+		 * shared motor state immediately after creation, so a failed allocation
+		 * or reserve check is rolled back before a later retry. */
+		if (s_timer_thread != NULL) {
+			vTaskDelete((TaskHandle_t)s_timer_thread);
+			s_timer_thread = NULL;
+		}
+		if (s_sample_send_thread != NULL) {
+			vTaskDelete((TaskHandle_t)s_sample_send_thread);
+			s_sample_send_thread = NULL;
+		}
+		if (s_fault_stop_thread != NULL) {
+			vTaskDelete((TaskHandle_t)s_fault_stop_thread);
+			s_fault_stop_thread = NULL;
+		}
+		return false;
+	}
+
+	s_threads_started = true;
+	timeout_watchdog_start();
+	return true;
+}
+
+#include "applications/appconf_default.h"
+#include <limits.h>
+#include <string.h>
+
+static debug_sample_t s_samples[SAMPLE_BUFFER_LEN];
+static volatile uint16_t s_target_len;
+static volatile uint16_t s_wr;             /* physical next-write index */
+static volatile uint16_t s_count;          /* valid samples in buffer */
+static volatile uint16_t s_read_start;     /* oldest physical sample */
+static volatile uint16_t s_decimation;
+static volatile uint16_t s_decim_count;
+static volatile uint16_t s_post_remaining;
+static volatile motor_id_t s_motor;
+static volatile debug_sampling_mode s_mode;
+static volatile bool s_active;
+static volatile bool s_armed;
+static volatile bool s_triggered;
+static volatile bool s_capture_valid;
+static volatile bool s_send_pending;
+static volatile bool s_auto_send;
+static volatile bool s_raw;
+static volatile bool s_prev_running;
+static volatile bool s_prev_fault;
+
+static int16_t sat_i16(int32_t value) {
+	if (value > INT16_MAX) {
+		return INT16_MAX;
+	}
+	if (value < INT16_MIN) {
+		return INT16_MIN;
+	}
+	return (int16_t)value;
+}
+
+static void sample_fill(debug_sample_t *d, MotorRuntime *m) {
+	d->ia_cA = sat_i16((m->ia_q15 * 6400L) / 32768L);
+	d->ib_cA = sat_i16((m->ib_q15 * 6400L) / 32768L);
+	d->id_cA = sat_i16((m->id_q15 * 6400L) / 32768L);
+	d->iq_cA = sat_i16((m->iq_q15 * 6400L) / 32768L);
+	d->vd_cV = sat_i16((m->vd_q15 * 6400L) / 32768L);
+	d->vq_cV = sat_i16((m->vq_q15 * 6400L) / 32768L);
+	d->erpm = sat_i16(m->erpm_int);
+	d->phase_u16 = motor_sensor_electrical_phase_u16(m);
+	d->duty_u_q15 = m->duty_u_q15;
+	d->duty_v_q15 = m->duty_v_q15;
+	d->duty_w_q15 = m->duty_w_q15;
+	d->current_raw_u = m->current_raw_u;
+	d->current_raw_v = m->current_raw_v;
+
+	int32_t vbus_dv = (m->vbus_q15 * 640L) / 32768L;
+	if (vbus_dv < 0) {
+		vbus_dv = 0;
+	}
+	if (vbus_dv > UINT16_MAX) {
+		vbus_dv = UINT16_MAX;
+	}
+	d->vbus_dV = (uint16_t)vbus_dv;
+	d->motor = (uint8_t)m->id;
+	d->hall_raw = m->hall.raw_state;
+}
+
+static void finish_capture_isr(void) {
+	s_active = false;
+	s_armed = false;
+	s_capture_valid = (s_count != 0U);
+	s_read_start = (s_count >= s_target_len) ? s_wr : 0U;
+	s_send_pending = s_capture_valid && s_auto_send;
+}
+
+void mc_interface_sample_init(void) {
+	memset(s_samples, 0, sizeof(s_samples));
+	s_target_len = SAMPLE_BUFFER_LEN;
+	s_wr = 0U;
+	s_count = 0U;
+	s_read_start = 0U;
+	s_decimation = SAMPLE_DEFAULT_DECIMATION;
+	s_decim_count = 0U;
+	s_post_remaining = 0U;
+	s_motor = MOTOR_LEFT;
+	s_mode = DEBUG_SAMPLING_OFF;
+	s_active = false;
+	s_armed = false;
+	s_triggered = false;
+	s_capture_valid = false;
+	s_send_pending = false;
+	s_auto_send = true;
+	s_raw = false;
+	s_prev_running = false;
+	s_prev_fault = false;
+}
+
+bool mc_interface_sample_control(debug_sampling_mode mode, motor_id_t motor,
+		uint16_t len, uint16_t decimation, bool raw) {
+	/* debug_sampling_mode starts at DEBUG_SAMPLING_OFF. A lower-bound check
+	 * would trigger -Wtype-limits when ARM GCC represents the enum unsigned. */
+	if (mode > DEBUG_SAMPLING_SEND_SINGLE_SAMPLE ||
+			(motor != MOTOR_LEFT && motor != MOTOR_RIGHT)) {
+		return false;
+	}
+	if (len == 0U || len > SAMPLE_BUFFER_LEN) {
+		len = SAMPLE_BUFFER_LEN;
+	}
+	if (decimation == 0U) {
+		decimation = 1U;
+	}
+
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
+
+	if (mode == DEBUG_SAMPLING_OFF) {
+		s_active = false;
+		s_armed = false;
+		s_triggered = false;
+		s_send_pending = false;
+		s_mode = mode;
+		if (primask == 0U) {
+			__enable_irq();
+		}
+		return true;
+	}
+
+	if (mode == DEBUG_SAMPLING_SEND_LAST_SAMPLES) {
+		const bool capture_valid = s_capture_valid;
+		if (capture_valid) {
+			s_send_pending = true;
+		}
+		if (primask == 0U) {
+			__enable_irq();
+		}
+		return capture_valid;
+	}
+
+	/* Never overwrite a buffer while the UART worker is serializing it. */
+	if (s_send_pending) {
+		if (primask == 0U) {
+			__enable_irq();
+		}
+		return false;
+	}
+
+	s_motor = motor;
+	s_mode = mode;
+	s_target_len = (mode == DEBUG_SAMPLING_SEND_SINGLE_SAMPLE) ? 1U : len;
+	s_decimation = decimation;
+	s_decim_count = 0U;
+	s_wr = 0U;
+	s_count = 0U;
+	s_read_start = 0U;
+	s_post_remaining = 0U;
+	s_raw = raw;
+	s_capture_valid = false;
+	s_send_pending = false;
+	s_triggered = false;
+	s_prev_running = false;
+	s_prev_fault = false;
+	s_auto_send = (mode != DEBUG_SAMPLING_TRIGGER_START_NOSEND &&
+			mode != DEBUG_SAMPLING_TRIGGER_FAULT_NOSEND);
+
+	switch (mode) {
+	case DEBUG_SAMPLING_NOW:
+	case DEBUG_SAMPLING_SEND_SINGLE_SAMPLE:
+		s_active = true;
+		s_armed = false;
+		break;
+	case DEBUG_SAMPLING_START:
+	case DEBUG_SAMPLING_TRIGGER_START:
+	case DEBUG_SAMPLING_TRIGGER_FAULT:
+	case DEBUG_SAMPLING_TRIGGER_START_NOSEND:
+	case DEBUG_SAMPLING_TRIGGER_FAULT_NOSEND:
+		s_active = true;
+		s_armed = true;
+		break;
+	default:
+		s_active = false;
+		s_armed = false;
+		break;
+	}
+
+	if (primask == 0U) {
+		__enable_irq();
+	}
+	return true;
+}
+
+void mc_interface_sample_start_ex(motor_id_t motor, uint16_t len,
+		uint16_t decimation, bool raw) {
+	(void)mc_interface_sample_control(DEBUG_SAMPLING_NOW, motor, len,
+			decimation, raw);
+}
+
+void mc_interface_sample_start(motor_id_t motor, uint16_t len,
+		uint16_t decimation) {
+	mc_interface_sample_start_ex(motor, len, decimation, false);
+}
+
+void mc_interface_sample_capture_isr(MotorRuntime *active) {
+	if (!s_active || active == NULL || active->id != s_motor) {
+		return;
+	}
+
+	const bool running = active->pwm_enabled &&
+			active->fault == MOTOR_FAULT_NONE;
+	const bool fault_now = active->fault != MOTOR_FAULT_NONE;
+	const bool start_edge = running && !s_prev_running;
+	const bool fault_edge = fault_now && !s_prev_fault;
+	s_prev_running = running;
+	s_prev_fault = fault_now;
+
+	if (s_armed && !s_triggered) {
+		bool trigger = false;
+		switch (s_mode) {
+		case DEBUG_SAMPLING_START:
+		case DEBUG_SAMPLING_TRIGGER_START:
+		case DEBUG_SAMPLING_TRIGGER_START_NOSEND:
+			trigger = start_edge;
+			break;
+		case DEBUG_SAMPLING_TRIGGER_FAULT:
+		case DEBUG_SAMPLING_TRIGGER_FAULT_NOSEND:
+			trigger = fault_edge;
+			break;
+		default:
+			trigger = true;
+			break;
+		}
+		if (trigger) {
+			s_triggered = true;
+			s_armed = false;
+			if (s_mode == DEBUG_SAMPLING_START) {
+				/* START begins a fresh capture on the run edge. */
+				s_wr = 0U;
+				s_count = 0U;
+				s_read_start = 0U;
+				s_post_remaining = s_target_len;
+			} else {
+				/* Keep circular pre-trigger history. Half a capture after the
+				 * edge gives an approximately even pre/post split. */
+				s_post_remaining =
+						(uint16_t)((s_target_len + 1U) / 2U);
+			}
+		}
+	}
+
+	if (++s_decim_count < s_decimation) {
+		return;
+	}
+	s_decim_count = 0U;
+
+    /* START does not record before its start edge. Trigger modes do, as a
+       circular pre-trigger history. */
+	const bool trigger_mode =
+			s_mode == DEBUG_SAMPLING_TRIGGER_START ||
+			s_mode == DEBUG_SAMPLING_TRIGGER_FAULT ||
+			s_mode == DEBUG_SAMPLING_TRIGGER_START_NOSEND ||
+			s_mode == DEBUG_SAMPLING_TRIGGER_FAULT_NOSEND;
+	if (s_mode == DEBUG_SAMPLING_START && !s_triggered) {
+		return;
+	}
+
+	sample_fill(&s_samples[s_wr], active);
+	s_wr++;
+	if (s_wr >= s_target_len) {
+		s_wr = 0U;
+	}
+	if (s_count < s_target_len) {
+		s_count++;
+	}
+
+	if (trigger_mode || s_mode == DEBUG_SAMPLING_START) {
+		if (s_triggered && s_post_remaining > 0U) {
+			s_post_remaining--;
+			if (s_post_remaining == 0U) {
+				finish_capture_isr();
+			}
+		}
+		return;
+	}
+
+	if (s_count >= s_target_len) {
+		finish_capture_isr();
+	}
+}
+
+bool mc_interface_sample_ready(void) {
+	return s_capture_valid && s_send_pending;
+}
+
+bool mc_interface_sample_has_capture(void) {
+	return s_capture_valid;
+}
+
+uint16_t mc_interface_sample_count(void) {
+	return s_count;
+}
+
+const debug_sample_t *mc_interface_sample_data(void) {
+	return s_samples;
+}
+
+const debug_sample_t *mc_interface_sample_at(uint16_t logical_index) {
+	if (!s_capture_valid || logical_index >= s_count || s_target_len == 0U) {
+		return NULL;
+	}
+
+	uint16_t physical_index = (uint16_t)(s_read_start + logical_index);
+	while (physical_index >= s_target_len) {
+		physical_index = (uint16_t)(physical_index - s_target_len);
+	}
+	return &s_samples[physical_index];
+}
+
+void mc_interface_sample_mark_sent(void) {
+	uint32_t primask = __get_PRIMASK();
+	__disable_irq();
+	s_send_pending = false;
+	if (primask == 0U) {
+		__enable_irq();
+	}
+}
+
+bool mc_interface_sample_active(void) {
+	return s_active;
+}
+
+bool mc_interface_sample_raw(void) {
+	return s_raw;
+}
+
+debug_sampling_mode mc_interface_sample_mode(void) {
+	return s_mode;
+}
+

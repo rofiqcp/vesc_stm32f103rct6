@@ -2,7 +2,7 @@
 #include "cmsis_os2.h"
 #include "hwconf/hw.h"
 #include "motor/mc_interface.h"
-#include "motor/mc_interface_sample.h"
+#include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
 #include "telemetry.h"
 #include "comm/commands.h"

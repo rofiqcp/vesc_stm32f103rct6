@@ -15,6 +15,10 @@ void motor_set_position(MotorRuntime *m, float deg);
 void motor_set_duty(MotorRuntime *m, float duty);
 void motor_stop(MotorRuntime *m);
 void motor_clear_fault(MotorRuntime *m);
+/* Force-clear a fault for a safe stopped recalibration. Hardware-latched
+ * power-stage faults (PVD/BKIN/break) still refuse reset; a config-flash fault
+ * is cleared so offset calibration can arm the 50% zero-vector MOE handshake. */
+void motor_clear_fault_for_cal(MotorRuntime *m);
 void motor_touch_command(MotorRuntime *m);
 void motor_keepalive(MotorRuntime *m);
 void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms);
@@ -35,10 +39,13 @@ void motor_set_current_pi_gains(MotorRuntime *m, float kp, float ki);
 int32_t motor_encoder_extended_count(MotorRuntime *m);
 
 /* ========================================================================
- * VESC master-compatible public mc_interface API.
- * The original F103 explicit MotorRuntime helpers above remain available to
- * hard/board code. These wrappers use a per-RTOS-thread motor selection, as
- * VESC does on dual-motor targets, and dispatch by MCCONF motor_type.
+ * VESC 6.00 FOC-subset command/status mc_interface API.
+ * The upstream-shaped mc_interface_* wrappers provide VESC Tool compatibility.
+ * The explicit MotorRuntime helpers above and the F103-only mc_interface_*
+ * additions (resource stats, per-motor odometer, input-gate helpers,
+ * mc_interface_motor_runtime_now bridge) are port extensions, not VESC public
+ * API guarantees. mc_interface_adc_inj_int_handler() is intentionally absent;
+ * this target uses the platform ADC/DMA ISR instead.
  * ======================================================================== */
 void mc_interface_init(bool reset_conf);
 bool mc_interface_start_threads(void);
@@ -120,8 +127,31 @@ float mc_interface_get_pid_pos_set(void);
 float mc_interface_get_pid_pos_now(void);
 void mc_interface_update_pid_pos_offset(float angle_now, bool store);
 float mc_interface_get_last_sample_adc_isr_duration(void);
-void mc_interface_sample_print_data(debug_sampling_mode mode, uint16_t len, uint8_t decimation, bool raw,
-                                    void(*reply_func)(unsigned char *data, unsigned int len));
+void mc_interface_sample_print_data(debug_sampling_mode mode, uint16_t len, uint8_t decimation,
+		bool raw, void (*reply_func)(unsigned char *data, unsigned int len));
+/* The initiating VESC transport for the asynchronous debug-sample sender.
+ * This preserves upstream reply_func routing instead of silently falling back
+ * to the board's default UART queue. */
+void (*mc_interface_sample_reply_func(void))(unsigned char *data, unsigned int len);
+
+/* --- Debug sample buffer (VESC-standard mc_interface ownership) --- */
+void mc_interface_sample_init(void);
+bool mc_interface_sample_control(debug_sampling_mode mode, motor_id_t motor,
+		uint16_t len, uint16_t decimation, bool raw);
+void mc_interface_sample_start(motor_id_t motor, uint16_t len,
+		uint16_t decimation);
+void mc_interface_sample_start_ex(motor_id_t motor, uint16_t len,
+		uint16_t decimation, bool raw);
+void mc_interface_sample_capture_isr(MotorRuntime *active);
+bool mc_interface_sample_ready(void);
+bool mc_interface_sample_has_capture(void);
+uint16_t mc_interface_sample_count(void);
+const debug_sample_t *mc_interface_sample_data(void);
+const debug_sample_t *mc_interface_sample_at(uint16_t logical_index);
+void mc_interface_sample_mark_sent(void);
+bool mc_interface_sample_active(void);
+bool mc_interface_sample_raw(void);
+debug_sampling_mode mc_interface_sample_mode(void);
 float mc_interface_temp_fet_filtered(void);
 float mc_interface_temp_motor_filtered(void);
 float mc_interface_get_battery_level(float *wh_left);

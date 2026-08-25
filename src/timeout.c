@@ -1,5 +1,6 @@
 #include "timeout.h"
 #include "motor/mc_interface.h"
+#include "motor/mcpwm_foc.h"
 #include "applications/appconf_default.h"
 #include "cmsis_os2.h"
 #include "stm32f1xx_hal.h"
@@ -77,6 +78,17 @@ bool timeout_init(void) {
 void timeout_update_10ms(uint32_t now) {
     const uint32_t timeout = s_timeout_ms;
     const bool expired = timeout != 0U && (uint32_t)(now - s_last_update_ms) > timeout;
+
+    /* During offset calibration the bridge is deliberately driven with a 50%
+     * zero-vector. A command timeout must not tear down that PWM (VESC clears
+     * the timeout for the duration of dc_cal), otherwise the driven offset
+     * measurement is aborted after the first samples and the MOE handshake
+     * fails. Real hardware faults are still handled synchronously elsewhere. */
+    if (expired && foc_calibration_in_progress()) {
+        g_motor_left.timeout_active = false;
+        g_motor_right.timeout_active = false;
+        return;
+    }
 
     if (expired) {
         if (!s_has_timeout) {

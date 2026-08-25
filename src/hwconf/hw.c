@@ -571,13 +571,17 @@ void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled) {
             return;
         }
         if (!m->pwm_enabled && m->pwm_enable_pending_events == 0U) {
-            /* Stage an exact zero-vector triplet first. MOE remains OFF until
-               the hard ADC schedule has observed enough timer update events
-               to guarantee the preload is active in hardware. */
+            /* Stage an exact zero-vector triplet first. MOE remains OFF until the
+               hard ADC schedule has observed enough timer update events to guarantee
+               the preload is active in hardware. Guard against re-entrant calls from
+               the calibration 200 Hz task that would reset the countdown before
+               the 16 kHz ISR has finished arming. */
             motor_hw_restore_foc_outputs(m);
             motor_hw_set_pwm_q15(m, FOC_Q15_HALF, FOC_Q15_HALF, FOC_Q15_HALF);
             m->pwm_enable_blank_cycles = 0U;
-            m->pwm_enable_pending_events = PWM_ENABLE_PRELOAD_EVENTS;
+            if (m->pwm_enable_pending_events == 0U) {
+                m->pwm_enable_pending_events = PWM_ENABLE_PRELOAD_EVENTS;
+            }
             m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
         }
     } else {
@@ -591,7 +595,13 @@ void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled) {
 
 void motor_hw_service_pwm_enable_from_isr(MotorRuntime *m) {
     if (m == NULL || m->pwm_enabled || m->pwm_enable_pending_events == 0U) return;
-    if (s_powerstage_fault_flags != 0U || m->fault != MOTOR_FAULT_NONE) {
+    /* Hardware power-stage faults (PVD/BKIN) always block MOE. A normal
+     * software fault blocks MOE only after calibration has finished (i.e. the
+     * normal running state). During calibration, even a stale fault (e.g.
+     * FLASH_CONFIG from a blank flash) must not prevent the safe 50% zero-
+     * vector driven stage from arming MOE so offset calibration can finish. */
+    if (s_powerstage_fault_flags != 0U ||
+        (m->fault != MOTOR_FAULT_NONE && !foc_calibration_in_progress())) {
         m->pwm_enable_pending_events = 0U;
         m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
         return;
@@ -660,6 +670,23 @@ bool motor_hw_pvd_low(void) {
 #else
     return false;
 #endif
+}
+
+bool motor_hw_clear_recoverable_powerstage_faults(void) {
+    /* Calibration is a stopped, zero-vector operation. Clear only a stale
+     * software latch when the underlying hardware condition is absent now.
+     * Never clear while PVD is currently low or a timer break flag is set. */
+#if HOVERBOARD_PVD_ENABLE
+    if ((PWR->CSR & (1UL << 2)) != 0U) return false;
+#endif
+#if HOVERBOARD_TIM1_BREAK_ENABLE
+    if ((TIM1->SR & TIM_SR_BIF) != 0U) return false;
+#endif
+#if HOVERBOARD_TIM8_BREAK_ENABLE
+    if ((TIM8->SR & TIM_SR_BIF) != 0U) return false;
+#endif
+    s_powerstage_fault_flags = 0U;
+    return true;
 }
 
 void motor_hw_pvd_irq_handler(void) {

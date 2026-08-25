@@ -60,6 +60,7 @@ void motor_hw_pvd_irq_handler(void);
 uint32_t motor_hw_powerstage_fault_flags(void);
 bool motor_hw_powerstage_fault_latched(void);
 bool motor_hw_pvd_low(void);
+bool motor_hw_clear_recoverable_powerstage_faults(void);
 uint8_t motor_hw_read_hall_raw(motor_id_t id);
 uint16_t motor_hw_encoder_cnt(void);
 bool motor_hw_board_temperature_c(float *temp_c);

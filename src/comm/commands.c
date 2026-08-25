@@ -10,7 +10,7 @@
 #include "motor/mc_interface.h"
 #include "hwconf/hw.h"
 #include "telemetry.h"
-#include "motor/mc_interface_sample.h"
+#include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
 #include "motor/foc_math.h"
 #include "applications/appconf_default.h"
@@ -554,7 +554,7 @@ static void reply_current_cal(void) {
     /* Calibration diagnostics keep the established field prefix and only
        append new timing/synchronized-enable fields at the end. */
     foc_cal_diag_t cd; foc_get_calibration_diag(&cd);
-    p[i++] = 17U; /* calibration diagnostic revision */
+    p[i++] = 18U; /* calibration diagnostic revision */
     put_u16(p, &i, cd.warn_mask);
     put_u16(p, &i, cd.fail_range_mask);
     put_u16(p, &i, cd.fail_noise_mask);
@@ -634,6 +634,11 @@ static void reply_current_cal(void) {
     for (uint8_t k = 0U; k < 2U; k++) {
         put_u32(p, &i, cd.first_sample_adc[k]);
     }
+    /* Revision 18: expose power-stage fault latch / PVD status so a stuck
+     * MOE handshake can be attributed to a hardware latch rather than a
+     * software calibration fault. Appended strictly at the end. */
+    put_u32(p, &i, motor_hw_powerstage_fault_flags());
+    p[i++] = motor_hw_pvd_low() ? 1U : 0U;
     payload_end(i);
 }
 
@@ -1886,7 +1891,12 @@ void vesc_comm_periodic_100hz(void) {
     else if (s_display_owner == 1) send_rotor_position(MOTOR_RIGHT);
 }
 
-void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count) {
+static void sample_default_reply(unsigned char *data, unsigned int len) {
+    vesc_comm_send_payload_low_priority(data, (uint16_t)len);
+}
+
+static void send_sample_buffer_impl(const debug_sample_t *samples, uint16_t count,
+                                    void (*reply)(unsigned char *, unsigned int)) {
     if (samples == NULL || count == 0U) return;
     bool raw = mc_interface_sample_raw();
     for (uint16_t n = 0U; n < count; n++) {
@@ -1946,11 +1956,23 @@ void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count)
         p[i++] = 0U; /* reduced sampler status */
         p[i++] = (uint8_t)(((uint32_t)d->phase_u16 * 250U) >> 16);
         put_i32(p, &i, (int32_t)n);
-        vesc_comm_send_payload_low_priority(p, i);
+        reply(p, i);
         /* At 115200 the software TX ring is back-pressure aware; yielding also
          * keeps the sample sender from starving control threads. */
         osDelay(1U);
     }
+}
+
+void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count) {
+    send_sample_buffer_impl(samples, count, sample_default_reply);
+}
+
+void vesc_comm_send_sample_buffer_to(void (*reply)(unsigned char *, unsigned int),
+                                     uint16_t count) {
+    if (reply == NULL) {
+        reply = sample_default_reply;
+    }
+    send_sample_buffer_impl(mc_interface_sample_data(), count, reply);
 }
 
 void vesc_comm_register_appdata_handler(vesc_appdata_handler_t handler) {

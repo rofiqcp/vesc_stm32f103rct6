@@ -4,10 +4,12 @@
 #include "datatypes.h"
 
 /* ========================================================================
- * VESC master public mcpwm_foc API.
- * Signatures intentionally match vedderb/bldc motor/mcpwm_foc.h. The only
- * upstream public API intentionally omitted is mcpwm_foc_get_hfi_state(),
- * because this STM32F103 port is explicitly built without HFI runtime.
+ * VESC 6.00 FOC-subset public mcpwm_foc API.
+ * The normal control/status signatures retain the upstream names. This F103
+ * target intentionally does not provide HFI types/runtime, motor-audio APIs,
+ * or mcpwm_foc_tim_sample_int_handler(); ADC/DMA sampling is owned by the
+ * platform-specific mcpwm_foc_adc_words_isr() path. Callers must feature-gate
+ * those capabilities rather than treating this header as full master parity.
  * ======================================================================== */
 void mcpwm_foc_init(mc_configuration *conf_m1, mc_configuration *conf_m2);
 void mcpwm_foc_deinit(void);
@@ -70,6 +72,9 @@ float mcpwm_foc_get_phase_encoder(void);
 float mcpwm_foc_get_phase_hall(void);
 float mcpwm_foc_get_vd(void);
 float mcpwm_foc_get_vq(void);
+/* Modulation and voltage getters below expose commanded/reconstructed values
+ * derived from duty and Vbus. This board has no independent phase-voltage ADC
+ * channels; these are not phase-voltage measurements. */
 float mcpwm_foc_get_mod_alpha_raw(void);
 float mcpwm_foc_get_mod_beta_raw(void);
 float mcpwm_foc_get_mod_alpha_measured(void);
@@ -170,14 +175,18 @@ typedef struct {
     uint16_t outlier_count[6];
     uint8_t moe_fail_mask, moe_confirmed_mask;
     uint32_t moe_request_adc[2], moe_confirm_adc[2], first_sample_adc[2];
+    uint32_t moe_drop_adc[2];
+    uint8_t moe_drop_bdtr[2], moe_drop_pending[2], moe_drop_pwm_enabled[2];
 } foc_cal_diag_t;
 bool foc_calibration_done(void);
 bool foc_calibration_valid(void);
+bool foc_calibration_in_progress(void);
 foc_cal_stage_t foc_calibration_stage(void);
 void foc_calibration_service_task(void);
 void foc_request_recalibration(void);
 uint32_t foc_adc_isr_count(void);
 uint32_t foc_isr_total_max_cycles(void);
+float foc_last_isr_duration_s(void);
 uint32_t foc_isr_near_deadline_count(void);
 uint32_t foc_isr_period_min_cycles(void);
 uint32_t foc_isr_period_max_cycles(void);

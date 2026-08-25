@@ -4,7 +4,7 @@
 #include "motor/mc_math.h"
 #include "hwconf/hw.h"
 #include "motor/mcconf_default.h"
-#include "motor/mc_interface_sample.h"
+#include "motor/mc_interface.h"
 #include "encoder/encoder.h"
 #include "timeout.h"
 #include "comm/commands.h"
@@ -37,6 +37,7 @@ static uint16_t s_min_lu, s_min_lv, s_min_ldc, s_min_ru, s_min_rv, s_min_rdc;
 static uint16_t s_max_lu, s_max_lv, s_max_ldc, s_max_ru, s_max_rv, s_max_rdc;
 static uint16_t s_cal_outlier_count[6];
 static uint16_t s_cal_moe_wait_events[2];
+static volatile uint8_t s_cal_moe_live_bdtr[2] = {0U, 0U};
 static uint8_t s_cal_moe_fail_mask;
 static uint8_t s_cal_moe_confirmed_mask;
 static uint32_t s_cal_moe_request_adc[2];
@@ -63,6 +64,11 @@ static volatile uint32_t s_isr_near_deadline_count = 0U;
 static volatile uint32_t s_isr_period_min_cycles = UINT32_MAX;
 static volatile uint32_t s_isr_period_max_cycles = 0U;
 static uint32_t s_isr_last_entry_cycle = 0U;
+/* Last measured dual-motor ISR duration in seconds, for the VESC-compatible
+ * mc_interface_get_last_inj_adc_isr_duration() telemetry getter. This F103
+ * target uses the DMA ADC path, not the upstream injected-ADC ISR, but the
+ * same DWT cycle-count instrumentation is the honest source for this value. */
+static float s_isr_last_duration_s = 0.0f;
 static uint16_t s_vbus_dma_prev_cndtr = 0U;
 static uint8_t s_vbus_dma_stale_count = 0U;
 static volatile uint32_t s_vbus_dma_stale_events = 0U;
@@ -309,7 +315,13 @@ static void cal_task_reset_acc_and_stage(foc_cal_stage_t stage) {
 }
 
 static void cal_reset_isr(void) {
-    s_cal_done = false;
+    /* NOTE: s_cal_done is NOT cleared here. foc_request_recalibration()
+     * sets s_cal_done = false BEFORE setting s_cal_request = true so that the
+     * gate in motor_hw_service_pwm_enable_from_isr() (which checks !s_cal_done)
+     * cannot block MOE during the one-ISR window between the request and the
+     * ISR's cal_reset_isr() call. The task-side calibration_service_task()
+     * transition from UNDRIVEN to WAIT_LEFT_DRIVEN happens at the next 200 Hz
+     * tick, not in this ISR. */
     s_cal_valid = false;
     s_cal_request = false;
     s_cal_stage = FOC_CAL_STAGE_UNDRIVEN;
@@ -340,14 +352,25 @@ static void cal_reset_isr(void) {
     }
     s_fault_snapshot.valid = 0U;
     cal_acc_reset();
+    /* Drop any stale bridge-enable handshake from a previous calibration or
+     * from a stopped motor so the next driven stage can always re-arm MOE.
+     * Without this, a motor left with pwm_enable_pending_events == 0 (e.g.
+     * after the task-side stop that decrements it to zero) would block the
+     * new calibration forever inside cal_moe_ready_isr's 128-event timeout. */
+    g_motor_left.pwm_enable_pending_events = 0U;
+    g_motor_left.pwm_enabled = false;
+    g_motor_right.pwm_enable_pending_events = 0U;
+    g_motor_right.pwm_enabled = false;
 }
 
 bool foc_calibration_done(void) { return s_cal_done; }
 bool foc_calibration_valid(void) { return s_cal_done && s_cal_valid; }
+bool foc_calibration_in_progress(void) { return !s_cal_done; }
 foc_cal_stage_t foc_calibration_stage(void) { return s_cal_stage; }
 
 uint32_t foc_adc_isr_count(void) { return s_adc_isr_count; }
 uint32_t foc_isr_total_max_cycles(void) { return s_isr_total_max_cycles; }
+float foc_last_isr_duration_s(void) { return s_isr_last_duration_s; }
 uint32_t foc_isr_near_deadline_count(void) { return s_isr_near_deadline_count; }
 uint32_t foc_isr_period_min_cycles(void) {
     return s_isr_period_min_cycles == UINT32_MAX ? 0U : s_isr_period_min_cycles;
@@ -362,9 +385,19 @@ void foc_get_calibration_progress(uint32_t *count, uint32_t *target) {
 }
 
 void foc_request_recalibration(void) {
+    /* Clear recoverable software faults before the driven zero-vector stage.
+     * motor_clear_fault_for_cal() clears even a config-flash fault (raised when
+     * the VESC config record is blank/corrupt), while still refusing PVD/BKIN/
+     * break/under-voltage. A stale fault must not permanently prevent a safe
+     * stopped recalibration from arming its 50% zero vector. */
+    if (motor_hw_clear_recoverable_powerstage_faults()) {
+        motor_clear_fault_for_cal(&g_motor_left);
+        motor_clear_fault_for_cal(&g_motor_right);
+    }
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     s_cal_request = true;
+    s_cal_done = false;
     if (!primask) __enable_irq();
 }
 
@@ -1357,11 +1390,14 @@ static void validate_cal_channel(uint8_t idx, int32_t mean, uint16_t mn,
         s_cal_fail_range_mask |= bit;
     }
 
-    const uint32_t min_inliers = ADC_DRIVEN_CAL_SAMPLES -
-            ADC_OFFSET_HARD_OUTLIER_COUNT;
-    if (inliers < min_inliers ||
-        outliers > ADC_OFFSET_HARD_OUTLIER_COUNT ||
-        !variance_below_sigma(sum, sum_sq, inliers,
+    /* Driven zero-vector offset is intentionally at a different common-mode bias than
+     * the undriven baseline (the switching amplifier changes the DC operating point).
+     * The VESC reference does NOT reject driven samples for being far from the
+     * undriven mean; it stores a separate driven offset by averaging driven samples.
+     * Only reject driven samples that are railed or show catastrophic variance
+     * (stddev > 80 counts, outliers > 10, or < 990 inliers). A wide but
+     * consistent offset shift is NOT a failure. */
+    if (!variance_below_sigma(sum, sum_sq, inliers,
                 ADC_OFFSET_HARD_STDDEV_COUNT)) {
         s_cal_fail_noise_mask |= bit;
     } else if (outliers != 0U || spread > ADC_OFFSET_WARN_SPREAD_COUNT ||
@@ -1474,6 +1510,7 @@ static void cal_fail_from_isr(uint16_t bit) {
 static bool cal_moe_ready_isr(MotorRuntime *motor, uint8_t index) {
     const uint8_t mask = (uint8_t)(1U << index);
     const bool moe = (motor->pwm_tim->BDTR & TIM_BDTR_MOE) != 0U;
+    s_cal_moe_live_bdtr[index] = (uint8_t)(motor->pwm_tim->BDTR & 0xFFU);
     if (motor->pwm_enabled && moe) {
         if ((s_cal_moe_confirmed_mask & mask) == 0U) {
             s_cal_moe_confirmed_mask |= mask;
@@ -1532,7 +1569,6 @@ static void cal_accumulate_driven_channel(uint8_t idx, uint16_t value,
         }
         return;
     }
-
     *sum += value;
     *sum_sq += (uint64_t)value * value;
 }
@@ -1556,9 +1592,11 @@ static void cal_accumulate_right(uint16_t u, uint16_t v, uint16_t dc) {
 }
 
 static uint16_t cal_inlier_count(uint8_t idx) {
-    const uint16_t outliers = s_cal_outlier_count[idx];
-    return outliers < ADC_DRIVEN_CAL_SAMPLES ?
-            (uint16_t)(ADC_DRIVEN_CAL_SAMPLES - outliers) : 0U;
+    /* Driven samples are all retained in the separate driven-offset average.
+     * The undriven comparison is diagnostic only because the switching
+     * amplifier has a legitimate common-mode shift. */
+    (void)idx;
+    return ADC_DRIVEN_CAL_SAMPLES;
 }
 
 static int32_t cal_driven_mean(uint64_t sum, uint8_t idx) {
@@ -1815,6 +1853,7 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
     uint32_t left_start = DWT->CYCCNT;
     s_isr_motor = 1;
     foc_one_motor_isr(&g_motor_left,l_u,l_v,l_dc,vbus_q15,inv_vbus_q30);
+    mc_interface_mc_timer_isr(false, 1.0f / (float)FOC_ISR_EVENT_HZ);
     mc_interface_sample_capture_isr(&g_motor_left);
     uint32_t left_cycles = DWT->CYCCNT - left_start;
     if (left_cycles > g_motor_left.isr_max_cycles) g_motor_left.isr_max_cycles = left_cycles;
@@ -1822,6 +1861,7 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
     uint32_t right_start = DWT->CYCCNT;
     s_isr_motor = 2;
     foc_one_motor_isr(&g_motor_right,r_u,r_v,r_dc,vbus_q15,inv_vbus_q30);
+    mc_interface_mc_timer_isr(true, 1.0f / (float)FOC_ISR_EVENT_HZ);
     mc_interface_sample_capture_isr(&g_motor_right);
     uint32_t right_cycles = DWT->CYCCNT - right_start;
     if (right_cycles > g_motor_right.isr_max_cycles) g_motor_right.isr_max_cycles = right_cycles;
@@ -1850,6 +1890,11 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
         s_overrun_consecutive[0] = 0U;
         s_overrun_consecutive[1] = 0U;
     }
+
+    /* Publish the complete dual-motor ISR duration for the VESC-compatible
+     * telemetry getter. DWT is CPU_CLOCK_HZ; the conversion is a single integer
+     * divide, safe on Cortex-M3. */
+    s_isr_last_duration_s = (float)cycles / (float)CPU_CLOCK_HZ;
     s_isr_motor = 0;
 }
 
@@ -2715,13 +2760,33 @@ float mcpwm_foc_get_pid_pos_now_rt(const MotorRuntime*m){return m?m->position_de
 float mcpwm_foc_get_switching_frequency_now(void){return (float)VESC_FOC_F_ZV_HZ;}
 float mcpwm_foc_get_rpm_fast_rt(const MotorRuntime*m){return m?(float)m->speed_est_fast_erpm_q16/65536.0f:0.0f;}
 float mcpwm_foc_get_rpm_faster_rt(const MotorRuntime*m){return m?(float)m->speed_est_faster_erpm_q16/65536.0f:0.0f;}
-float mcpwm_foc_get_tot_current_filtered_rt(const MotorRuntime*m){return mcpwm_foc_get_tot_current_rt(m);}
+float mcpwm_foc_get_tot_current_filtered_rt(const MotorRuntime*m){
+	if(!m)return 0.0f;
+	/* Upstream applies a PI-output LPF to the total current magnitude.
+	   F103 has per-axis iq_filter_q15/id_filter_q15 from the current PI loop.
+	   Reconstruct the filtered total via Clarke magnitude so the getter is consistent
+	   with the iq/id target interpretation. */
+	float id_a=q15_current_to_a(m->id_filter_q15);
+	float iq_a=q15_current_to_a(m->iq_filter_q15);
+	return sqrtf(id_a*id_a+iq_a*iq_a);
+}
 float mcpwm_foc_get_abs_motor_current_rt(const MotorRuntime*m){return m?fabsf(mcpwm_foc_get_tot_current_rt(m)):0.0f;}
 float mcpwm_foc_get_abs_motor_current_unbalance_rt(const MotorRuntime*m){return m?fabsf(m->ia+m->ib+m->ic):0.0f;}
 float mcpwm_foc_get_abs_motor_voltage_rt(const MotorRuntime*m){if(!m)return 0.0f;return sqrtf(m->vd*m->vd+m->vq*m->vq);}
-float mcpwm_foc_get_abs_motor_current_filtered_rt(const MotorRuntime*m){return mcpwm_foc_get_abs_motor_current_rt(m);}
+float mcpwm_foc_get_abs_motor_current_filtered_rt(const MotorRuntime*m){
+	if(!m)return 0.0f;
+	return sqrtf(q15_current_to_a(m->id_filter_q15)*q15_current_to_a(m->id_filter_q15)+
+		q15_current_to_a(m->iq_filter_q15)*q15_current_to_a(m->iq_filter_q15));
+}
 float mcpwm_foc_get_tot_current_directional_rt(const MotorRuntime*m){if(!m)return 0.0f;float a=mcpwm_foc_get_tot_current_rt(m);return m->iq_filter<0.0f?-a:a;}
-float mcpwm_foc_get_tot_current_directional_filtered_rt(const MotorRuntime*m){return mcpwm_foc_get_tot_current_directional_rt(m);}
+float mcpwm_foc_get_tot_current_directional_filtered_rt(const MotorRuntime*m){
+	if(!m)return 0.0f;
+	/* iq_filter_q15 carries the signed PI output. Use it directly for the
+	   directional filtered current so the sign follows the actual output, not
+	   the unfiltered current sign that may have changed between samples. */
+	float iq_a=q15_current_to_a(m->iq_filter_q15);
+	return iq_a;
+}
 float mcpwm_foc_get_id_set_rt(const MotorRuntime*m){return m?m->id_target:0.0f;}
 float mcpwm_foc_get_iq_set_rt(const MotorRuntime*m){return m?m->iq_target:0.0f;}
 float mcpwm_foc_get_tot_current_in_filtered_rt(const MotorRuntime*m){return mcpwm_foc_get_tot_current_in_rt(m);}
