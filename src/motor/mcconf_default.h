@@ -86,6 +86,15 @@
 #define MCCONF_FOC_FW_BACKOFF_DEFAULT         0.0f
 #define MCCONF_FOC_MAG_VD_MAX_DEFAULT        1.0f
 #define MCCONF_FOC_OVERMOD_FACTOR_DEFAULT    1.0f
+/* Newer VESC fields implemented by this port (runtime-only while wire ABI
+ * reports VESC 6.00). The F103 port has no motor NTC, so temp compensation
+ * uses the STM32 board-temperature proxy as the thermal input. */
+#define MCCONF_FOC_TEMP_COMP_DEFAULT               false
+#define MCCONF_FOC_TEMP_COMP_BASE_TEMP_DEFAULT     25.0f
+/* Offset calibration mode bits: 1 = driven, 2 = undriven, 4 = periodic
+ * recalibration on motor-stopped (state OFF). Keep bit2 OFF until the
+ * zero-vector/safety behavior of the hoverboard bridge is verified live. */
+#define MCCONF_FOC_OFFSETS_CAL_MODE_DEFAULT        1
 
 /* FOC defaults are board-qualified values from appconf_default.h. */
 #define MCCONF_FOC_F_ZV_DEFAULT               VESC_FOC_F_ZV_HZ

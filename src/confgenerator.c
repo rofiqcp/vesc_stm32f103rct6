@@ -695,6 +695,9 @@ static bool apply_mc(motor_id_t id,const uint8_t *w) {
     m->foc_fw_backoff=MCCONF_FOC_FW_BACKOFF_DEFAULT;
     m->foc_mag_vd_max=MCCONF_FOC_MAG_VD_MAX_DEFAULT;
     m->foc_overmod_factor=MCCONF_FOC_OVERMOD_FACTOR_DEFAULT;
+    m->foc_temp_comp=MCCONF_FOC_TEMP_COMP_DEFAULT;
+    m->foc_temp_comp_base_temp=MCCONF_FOC_TEMP_COMP_BASE_TEMP_DEFAULT;
+    m->foc_offsets_cal_mode=MCCONF_FOC_OFFSETS_CAL_MODE_DEFAULT;
     m->foc_openloop_rpm=clampf(get_auto_at(w,201),10.0f,MOTOR_DEFAULT_MAX_ERPM);
     {int32_t q=205;m->foc_openloop_rpm_low=clampf(vesc_buf_get_float16(w,1000.0f,&q),0.0f,MOTOR_DEFAULT_MAX_ERPM);}
     /* foc_d_gain_scale_start/max_mod are present in the VESC-6.00 wire image,
@@ -1178,6 +1181,9 @@ static void mcconf_decode_wire(const uint8_t *w, mc_configuration *c) {
     c->foc_fw_backoff=MCCONF_FOC_FW_BACKOFF_DEFAULT;
     c->foc_mag_vd_max=MCCONF_FOC_MAG_VD_MAX_DEFAULT;
     c->foc_overmod_factor=MCCONF_FOC_OVERMOD_FACTOR_DEFAULT;
+    c->foc_temp_comp=MCCONF_FOC_TEMP_COMP_DEFAULT;
+    c->foc_temp_comp_base_temp=MCCONF_FOC_TEMP_COMP_BASE_TEMP_DEFAULT;
+    c->foc_offsets_cal_mode=MCCONF_FOC_OFFSETS_CAL_MODE_DEFAULT;
 
     c->s_pid_kp=get_auto_at(w,VESC6_MC_OFF_S_PID_KP); c->s_pid_ki=get_auto_at(w,VESC6_MC_OFF_S_PID_KI);
     c->s_pid_kd=get_auto_at(w,VESC6_MC_OFF_S_PID_KD); c->s_pid_kd_filter=get_f16_at(w,342U,10000.0f);

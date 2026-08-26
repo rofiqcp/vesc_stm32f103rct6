@@ -266,6 +266,14 @@ typedef struct mc_configuration {
     MTPA_MODE foc_mtpa_mode;
     float foc_fw_current_max, foc_fw_duty_start, foc_fw_ramp_time, foc_fw_q_current_factor, foc_fw_backoff;
     float foc_mag_vd_max, foc_overmod_factor;
+    /* VESC-style motor-temperature (resistance) compensation. The F103 port has
+       no motor NTC, so the STM32 board-temperature proxy (board_temp_filter_c)
+       is used as the thermal input. comp_factor = 1 + 0.00386*(T - base_temp). */
+    bool foc_temp_comp;
+    float foc_temp_comp_base_temp;
+    /* VESC offset-calibration mode bits: bit0 = driven, bit1 = undriven,
+       bit2 = periodic re-calibration when motor stopped (state OFF). */
+    uint8_t foc_offsets_cal_mode;
     float s_pid_kp, s_pid_ki, s_pid_kd, s_pid_kd_filter, s_pid_min_erpm;
     bool s_pid_allow_braking;
     float s_pid_ramp_erpms_s;
@@ -857,6 +865,18 @@ typedef struct MotorRuntime {
 
     float current_kp;
     float current_ki;
+    /* Cached temp-comp / offset-cal mode flags (mirrored from mc_configuration
+       on every SET_MCCONF). The 1-kHz loop and 16-kHz ISR read these directly
+       instead of dereferencing the configuration mirror each tick. */
+    bool foc_temp_comp;
+    float foc_temp_comp_base_temp;
+    uint8_t foc_offsets_cal_mode;
+    /* VESC-style temperature-compensated R and Ki. The F103 port has no motor
+       NTC, so the STM32 board-temperature proxy (board_temp_filter_c) is the
+       thermal input. comp_factor = 1 + 0.00386*(T - base_temp); these hold
+       foc_motor_r*comp and current_ki*comp, consumed by the observer/PI. */
+    volatile float res_temp_comp_ohm;
+    volatile float current_ki_temp_comp;
     float current_scale;
     float dc_current_scale;
     volatile float current_offset_u;

@@ -335,7 +335,11 @@ static void clamp_observer_state_vector(MotorRuntime *m, int32_t rotor_a, int32_
 
 void foc_observer_precalc(MotorRuntime *m) {
     if (!m) return;
-    float r = fmaxf(m->foc_motor_r, 1.0e-6f);
+    /* VESC-style temperature compensation: use the compensated resistance when
+       enabled and valid, otherwise the configured R. This keeps the voltage
+       model consistent with the copper drift tracked in the 1-kHz loop. */
+    float r = fmaxf((m->foc_temp_comp && m->board_temp_valid)
+                        ? m->res_temp_comp_ohm : m->foc_motor_r, 1.0e-6f);
     float l = fmaxf(m->foc_motor_l, 1.0e-8f);
     float flux = fmaxf(m->foc_motor_flux_linkage, 1.0e-6f);
 

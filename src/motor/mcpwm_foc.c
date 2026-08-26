@@ -1201,10 +1201,17 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
         if (m->control_mode==MOTOR_CTRL_OPENLOOP_DUTY_PHASE) vd=direct; else vq=direct;
         m->vd_int_q31=m->vq_int_q31=0; m->vd_int_q15=m->vq_int_q15=0;
     } else {
-    /* Q15 error x Q16.16 Ki*dt produces a Q31 increment. Keep that full
-       precision in the integrator instead of truncating every 62.5 us. */
-    m->vd_int_q31 += (int64_t)err_d * (int64_t)m->current_ki_dt_q16;
-    m->vq_int_q31 += (int64_t)err_q * (int64_t)m->current_ki_dt_q16;
+    /* Q15 error x Q16.16 Ki*dt produces a Q31 increment. Temperature
+       compensation scales Ki (current_ki_temp_comp) so the integrator tracks
+       copper drift; fall back to the untouched value when comp is disabled.
+       The Ki*dt Q16 conversion mirrors motor_set_current_pi_gains(). */
+    int32_t ki_dt = m->current_ki_dt_q16;
+    if (m->foc_temp_comp && m->board_temp_valid) {
+        ki_dt = (int32_t)((m->current_ki_temp_comp * FOC_DT_S *
+                           FOC_CURRENT_Q_BASE_A / FOC_VOLTAGE_Q_BASE_V) * 65536.0f);
+    }
+    m->vd_int_q31 += (int64_t)err_d * (int64_t)ki_dt;
+    m->vq_int_q31 += (int64_t)err_q * (int64_t)ki_dt;
     int64_t int_lim_q31 = (int64_t)vmax_q15 << 16;
     if (m->vd_int_q31 > int_lim_q31) m->vd_int_q31 = int_lim_q31;
     if (m->vd_int_q31 < -int_lim_q31) m->vd_int_q31 = -int_lim_q31;
