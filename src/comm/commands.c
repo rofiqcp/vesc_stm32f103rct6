@@ -145,13 +145,13 @@ static int16_t scaled_i16(float v, float scale) {
     float x = v * scale;
     if (x > 32767.0f) x = 32767.0f;
     if (x < -32768.0f) x = -32768.0f;
-    return (int16_t)lroundf(x);
+    return (int16_t)x; /* truncation matches upstream VESC buffer_append_float16 */
 }
 static int32_t scaled_i32(float v, float scale) {
     double x = (double)v * (double)scale;
     if (x > 2147483647.0) x = 2147483647.0;
     if (x < -2147483648.0) x = -2147483648.0;
-    return (int32_t)llround(x);
+    return (int32_t)x; /* truncation matches upstream VESC buffer_append_float32 */
 }
 
 
@@ -1724,6 +1724,7 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
         case COMM_ALIVE:
             timeout_reset();
             app_command_uart_keepalive(id);
+            (void)hw_status_power_is_held(); /* keepalive may hold power latch */
             break;
         case COMM_CUSTOM_APP_DATA:
             if (len >= 2U) {
@@ -1885,6 +1886,11 @@ static void vesc_comm_reply_diag(void) {
 void vesc_comm_periodic_100hz(void) {
     conf_general_service_100hz();
     if (!s_motor_ready) return;
+    /* VESC Tool "Realtime Data" tab relies on the controller periodically
+     * pushing COMM_GET_VALUES for both bridges. Send it at the 100 Hz hook so
+     * the live data view populates without an external poll loop. */
+    reply_get_values(COMM_GET_VALUES, 0x003FFFFFUL, MOTOR_LEFT);
+    reply_get_values(COMM_GET_VALUES, 0x003FFFFFUL, MOTOR_RIGHT);
     /* Kedua bridge lokal memiliki display-position state sendiri. Motor-2
      * mengikuti semantics local dual-motor forwarding, tanpa driver CAN. */
     if (s_display_owner == 0) send_rotor_position(MOTOR_LEFT);
@@ -2009,7 +2015,7 @@ bool vesc_comm_task_init(void) {
     }
 
     const osThreadAttr_t packet_attr = {
-        .name="uartcomm proc", .priority=osPriorityAboveNormal, .stack_size=1536U
+        .name="uartcomm proc", .priority=osPriorityHigh, .stack_size=1536U
     };
     const osThreadAttr_t block_attr = {
         .name="comm_block", .priority=osPriorityNormal, .stack_size=3072U

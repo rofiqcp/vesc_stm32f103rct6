@@ -475,6 +475,10 @@ def parse_cal(p: bytes) -> dict:
                 d["moe_request_adc"] = [r.u32(), r.u32()]
                 d["moe_confirm_adc"] = [r.u32(), r.u32()]
                 d["first_sample_adc"] = [r.u32(), r.u32()]
+            # V18 appends power-stage fault latch and live PVD status.
+            if d.get("cal_diag_revision",0) >= 18 and len(p)-r.i >= 5:
+                d["powerstage_fault_flags"] = r.u32()
+                d["pvd_low"] = bool(r.u8())
     return d
 
 

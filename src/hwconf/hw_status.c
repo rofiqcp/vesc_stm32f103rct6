@@ -9,6 +9,14 @@
 
 static volatile bool s_tone_level = false;
 static volatile bool s_tone_running = false;
+/* VESC-correct finite-beep support. A tone may be infinite (stopped only by an
+ * explicit hw_status_tone_stop) or self-terminate after a fixed number of
+ * half-cycles. The self-terminating path is what the V33 status-thread refactor
+ * accidentally dropped when it removed the old s_tone_toggle_remaining guard:
+ * without it a tone that the status task fails to stop (delayed/blocked/stopped
+ * thread) keeps TIM3 toggling the pin forever, i.e. a stuck-ON buzzer. */
+static volatile bool s_tone_infinite = false;
+static volatile uint32_t s_tone_toggle_remaining = 0U;
 static volatile bool s_power_held = true;
 static osThreadId_t s_status_thread;
 static bool s_status_started = false;
@@ -109,15 +117,45 @@ void hw_status_timer_init(void) {
 }
 
 void hw_status_tone_start(uint16_t hz) {
+    /* Infinite tone: only an explicit hw_status_tone_stop ends it. Retained for
+     * VESC API parity; the fault/startup sequences below prefer the bounded
+     * hw_status_tone_start_for() so the buzzer can never be left stuck ON. */
+    hw_status_tone_start_for(hz, 0U);
+}
+
+void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms) {
     if (hz < 100U) hz = 100U;
     if (hz > 5000U) hz = 5000U;
 
-    uint32_t arr = 500000UL / (uint32_t)hz;
+    /* hw_status_timer_init() sets PSC=63 on a 64 MHz APB1 (timer clock is
+     * doubled back to 64 MHz), so the counter runs at 1 MHz. ARR is therefore
+     * 1,000,000/hz counts per full period; the ISR toggles the pin each
+     * update event, giving the requested audio frequency. */
+    uint32_t arr = 1000000UL / (uint32_t)hz;
     if (arr == 0U) arr = 1U;
     arr -= 1U;
 
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
+
+    s_tone_infinite = false;
+    s_tone_toggle_remaining = 0U;
+    if (duration_ms == 0U) {
+        s_tone_infinite = true;          /* unbounded until tone_stop() */
+    } else {
+        /* Count half-cycles so the tone runs for exactly duration_ms. */
+        uint64_t toggles = ((uint64_t)hz * 2ULL * (uint64_t)duration_ms +
+                            999ULL) / 1000ULL;
+        if (toggles > 0xFFFFFFFEULL) toggles = 0xFFFFFFFEULL;
+        s_tone_toggle_remaining = (uint32_t)toggles;
+        if (s_tone_toggle_remaining == 0U) {
+            /* Duration too short to fit one half-cycle: stay silent. */
+            __enable_irq();
+            hw_status_tone_stop();
+            return;
+        }
+    }
+
     TIM3->CR1 &= ~TIM_CR1_CEN;
     TIM3->ARR = arr;
     TIM3->CNT = 0U;
@@ -146,15 +184,41 @@ void hw_status_tone_stop(void) {
     TIM3->CR1 &= ~TIM_CR1_CEN;
     TIM3->SR = 0U;
     s_tone_running = false;
+    s_tone_infinite = false;
+    s_tone_toggle_remaining = 0U;
     s_tone_level = false;
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
     if (!primask) __enable_irq();
+}
+
+bool hw_status_tone_is_running(void) {
+    return s_tone_running;
+}
+
+bool hw_status_tone_level(void) {
+    return s_tone_level;
 }
 
 void hw_status_tim3_irq_handler(void) {
     if ((TIM3->SR & TIM_SR_UIF) == 0U) return;
     TIM3->SR &= ~TIM_SR_UIF;
     if (!s_tone_running) return;
+
+    if (!s_tone_infinite) {
+        if (s_tone_toggle_remaining == 0U) {
+            /* Bounded tone finished: silence the pin and halt the timer so the
+             * buzzer can never be left stuck ON even if the status task that
+             * scheduled it is delayed or stops. */
+            TIM3->DIER = 0U;
+            TIM3->CR1 &= ~TIM_CR1_CEN;
+            s_tone_running = false;
+            s_tone_level = false;
+            BUZZER_PORT->BRR = BUZZER_PIN;
+            return;
+        }
+        s_tone_toggle_remaining--;
+    }
+
     s_tone_level = !s_tone_level;
     if (s_tone_level) {
         BUZZER_PORT->BSRR = BUZZER_PIN;
@@ -204,7 +268,7 @@ static void status_thread(void *argument) {
                 fault_stage = 1U;
                 fault_output_on = true;
                 motor_hw_led(true);
-                hw_status_tone_start(fault_group == 0U ? 1500U : 2400U);
+                hw_status_tone_start_for(fault_group == 0U ? 1500U : 2400U, 100U);
                 fault_deadline = now + 100U;
             } else if ((int32_t)(now - fault_deadline) >= 0) {
                 if (fault_stage == 1U) {
@@ -238,7 +302,7 @@ static void status_thread(void *argument) {
                     fault_stage = 1U;
                     fault_output_on = true;
                     motor_hw_led(true);
-                    hw_status_tone_start(2400U);
+                    hw_status_tone_start_for(2400U, 100U);
                     fault_deadline = now + 100U;
                 } else {
                     fault_group = fault_tens != 0U ? 0U : 1U;
@@ -293,7 +357,10 @@ static void status_thread(void *argument) {
                     if (note->hz == 0U) {
                         hw_status_tone_stop();
                     } else {
-                        hw_status_tone_start(note->hz);
+                        /* Each note self-terminates after its duration, so the
+                         * melody cannot leave the buzzer stuck ON if the thread
+                         * is late reaching the next scheduler tick. */
+                        hw_status_tone_start_for(note->hz, note->duration_ms);
                     }
                     startup_deadline = now + note->duration_ms;
                 }
