@@ -2357,10 +2357,21 @@ void timer_thread(void *argument) {
 	uint8_t calibration_divider = 0U;
 	uint8_t ten_ms_divider = 0U;
 	TickType_t last_wake = xTaskGetTickCount();
+	const TickType_t watchdog_start_at = last_wake + pdMS_TO_TICKS(2000U);
+	bool watchdog_start_attempted = false;
 
 	for (;;) {
 		const uint32_t now = (uint32_t)xTaskGetTickCount();
 		timeout_heartbeat(TIMEOUT_HEARTBEAT_MOTOR_SERVICE);
+		if (!watchdog_start_attempted &&
+		    (int32_t)((TickType_t)now - watchdog_start_at) >= 0) {
+			/* Hardware IWDG, when explicitly enabled, starts only after the
+			 * scheduler and all workers have had two seconds to establish
+			 * heartbeat. This avoids reset loops that make SWD require
+			 * connect-under-reset during commissioning. */
+			timeout_watchdog_start();
+			watchdog_start_attempted = true;
+		}
 
 		motor_slow_update_1khz(&g_motor_left, now);
 		motor_slow_update_1khz(&g_motor_right, now);
@@ -2504,7 +2515,6 @@ bool mc_interface_start_threads(void) {
 	}
 
 	s_threads_started = true;
-	timeout_watchdog_start();
 	return true;
 }
 

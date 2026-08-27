@@ -2,6 +2,7 @@
 #include "hwconf/hw_hoverboard.h"
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
+#include "comm/commands.h"
 #include "stm32f1xx_hal.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -427,19 +428,31 @@ bool hw_status_init(void) {
     return true;
 }
 
+static void early_fatal_delay_with_comm(uint32_t delay_ms) {
+    const uint32_t start = HAL_GetTick();
+    while ((HAL_GetTick() - start) < delay_ms) {
+        /* If USART3/commands were already brought up, preserve VESC Tool
+         * recovery access even though the motor subsystem is in early-fatal. */
+        if (commands_is_initialized()) {
+            (void)vesc_comm_poll_once();
+        }
+        HAL_Delay(1U);
+    }
+}
+
 void hw_status_early_fatal_loop(void) {
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
     for (;;) {
-        /* 4 rapid LED flashes + a fixed buzzer level indicate failure before
-         * the RTOS status threads could start. */
+        /* 4 rapid LED flashes + buzzer indicate a pre-scheduler failure while
+         * the management UART remains serviceable when it was initialized. */
         for (uint8_t i = 0U; i < 4U; i++) {
             motor_hw_led(true);
             HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_SET);
-            HAL_Delay(80U);
+            early_fatal_delay_with_comm(80U);
             motor_hw_led(false);
             HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
-            HAL_Delay(80U);
+            early_fatal_delay_with_comm(80U);
         }
-        HAL_Delay(800U);
+        early_fatal_delay_with_comm(800U);
     }
 }

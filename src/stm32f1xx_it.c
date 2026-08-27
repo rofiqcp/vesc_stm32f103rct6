@@ -79,15 +79,13 @@ void TIM2_IRQHandler(void) {
 }
 
 void DMA1_Channel2_IRQHandler(void) {
+    /* SmartESC-compatible USART3 TX DMA ISR -> STM32 HAL DMA state machine. */
     app_uartcomm_dma_tx_irq_handler();
 }
 
 void DMA1_Channel3_IRQHandler(void) {
+    /* SmartESC-compatible USART3 RX circular DMA ISR -> HAL_DMA_IRQHandler. */
     app_uartcomm_dma_rx_irq_handler();
-}
-
-void USART3_IRQHandler(void) {
-    app_uartcomm_irq_handler();
 }
 
 void TIM3_IRQHandler(void) {

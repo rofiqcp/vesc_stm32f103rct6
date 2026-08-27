@@ -30,6 +30,7 @@ void vesc_comm_set_thread_ids(TaskHandle_t packet, TaskHandle_t blocking);
 void vesc_comm_set_config_ready(bool ready);
 void vesc_comm_set_motor_ready(bool ready);
 bool vesc_comm_motor_ready(void);
+bool vesc_comm_poll_once(void);
 void vesc_comm_send_payload(const uint8_t *payload, uint16_t len);
 void vesc_comm_periodic_100hz(void);
 void vesc_comm_send_sample_buffer(const debug_sample_t *samples, uint16_t count);

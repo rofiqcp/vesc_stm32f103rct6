@@ -44,6 +44,36 @@ extra = (ROOT / "tools" / "extra_script.py").read_text()
 if "CMSIS_RTOS_V2" in extra or "cmsis_os2.c" in extra:
     errors.append("build still compiles CMSIS-RTOS2 wrapper")
 
+
+# Commissioning safety: hardware IWDG must not start before scheduler and is
+# disabled by default to keep SWD reprogrammable without connect-under-reset.
+platformio = (ROOT / "platformio.ini").read_text()
+if "-DVESC_IWDG_ENABLE=0" not in platformio:
+    errors.append("commissioning build must default VESC_IWDG_ENABLE=0")
+mc = (SRC / "motor" / "mc_interface.c").read_text()
+start_threads_pos = mc.find("bool mc_interface_start_threads(void)")
+if start_threads_pos >= 0:
+    block = mc[start_threads_pos:start_threads_pos + 2500]
+    if "timeout_watchdog_start();" in block:
+        errors.append("IWDG start remains in pre-scheduler mc_interface_start_threads")
+
+wrapper = SRC / "freertos_vendor" / "queue_wrapper.c"
+if not wrapper.exists() or 'diagnostic ignored "-Wnonnull"' not in wrapper.read_text():
+    errors.append("source-scoped FreeRTOS queue.c -Wnonnull wrapper missing")
+if '-<queue.c>' not in extra:
+    errors.append("vendor FreeRTOS queue.c is not excluded from direct BuildSources")
+
+# STM32F1 reflash safety: generic AFIO MAPR read-modify-write helpers can
+# corrupt SWJ_CFG. Require the controlled SWD-preserving setup.
+hw = (SRC / "hwconf" / "hw.c").read_text()
+uart = (SRC / "applications" / "app_uartcomm.c").read_text()
+if "__HAL_AFIO_REMAP_SWJ_NOJTAG()" in hw or "__HAL_AFIO_REMAP_ADC1_ETRGREG_ENABLE()" in hw:
+    errors.append("unsafe generic AFIO MAPR remap helper remains")
+if "AFIO_SWJ_JTAG_OFF_SWD_ON_LOCAL" not in hw or "AFIO->MAPR = mapr;" not in hw:
+    errors.append("controlled JTAG-off/SWD-on AFIO MAPR setup missing")
+if re.search(r"AFIO->MAPR\s*[|&^]?=", uart):
+    errors.append("UART init still performs unsafe AFIO MAPR RMW")
+
 fc = (SRC / "FreeRTOSConfig.h").read_text()
 for required in [
     "#define configMAX_PRIORITIES                    7",

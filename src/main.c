@@ -17,6 +17,22 @@ static void SystemClock_Config(void);
 static void dwt_init(void);
 static void early_fatal(void);
 
+/* Debug-visible boot breadcrumbs. They cost 8 bytes of RAM and make OpenOCD
+ * diagnosis deterministic when the UART cannot yet report a failure. */
+volatile uint32_t g_vesc_boot_stage = 0U;
+volatile uint32_t g_vesc_boot_error = 0U;
+volatile uint32_t g_vesc_sampling_contract_flags = 0U;
+
+/* Export task handles for OpenOCD/GDB commissioning. They are intentionally
+ * globals (rather than function locals) so thread creation failures can be
+ * diagnosed even before the scheduler starts. */
+TaskHandle_t g_task_fault_stop = NULL;
+TaskHandle_t g_task_timer = NULL;
+TaskHandle_t g_task_packet_process = NULL;
+TaskHandle_t g_task_blocking = NULL;
+TaskHandle_t g_task_sample_send = NULL;
+
+
 /* VESC-standard worker names, with SmartESC-like priority distribution. */
 #define VESC_PRIO_LOW       ((UBaseType_t)4U)
 #define VESC_PRIO_NORMAL    ((UBaseType_t)5U)
@@ -29,47 +45,65 @@ extern void sample_send_thread(void *argument);
 extern void fault_stop_thread(void *argument);
 
 static bool create_vesc_tasks(void) {
-    TaskHandle_t packet = NULL, blocking = NULL;
-    TaskHandle_t timer = NULL, sample = NULL, fault = NULL;
+    if (xTaskCreate(fault_stop_thread, "fault_stop", 192U, NULL, VESC_PRIO_SAFETY, &g_task_fault_stop) != pdPASS) return false;
+    if (xTaskCreate(timer_thread, "timer", 256U, NULL, VESC_PRIO_NORMAL, &g_task_timer) != pdPASS) return false;
+    if (xTaskCreate(packet_process_thread, "packet_process", 384U, NULL, VESC_PRIO_NORMAL, &g_task_packet_process) != pdPASS) return false;
+    if (xTaskCreate(blocking_thread, "blocking", 768U, NULL, VESC_PRIO_NORMAL, &g_task_blocking) != pdPASS) return false;
+    if (xTaskCreate(sample_send_thread, "sample_send", 192U, NULL, VESC_PRIO_LOW, &g_task_sample_send) != pdPASS) return false;
 
-    if (xTaskCreate(fault_stop_thread, "fault_stop", 192U, NULL, VESC_PRIO_SAFETY, &fault) != pdPASS) return false;
-    if (xTaskCreate(timer_thread, "timer", 256U, NULL, VESC_PRIO_NORMAL, &timer) != pdPASS) return false;
-    if (xTaskCreate(packet_process_thread, "packet_process", 384U, NULL, VESC_PRIO_NORMAL, &packet) != pdPASS) return false;
-    if (xTaskCreate(blocking_thread, "blocking", 768U, NULL, VESC_PRIO_NORMAL, &blocking) != pdPASS) return false;
-    if (xTaskCreate(sample_send_thread, "sample_send", 192U, NULL, VESC_PRIO_LOW, &sample) != pdPASS) return false;
-
-    vesc_comm_set_thread_ids(packet, blocking);
-    mc_interface_set_thread_ids(timer, sample, fault);
+    vesc_comm_set_thread_ids(g_task_packet_process, g_task_blocking);
+    mc_interface_set_thread_ids(g_task_timer, g_task_sample_send, g_task_fault_stop);
     return true;
 }
 
 int main(void) {
+    g_vesc_boot_stage = 1U;
     HAL_Init();
+#if defined(VESC_DEBUG_BUILD) && defined(DBGMCU_CR_DBG_IWDG_STOP)
+    /* If IWDG is deliberately enabled later, freeze it whenever Cortex-M3 is
+     * halted by ST-Link/GDB. */
+    DBGMCU->CR |= DBGMCU_CR_DBG_IWDG_STOP;
+#endif
     timeout_capture_reset_reason();
     HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
 
+    g_vesc_boot_stage = 10U;
     hw_status_early_init();
     SystemClock_Config();
     dwt_init();
     hw_status_timer_init();
-    if (!hw_status_init()) early_fatal();
+    if (!hw_status_init()) { g_vesc_boot_error = 11U; early_fatal(); }
 
-    /* Match SmartESC's boot model: hardware/configuration is initialized before
-     * vTaskStartScheduler(), while all run-time work is owned by five tasks. */
+    /* Create the five native-FreeRTOS task objects first, but do not start the
+     * scheduler yet. This gives commands.c the packet/blocking task handles it
+     * validates while keeping the exact five-application-task architecture. */
+    g_vesc_boot_stage = 20U;
+    if (!create_vesc_tasks()) { g_vesc_boot_error = 21U; early_fatal(); }
+
+    /* Bring up the permanent USART3 VESC management transport BEFORE the motor
+     * power-stage/ADC initialization. If motor hardware init fails, hw.c can
+     * still poll this parser and answer COMM_FW_VERSION for diagnosis/recovery. */
+    g_vesc_boot_stage = 30U;
+    commands_init();
+    if (!commands_is_initialized()) { g_vesc_boot_error = 31U; early_fatal(); }
+
+    /* Match SmartESC's separation: communication is independent of the hard
+     * motor-control startup, while FOC remains interrupt-driven once sampling
+     * is enabled. */
+    g_vesc_boot_stage = 40U;
     motor_hw_init();
 
-    /* Initialize the VESC motor runtime before applying wire configuration.
-     * The previous boot path read g_motor_left.foc_calibrate_on_boot
-     * before motor_defaults(), which made the zero-initialized flag suppress
-     * boot current calibration. The VESC6 wire image does not carry this
-     * runtime-only field, so use its compiled default before FOC init. */
+    /* Initialize the VESC motor runtime before applying wire configuration. */
+    g_vesc_boot_stage = 50U;
     foc_calibration_set_skip(!MCCONF_FOC_CALIBRATE_ON_BOOT_DEFAULT);
     mc_interface_init(false);
 
     vesc_config_init_defaults();
+    g_vesc_boot_stage = 60U;
     if (!vesc_config_apply_defaults()) {
         motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_FLASH_CONFIG);
         motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_FLASH_CONFIG);
+        g_vesc_boot_error = 61U;
     }
 
     const bool loaded_cfg = conf_general_init();
@@ -77,29 +111,37 @@ int main(void) {
         motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_FLASH_CONFIG);
         motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_FLASH_CONFIG);
     }
-    if (!telemetry_init()) early_fatal();
+    g_vesc_boot_stage = 70U;
+    if (!telemetry_init()) { g_vesc_boot_error = 71U; early_fatal(); }
     mc_interface_sample_init();
     app_command_init();
     app_adc_init();
-    if (!timeout_init()) early_fatal();
+    if (!timeout_init()) { g_vesc_boot_error = 72U; early_fatal(); }
 
-    /* Create all five tasks before resources that validate their handles. */
-    if (!create_vesc_tasks()) early_fatal();
-    commands_init();
-    if (!commands_is_initialized()) early_fatal();
     vesc_comm_set_config_ready(true);
-    if (!mc_interface_start_threads()) early_fatal();
+    g_vesc_boot_stage = 80U;
+    if (!mc_interface_start_threads()) { g_vesc_boot_error = 81U; early_fatal(); }
 
+    g_vesc_boot_stage = 90U;
     motor_hw_start_sampling();
-    if (!motor_hw_sampling_contract_valid()) {
+    g_vesc_sampling_contract_flags = motor_hw_sampling_contract_flags();
+    if (g_vesc_sampling_contract_flags != 0U) {
+        /* A sampling-contract failure is safety-critical for motor drive, but
+         * it must NOT kill the VESC management link. Keep both bridges hard
+         * off, latch ADC/DMA faults, inhibit motor commands and still start
+         * FreeRTOS so packet_process can answer COMM_FW_VERSION/diagnostics. */
         motor_hw_emergency_all_off();
         motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_ADC_DMA);
         motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_ADC_DMA);
-        early_fatal();
+        g_vesc_boot_error = 91U;
+        timeout_watchdog_require_foc(false);
+        vesc_comm_set_motor_ready(false);
+    } else {
+        timeout_watchdog_require_foc(true);
+        vesc_comm_set_motor_ready(true);
     }
-    timeout_watchdog_require_foc(true);
-    vesc_comm_set_motor_ready(true);
 
+    g_vesc_boot_stage = 100U;
     vTaskStartScheduler();
     early_fatal();
 }

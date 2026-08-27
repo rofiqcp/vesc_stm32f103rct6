@@ -7,6 +7,11 @@
 #include "stm32f1xx_hal.h"
 #include <math.h>
 
+#ifndef VESC_IWDG_ENABLE
+#define VESC_IWDG_ENABLE 0
+#endif
+
+
 /* Command timeout state. */
 static volatile uint32_t s_timeout_ms = MOTOR_COMMAND_TIMEOUT_MS;
 static volatile uint32_t s_last_update_ms = 0U;
@@ -143,6 +148,13 @@ void timeout_heartbeat_from_isr(timeout_heartbeat_id_t id) {
 
 void timeout_watchdog_start(void) {
     if (s_watchdog_started) return;
+#if !VESC_IWDG_ENABLE
+    /* Commissioning-safe default: do not start the irreversible hardware IWDG.
+     * Motor command timeout and all power-stage fault paths remain active.
+     * Re-enable only after UART/FOC commissioning is stable. */
+    s_watchdog_healthy = true;
+    return;
+#else
 
     /* STM32 IWDG sequence: start it, unlock PR/RLR, program them, wait for
      * synchronization, then reload. Once started it cannot be stopped until
@@ -162,6 +174,7 @@ void timeout_watchdog_start(void) {
     for (uint32_t i = 0U; i < TIMEOUT_HEARTBEAT_COUNT; i++) s_hb_last[i] = s_hb[i];
     s_watchdog_healthy = true;
     s_watchdog_started = true;
+#endif
 }
 
 void timeout_watchdog_require_foc(bool required) {

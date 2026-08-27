@@ -9,15 +9,32 @@ fr = os.path.join(framework, "Middlewares", "Third_Party", "FreeRTOS", "Source")
 portable = os.path.join(fr, "portable", "GCC", "ARM_CM3")
 memmang = os.path.join(fr, "portable", "MemMang")
 
+# Add the STM32CubeF1 FreeRTOS include paths. queue.c itself is intentionally
+# excluded below and is compiled through src/freertos_vendor/queue_wrapper.c.
+# That wrapper suppresses GCC 7.2.1's vendor-only false-positive -Wnonnull
+# without hiding the diagnostic from the rest of this firmware.
 env.Append(CPPPATH=[
     fr,
     os.path.join(fr, "include"),
     portable,
 ])
 
-env.BuildSources(os.path.join("$BUILD_DIR", "freertos_kernel"), fr,
-                 src_filter=["+<*.c>"])
-env.BuildSources(os.path.join("$BUILD_DIR", "freertos_port"), portable,
-                 src_filter=["+<port.c>"])
-env.BuildSources(os.path.join("$BUILD_DIR", "freertos_heap"), memmang,
-                 src_filter=["+<heap_4.c>"])
+# Native FreeRTOS kernel. Do not compile upstream queue.c here, otherwise it
+# would be built twice (and the GCC 7.2.1 warning would reappear).
+env.BuildSources(
+    os.path.join("$BUILD_DIR", "freertos_kernel"),
+    fr,
+    src_filter=["+<*.c>", "-<queue.c>"]
+)
+
+env.BuildSources(
+    os.path.join("$BUILD_DIR", "freertos_port"),
+    portable,
+    src_filter=["+<port.c>"]
+)
+
+env.BuildSources(
+    os.path.join("$BUILD_DIR", "freertos_heap"),
+    memmang,
+    src_filter=["+<heap_4.c>"]
+)

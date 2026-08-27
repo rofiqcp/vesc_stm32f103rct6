@@ -683,9 +683,9 @@ def cmd_handshake(link: Link, args: argparse.Namespace) -> int:
         time.sleep(0.05)
 
     if not all_raw:
-        print("FAIL/LEVEL-1: MCU mengirim 0 byte. Fokus ke boot 64MHz, USART3 RXNE IRQ/ring, uartcomm packet thread, TXE/TC IRQ, wiring PB10/PB11, GND, dan baud.")
+        print("FAIL/LEVEL-1: MCU mengirim 0 byte. Fokus ke g_vesc_boot_stage/error, USART3 PB10/PB11, RX DMA1-Ch3 CNDTR, packet_process task, TX DMA1-Ch2 + USART3 TC IRQ, GND, dan baud.")
     else:
-        print("FAIL/LEVEL-2: ada byte dari MCU tetapi tidak terbentuk frame VESC valid. Fokus ke baud/clock 64MHz, USART3 TXE/TC IRQ, framing packet, atau CRC.")
+        print("FAIL/LEVEL-2: ada byte dari MCU tetapi tidak terbentuk frame VESC valid. Fokus ke clock/baud 64MHz, DMA TX + USART3 TC completion, framing VESC, atau CRC.")
         print("ALL RX raw:", bytes(all_raw).hex(" "))
     return 2
 
@@ -761,6 +761,9 @@ def parse_comm_diag(p: bytes) -> dict:
                         d['tx_queue_high_water']=r.u16(); d['tx_queue_busy_drops']=r.u32()
                         if revision >= 14 and len(p)-r.i >= 4:
                             d['tx_low_priority_drops']=r.u32()
+                        if revision >= 15 and len(p)-r.i >= 12:
+                            d['rx_restarts']=r.u32()
+                            d['boot_stage']=r.u32(); d['boot_error']=r.u32()
     elif revision >= 5:
         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames','tx_ring_overruns','tx_complete_count','blocking_busy_drops','baud']
         for name in names: d[name]=r.u32()
@@ -1875,7 +1878,7 @@ def self_test() -> int:
     assert dd10['sample_clamp_left']==65 and dd10['sample_clamp_right']==66
     assert dd10['sample_margin_left_q15']==777 and dd10['sample_margin_right_q15']==888
 
-    d14=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,14))
+    d14=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,15))
     for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d14 += struct.pack(">I",v)
     d14 += bytes((2,1,1))
     for v in (31,32,33,34,35): d14 += struct.pack(">I",v)
@@ -1888,15 +1891,16 @@ def self_test() -> int:
     d14 += bytes((0,1,1,0,1,2))
     for v in (0,1234,9,3990,4010,4096,3072): d14 += struct.pack(">I",v)
     d14 += struct.pack(">HHHHHHH",500,400,300,200,600,700,3)
-    d14 += struct.pack(">II",4,5)
+    d14 += struct.pack(">IIIII",4,5,6,100,0)
     dd14=parse_comm_diag(bytes(d14))
     assert dd14['sampling_contract_flags']==0 and dd14['isr_total_max_cycles']==1234
     assert dd14['heap_min_ever_bytes']==3072 and dd14['tx_queue_high_water']==3
     assert dd14['tx_queue_busy_drops']==4 and dd14['tx_low_priority_drops']==5
+    assert dd14['rx_restarts']==6 and dd14['boot_stage']==100 and dd14['boot_error']==0
 
     print("SELF-TEST PASS: CRC/framing, VESC-6.00 FW/config, local-ID2 forwarding, "
           "sample/ADC parser, current-cal-v17 robust/MOE ABI, EXT-v6 telemetry, "
-          "COMM_DIAG-v14 resources, sensor/observer diagnostics")
+          "COMM_DIAG-v15 resources/boot, sensor/observer diagnostics")
     return 0
 
 def add_live_args(p: argparse.ArgumentParser) -> None:
@@ -1921,7 +1925,7 @@ def main() -> int:
     p.add_argument("--yes",action="store_true",help="required with --write-back")
     p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=0.5); p.add_argument("--attempts",type=int,default=5)
     p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake"); p.add_argument("--bauds",default="115200,230400,250000,460800,921600"); p.add_argument("--timeout",type=float,default=0.6)
-    sp("comm-diag",cmd_comm_diag,"read firmware USART3 IRQ/ring diagnostics")
+    sp("comm-diag",cmd_comm_diag,"read firmware USART3 DMA/IRQ/RTOS diagnostics")
     sp("can-scan",cmd_can_scan,"VESC Tool-compatible COMM_PING_CAN scan; must discover local motor-2 ID 2")
     sp("vesc-tool-dual-basic",cmd_vesc_tool_dual_basic,"passive end-to-end VESC Tool dual-controller discovery/routing/config check")
     sp("motor2-forward",cmd_motor2_forward,"verify local second-motor forwarding ID 2 with FW_VERSION")

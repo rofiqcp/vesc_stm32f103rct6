@@ -27,6 +27,9 @@
 #include <stdio.h>
 #include <limits.h>
 
+extern volatile uint32_t g_vesc_boot_stage;
+extern volatile uint32_t g_vesc_boot_error;
+
 #define BLOCK_QUEUE_DEPTH 1U
 #define BLOCK_DATA_MAX    VESC_PACKET_MAX_PAYLOAD
 #define VESC_TEMP_UNAVAILABLE_DECIC (-3000)
@@ -162,13 +165,24 @@ static uint8_t controller_id_for_motor(motor_id_t id) {
     return (id == MOTOR_RIGHT) ? VESC_CONTROLLER_ID_RIGHT : VESC_CONTROLLER_ID_LEFT;
 }
 
+static bool comm_scheduler_running(void) {
+    return xTaskGetSchedulerState() == taskSCHEDULER_RUNNING;
+}
+
 static uint8_t *payload_begin(void) {
-    if (s_payload_mutex != NULL && xSemaphoreTake(s_payload_mutex, portMAX_DELAY) != pdTRUE) return NULL;
+    if (comm_scheduler_running() && s_payload_mutex != NULL &&
+        xSemaphoreTake(s_payload_mutex, portMAX_DELAY) != pdTRUE) {
+        return NULL;
+    }
+    /* Before scheduler start the boot path is single-threaded. Bypass the
+     * mutex entirely so early-fatal COMM_FW_VERSION replies cannot block on a
+     * FreeRTOS object before task scheduling exists. */
     return s_tx_payload;
 }
 static void payload_end(uint16_t len) {
+    const bool running = comm_scheduler_running();
     vesc_comm_send_payload(s_tx_payload, len);
-    if (s_payload_mutex != NULL) (void)xSemaphoreGive(s_payload_mutex);
+    if (running && s_payload_mutex != NULL) (void)xSemaphoreGive(s_payload_mutex);
 }
 
 void commands_send_packet(unsigned char *data, unsigned int len) {
@@ -1855,20 +1869,26 @@ static void process_payload(const uint8_t *data, uint16_t len) {
     process_payload_for_motor(data, len, MOTOR_LEFT);
 }
 
+bool vesc_comm_poll_once(void) {
+    if (!s_comm_initialized) return false;
+
+    bool received = false;
+    uint8_t byte = 0U;
+    while (app_uartcomm_rx_get(&byte)) {
+        received = true;
+        vesc_packet_process_byte(&s_parser, byte, process_payload);
+    }
+    return received;
+}
+
 void packet_process_thread(void *argument) {
     (void)argument;
     for (;;) {
         timeout_heartbeat(TIMEOUT_HEARTBEAT_COMM);
-        /* USART3 RX DMA hanya memindahkan byte ke buffer/ring. Framing/CRC dan
-         * commands diproses di task context, sesuai pemisahan ISR-vs-parser. */
-        bool received = false;
-        uint8_t byte;
-        while (app_uartcomm_rx_get(&byte)) {
-            received = true;
-            vesc_packet_process_byte(&s_parser, byte, process_payload);
-        }
-
-        if (received) {
+        /* SmartESC-compatible architecture: USART3 RX DMA writes a circular
+         * buffer and this task polls the DMA write pointer (CNDTR). Packet
+         * framing/CRC/dispatch is never executed from interrupt context. */
+        if (vesc_comm_poll_once()) {
             taskYIELD();
         } else {
             vTaskDelay(pdMS_TO_TICKS(1U));
@@ -1878,13 +1898,18 @@ void packet_process_thread(void *argument) {
 
 static bool vesc_comm_send_payload_class(const uint8_t *payload, uint16_t len, bool low_priority) {
     if (payload == NULL || len == 0U || len > VESC_PACKET_MAX_PAYLOAD) return false;
-    if (s_send_mutex != NULL && xSemaphoreTake(s_send_mutex, portMAX_DELAY) != pdTRUE) return false;
+    const bool running = comm_scheduler_running();
+    bool mutex_taken = false;
+    if (running && s_send_mutex != NULL) {
+        if (xSemaphoreTake(s_send_mutex, portMAX_DELAY) != pdTRUE) return false;
+        mutex_taken = true;
+    }
     uint16_t frame_len = vesc_packet_encode(payload, len, s_tx_frame, sizeof(s_tx_frame));
     bool queued = frame_len != 0U && (low_priority
         ? app_uartcomm_write_raw_low_priority(s_tx_frame, frame_len)
         : app_uartcomm_write_raw(s_tx_frame, frame_len));
     if (queued) s_diag.tx_frames++;
-    if (s_send_mutex != NULL) (void)xSemaphoreGive(s_send_mutex);
+    if (mutex_taken) (void)xSemaphoreGive(s_send_mutex);
     return queued;
 }
 
@@ -1906,7 +1931,7 @@ static void vesc_comm_reply_diag(void) {
     uint8_t *p = payload_begin();
     if (p == NULL) return;
     uint16_t i = 0U;
-    p[i++] = COMM_CUSTOM_APP_DATA; p[i++] = CUSTOM_COMM_DIAG; p[i++] = 14U;
+    p[i++] = COMM_CUSTOM_APP_DATA; p[i++] = CUSTOM_COMM_DIAG; p[i++] = 15U;
     put_u32(p, &i, u->rx_bytes); put_u32(p, &i, u->rx_overruns); put_u32(p, &i, s_diag.rx_frames_ok);
     put_u32(p, &i, u->tx_bytes); put_u32(p, &i, u->uart_errors); put_u32(p, &i, s_diag.tx_frames);
     put_u32(p, &i, u->tx_overruns); put_u32(p, &i, u->tx_complete_count); put_u32(p, &i, s_diag.blocking_busy_drops);
@@ -1975,6 +2000,11 @@ static void vesc_comm_reply_diag(void) {
     put_u16(p, &i, (uint16_t)(u->tx_queue_high_water > UINT16_MAX ? UINT16_MAX : u->tx_queue_high_water));
     put_u32(p, &i, u->tx_queue_busy_drops);
     put_u32(p, &i, u->tx_low_priority_drops);
+    /* Revision 15: SmartESC-style circular-RX recovery count and explicit
+     * boot breadcrumbs for diagnosing a management-UART failure path. */
+    put_u32(p, &i, u->rx_restarts);
+    put_u32(p, &i, g_vesc_boot_stage);
+    put_u32(p, &i, g_vesc_boot_error);
     payload_end(i);
 }
 

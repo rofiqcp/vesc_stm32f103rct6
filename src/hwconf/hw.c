@@ -49,15 +49,17 @@ static volatile uint32_t s_powerstage_fault_flags = 0U;
 #define TIM_EGR_COMG_LOCAL               (1UL << 5)
 
 static void Error_Handler_Local(void) {
-    /* Motor-subsystem failure must not kill the UART communication stack.
-     * main() starts motor hardware from a normal RTOS boot thread, so keeping
-     * IRQs enabled lets packet_process_thread continue answering FW_VERSION. */
+    /* Motor-subsystem failure must never make the controller disappear from
+     * VESC Tool. The management UART is initialized before motor_hw_init().
+     * Before the scheduler starts, service the same packet parser directly;
+     * after scheduler start the packet_process task owns it. */
     motor_hw_emergency_all_off();
     for (;;) {
         if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
-            vTaskDelay(pdMS_TO_TICKS(1000U));
+            vTaskDelay(pdMS_TO_TICKS(100U));
         } else {
-            HAL_Delay(1000U);
+            (void)vesc_comm_poll_once();
+            HAL_Delay(1U);
         }
     }
 }
@@ -68,14 +70,47 @@ static uint32_t deadtime_to_dtg(uint32_t ns) {
     return ticks;
 }
 
+/* STM32F1 AFIO->MAPR has a trap: SWJ_CFG readback is not safe to feed back
+ * through generic read-modify-write remap macros. Some STM32CubeF1 remap
+ * helpers OR the SWJ field while enabling an unrelated remap, which can turn
+ * JTAG-off/SWD-on into JTAG-off/SWD-off. That makes ST-Link appear to require
+ * connect-under-reset after the application starts.
+ *
+ * Keep every MAPR field used by this firmware in ONE explicit write. We may
+ * read the other ordinary remap bits, but the SWJ bits are always masked out
+ * and replaced with the known-safe value 0b010 = JTAG disabled, SWD enabled.
+ * USART3 remap is explicitly cleared so the VESC link remains PB10/PB11.
+ * ADC1 ETRGREG remap is explicitly set so TIM8_TRGO triggers the regular FOC
+ * scan on STM32F103xE. Do not add __HAL_AFIO_REMAP_* calls elsewhere. */
+#define AFIO_SWJ_CFG_MASK_LOCAL        (0x7UL << 24)
+#define AFIO_SWJ_JTAG_OFF_SWD_ON_LOCAL (0x2UL << 24)
+
+static void afio_apply_vesc_mapr_once(void) {
+    uint32_t mapr = AFIO->MAPR;
+
+    mapr &= ~AFIO_SWJ_CFG_MASK_LOCAL;
+#ifdef AFIO_MAPR_USART3_REMAP
+    mapr &= ~AFIO_MAPR_USART3_REMAP;
+#endif
+#ifdef AFIO_MAPR_ADC1_ETRGREG_REMAP
+    mapr |= AFIO_MAPR_ADC1_ETRGREG_REMAP;
+#endif
+    mapr |= AFIO_SWJ_JTAG_OFF_SWD_ON_LOCAL;
+
+    AFIO->MAPR = mapr;
+    __DSB();
+    __ISB();
+}
+
 static void init_gpio(void) {
     __HAL_RCC_AFIO_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
     __HAL_RCC_GPIOC_CLK_ENABLE();
 
-    /* Keep SWD, release JTAG-only pins such as PB3/PB4/PB5. */
-    __HAL_AFIO_REMAP_SWJ_NOJTAG();
+    /* Release JTAG PB3/PB4/PB5 but preserve SWD PA13/PA14, and establish all
+     * AFIO MAPR remaps required by this firmware in a single safe write. */
+    afio_apply_vesc_mapr_once();
 
     GPIO_InitTypeDef g = {0};
 
@@ -278,8 +313,9 @@ static void init_adc_dma(void) {
     hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
     hadc1.Init.NbrOfConversion = 6;
     if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler_Local();
-    /* STM32F103 high-density remap: ADC1 regular external trigger is TIM8 TRGO. */
-    __HAL_AFIO_REMAP_ADC1_ETRGREG_ENABLE();
+    /* ADC1 ETRGREG -> TIM8_TRGO was established by afio_apply_vesc_mapr_once().
+     * Do NOT use the generic HAL AFIO remap macro here: on STM32F1 its MAPR
+     * read-modify-write can corrupt SWJ_CFG and disable SWD. */
 
     hadc2.Instance = ADC2;
     hadc2.Init.ScanConvMode = ADC_SCAN_ENABLE;
@@ -536,8 +572,11 @@ uint32_t motor_hw_sampling_contract_flags(void) {
         adc_regular_rank_channel(ADC2, 2U) != 13U ||
         adc_regular_rank_channel(ADC1, 3U) != 14U ||
         adc_regular_rank_channel(ADC2, 3U) != 15U ||
-        adc_regular_rank_channel(ADC1, 6U) != 2U  ||
-        adc_regular_rank_channel(ADC2, 6U) != 3U) {
+        /* APP ADC PA2/PA3 are configured at regular rank 4 above. The old
+         * validator checked rank 6, which is deliberately the thermal/spare
+         * slot, so the contract failed on every boot before FreeRTOS started. */
+        adc_regular_rank_channel(ADC1, 4U) != 2U  ||
+        adc_regular_rank_channel(ADC2, 4U) != 3U) {
         flags |= HW_SAMPLING_CONTRACT_ADC_CHANNELS;
     }
 
