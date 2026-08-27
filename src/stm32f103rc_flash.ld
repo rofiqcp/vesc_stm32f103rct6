@@ -3,7 +3,7 @@
 ENTRY(Reset_Handler)
 
 _estack = ORIGIN(RAM) + LENGTH(RAM);
-/* FreeRTOS/CMSIS-RTOS2 uses heap_4 (ucHeap) for all dynamic RTOS objects.
+/* Native FreeRTOS uses heap_4 (ucHeap) for all dynamic RTOS objects.
  * The application does not call newlib malloc/calloc/realloc/free, so a
  * second libc heap reserve wastes F103 SRAM. MSP/ISR stack remains 2 KiB. */
 _Min_Heap_Size = 0x000;

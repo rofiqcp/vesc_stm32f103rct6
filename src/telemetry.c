@@ -3,7 +3,9 @@
 #include "motor/mcpwm_foc.h"
 #include "applications/appconf_default.h"
 #include "motor/foc_math.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
 #include <string.h>
 #include <math.h>
 
@@ -15,14 +17,13 @@ typedef struct {
 } telemetry_avg_acc_t;
 
 static telemetry_avg_acc_t s_avg[2];
-static osMutexId_t s_telem_mutex = NULL;
+static SemaphoreHandle_t s_telem_mutex = NULL;
 
 bool telemetry_init(void){
     memset(s_telem,0,sizeof(s_telem));
     memset(s_avg,0,sizeof(s_avg));
-    if(s_telem_mutex==NULL){
-        const osMutexAttr_t attr={.name="telemetry",.attr_bits=osMutexPrioInherit};
-        s_telem_mutex=osMutexNew(&attr);
+    if (s_telem_mutex == NULL) {
+        s_telem_mutex = xSemaphoreCreateMutex();
     }
     return s_telem_mutex != NULL;
 }
@@ -142,19 +143,19 @@ static void snapshot(MotorRuntime *m,motor_telemetry_t *t){
 }
 
 void telemetry_stats_update_100hz(void){
-    bool locked=s_telem_mutex!=NULL && osMutexAcquire(s_telem_mutex,osWaitForever)==osOK;
+    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
     accumulate_avg(0U,&g_motor_left);
     accumulate_avg(1U,&g_motor_right);
     update_stats(&g_motor_left,STAT_PERIOD_MS/1000.0f);
     update_stats(&g_motor_right,STAT_PERIOD_MS/1000.0f);
-    if(locked)(void)osMutexRelease(s_telem_mutex);
+    if(locked)(void)xSemaphoreGive(s_telem_mutex);
 }
 
 void telemetry_snapshot_100hz(void){
-    bool locked=s_telem_mutex!=NULL && osMutexAcquire(s_telem_mutex,osWaitForever)==osOK;
+    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
     snapshot(&g_motor_left,&s_telem[0]);
     snapshot(&g_motor_right,&s_telem[1]);
-    if(locked)(void)osMutexRelease(s_telem_mutex);
+    if(locked)(void)xSemaphoreGive(s_telem_mutex);
 }
 
 void telemetry_update_100hz(void){
@@ -165,9 +166,9 @@ void telemetry_update_100hz(void){
 void telemetry_get(motor_id_t id,motor_telemetry_t *out){
     if(out==NULL)return;
     uint32_t idx=(id==MOTOR_RIGHT)?1U:0U;
-    bool locked=s_telem_mutex!=NULL && osMutexAcquire(s_telem_mutex,osWaitForever)==osOK;
+    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
     *out=s_telem[idx];
-    if(locked)(void)osMutexRelease(s_telem_mutex);
+    if(locked)(void)xSemaphoreGive(s_telem_mutex);
 }
 
 
@@ -175,7 +176,7 @@ void telemetry_read_reset_avg(motor_id_t id, uint32_t mask, motor_telemetry_avg_
     if (out == NULL) return;
     const unsigned idx = (id == MOTOR_RIGHT) ? 1U : 0U;
     memset(out, 0, sizeof(*out));
-    bool locked = s_telem_mutex != NULL && osMutexAcquire(s_telem_mutex, osWaitForever) == osOK;
+    bool locked = s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
 
     const uint8_t bits[6] = {2U, 3U, 4U, 5U, 19U, 20U};
     const float fallback[6] = {s_telem[idx].current_motor, s_telem[idx].current_in,
@@ -194,5 +195,5 @@ void telemetry_read_reset_avg(motor_id_t id, uint32_t mask, motor_telemetry_avg_
     }
     out->current_motor = value[0]; out->current_in = value[1];
     out->id = value[2]; out->iq = value[3]; out->vd = value[4]; out->vq = value[5];
-    if (locked) (void)osMutexRelease(s_telem_mutex);
+    if (locked) (void)xSemaphoreGive(s_telem_mutex);
 }

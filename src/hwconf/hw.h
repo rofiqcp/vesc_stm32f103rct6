@@ -1,7 +1,8 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "datatypes.h"
 
 extern ADC_HandleTypeDef hadc1;
@@ -77,7 +78,6 @@ void motor_hw_emergency_all_off(void);
 void hw_status_early_init(void);
 void hw_status_timer_init(void);
 bool hw_status_init(void);
-void hw_status_set_thread_id(osThreadId_t id);
 void hw_status_tone_start(uint16_t hz);
 void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms);
 void hw_status_tone_stop(void);
@@ -85,6 +85,6 @@ bool hw_status_tone_is_running(void);
 bool hw_status_tone_level(void);
 void hw_status_power_hold(bool on);
 bool hw_status_power_is_held(void);
-uint32_t hw_status_stack_free_bytes(void);
+void hw_status_service_10ms(uint32_t now_ms);
 void hw_status_tim3_irq_handler(void);
 void hw_status_early_fatal_loop(void) __attribute__((noreturn));

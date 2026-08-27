@@ -4,7 +4,8 @@
 #include "motor/mc_interface.h"
 #include "applications/app_adc.h"
 #include "applications/app_command.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <string.h>
 
 static app_configuration s_app_conf;
@@ -53,14 +54,14 @@ void app_disable_output(int time_ms){
     if(time_ms<0){s_disabled_indefinite=true;s_disabled_until=0U;return;}
     s_disabled_indefinite=false;
     if(time_ms==0){s_disabled_until=0U;return;}
-    s_disabled_until=osKernelGetTickCount()+(uint32_t)time_ms;
+    s_disabled_until=xTaskGetTickCount()+(uint32_t)time_ms;
 }
 
 bool app_is_output_disabled(void){
     if(s_disabled_indefinite)return true;
     uint32_t until=s_disabled_until;
     if(until==0U)return false;
-    uint32_t now=osKernelGetTickCount();
+    uint32_t now=xTaskGetTickCount();
     if((int32_t)(until-now)>0)return true;
     s_disabled_until=0U;return false;
 }

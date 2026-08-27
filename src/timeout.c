@@ -2,7 +2,8 @@
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
 #include "applications/appconf_default.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "stm32f1xx_hal.h"
 #include <math.h>
 
@@ -58,7 +59,7 @@ bool timeout_had_iwdg_reset(void) {
 }
 
 bool timeout_init(void) {
-    s_last_update_ms = osKernelGetTickCount();
+    s_last_update_ms = xTaskGetTickCount();
     s_has_timeout = false;
     s_watchdog_healthy = true;
     s_required_mask = (1UL << TIMEOUT_HEARTBEAT_MOTOR_SERVICE) |
@@ -117,7 +118,7 @@ void timeout_update_10ms(uint32_t now) {
 }
 
 void timeout_reset(void) {
-    s_last_update_ms = osKernelGetTickCount();
+    s_last_update_ms = xTaskGetTickCount();
     s_has_timeout = false;
     g_motor_left.timeout_active = false;
     g_motor_right.timeout_active = false;
@@ -155,7 +156,7 @@ void timeout_watchdog_start(void) {
     }
     iwdg_feed();
 
-    uint32_t now = osKernelGetTickCount();
+    uint32_t now = xTaskGetTickCount();
     s_health_window_start_ms = now;
     s_watchdog_grace_until_ms = now + WATCHDOG_START_GRACE_MS;
     for (uint32_t i = 0U; i < TIMEOUT_HEARTBEAT_COUNT; i++) s_hb_last[i] = s_hb[i];

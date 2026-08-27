@@ -386,8 +386,8 @@ static bool runtime_mc_ready(const MotorRuntime *m) {
 }
 
 static void build_foc_hall(const MotorRuntime *m,uint8_t out[8]) {
-    /* GET_MCCONF can arrive immediately after FW_VERSION, before motor_boot_thread
-       has initialized MotorRuntime. Never serialize the zeroed BSS as a Hall table. */
+    /* GET_MCCONF may be requested before the motor runtime is fully ready.
+       Never serialize zeroed BSS as a Hall table. Never serialize the zeroed BSS as a Hall table. */
     static const uint8_t safe[8]={255,17,83,50,150,183,117,255};
     if (!runtime_mc_ready(m)) { memcpy(out,safe,8); return; }
     bool sane = (m->foc_hall_table[0] == 255U && m->foc_hall_table[7] == 255U);

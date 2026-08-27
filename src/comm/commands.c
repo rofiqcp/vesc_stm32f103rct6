@@ -17,7 +17,10 @@
 #include "timeout.h"
 #include "conf_general.h"
 #include "confgenerator.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "semphr.h"
 #include <string.h>
 #include <math.h>
 #include <stdarg.h>
@@ -70,11 +73,11 @@ typedef struct {
 } comm_diag_t;
 
 static vesc_packet_parser_t s_parser;
-static osMessageQueueId_t s_block_queue;
-static osThreadId_t s_packet_tp;
-static osThreadId_t s_blocking_tp;
-static osMutexId_t s_payload_mutex;
-static osMutexId_t s_send_mutex;
+static QueueHandle_t s_block_queue;
+static TaskHandle_t s_packet_tp;
+static TaskHandle_t s_blocking_tp;
+static SemaphoreHandle_t s_payload_mutex;
+static SemaphoreHandle_t s_send_mutex;
 static volatile uint8_t s_display_mode[2];
 static volatile int8_t s_display_owner = -1;
 static uint8_t s_tx_payload[VESC_PACKET_MAX_PAYLOAD];
@@ -160,12 +163,12 @@ static uint8_t controller_id_for_motor(motor_id_t id) {
 }
 
 static uint8_t *payload_begin(void) {
-    if (s_payload_mutex != NULL && osMutexAcquire(s_payload_mutex, osWaitForever) != osOK) return NULL;
+    if (s_payload_mutex != NULL && xSemaphoreTake(s_payload_mutex, portMAX_DELAY) != pdTRUE) return NULL;
     return s_tx_payload;
 }
 static void payload_end(uint16_t len) {
     vesc_comm_send_payload(s_tx_payload, len);
-    if (s_payload_mutex != NULL) (void)osMutexRelease(s_payload_mutex);
+    if (s_payload_mutex != NULL) (void)xSemaphoreGive(s_payload_mutex);
 }
 
 void commands_send_packet(unsigned char *data, unsigned int len) {
@@ -425,7 +428,7 @@ static void append_setup_fields(uint8_t *p, uint16_t *i,
     if (mask & (1UL << 18)) p[(*i)++] = sv->num_vescs;
     if (mask & (1UL << 19)) put_i32(p, i, scaled_i32(wh_left, 1000.0f));
     if (mask & (1UL << 20)) put_u32(p, i, odometer);
-    if (mask & (1UL << 21)) put_u32(p, i, osKernelGetTickCount());
+    if (mask & (1UL << 21)) put_u32(p, i, xTaskGetTickCount());
 }
 
 static void reply_setup_values(uint8_t command, uint32_t mask, motor_id_t id) {
@@ -752,7 +755,7 @@ static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context
             job.data[2] = (uint8_t)((uint32_t)ca >> 16);
             job.data[3] = (uint8_t)((uint32_t)ca >> 8);
             job.data[4] = (uint8_t)ca;
-            if (osMessageQueuePut(s_block_queue, &job, 0U, 0U) != osOK) {
+            if (xQueueSend(s_block_queue, &job, 0U) != pdTRUE) {
                 s_diag.blocking_busy_drops++;
                 commands_send_print("VESC F103: detection worker busy.");
             }
@@ -854,7 +857,7 @@ static bool queue_blocking_job(const uint8_t *data, uint16_t len, motor_id_t id)
     blocking_job_t job;
     memset(&job, 0, sizeof(job));
     job.cmd = data[0]; job.motor = (uint8_t)id; job.len = len; memcpy(job.data, data, len);
-    if (osMessageQueuePut(s_block_queue, &job, 0U, 0U) != osOK) {
+    if (xQueueSend(s_block_queue, &job, 0U) != pdTRUE) {
         s_diag.blocking_busy_drops++;
         return false;
     }
@@ -960,10 +963,10 @@ static bool ensure_current_calibration_valid(uint32_t timeout_ms) {
        motor parameters. Do the same for every motor-moving detect job. */
     if (foc_calibration_valid()) return true;
     if (foc_calibration_done()) foc_request_recalibration();
-    uint32_t start = osKernelGetTickCount();
-    while ((uint32_t)(osKernelGetTickCount() - start) < timeout_ms) {
+    uint32_t start = xTaskGetTickCount();
+    while ((uint32_t)(xTaskGetTickCount() - start) < timeout_ms) {
         if (foc_calibration_done()) return foc_calibration_valid();
-        osDelay(5U);
+        vTaskDelay(pdMS_TO_TICKS(5U));
     }
     return false;
 }
@@ -976,12 +979,12 @@ static bool force_current_calibration_valid(uint32_t timeout_ms) {
     motor_stop(&g_motor_left);
     motor_stop(&g_motor_right);
     foc_request_recalibration();
-    uint32_t start = osKernelGetTickCount();
+    uint32_t start = xTaskGetTickCount();
     bool saw_active = false;
-    while ((uint32_t)(osKernelGetTickCount() - start) < timeout_ms) {
+    while ((uint32_t)(xTaskGetTickCount() - start) < timeout_ms) {
         if (!foc_calibration_done()) saw_active = true;
         if (saw_active && foc_calibration_done()) return foc_calibration_valid();
-        osDelay(2U);
+        vTaskDelay(pdMS_TO_TICKS(2U));
     }
     return false;
 }
@@ -1088,10 +1091,10 @@ static bool validate_sensorless_runtime(MotorRuntime *m, float detect_current_a)
     foc_observer_reset(m, m->observer_phase_u16);
     motor_set_current(m, test_current);
 
-    const uint32_t start = osKernelGetTickCount();
+    const uint32_t start = xTaskGetTickCount();
     uint32_t stable_ms = 0U;
     bool ok = false;
-    while ((uint32_t)(osKernelGetTickCount() - start) < 8000U) {
+    while ((uint32_t)(xTaskGetTickCount() - start) < 8000U) {
         if (m->fault != MOTOR_FAULT_NONE || m->sensorless_start_failures >= 3U) break;
         int32_t sp = m->speed_est_fast_erpm_q16;
         if (sp < 0) sp = (sp == INT32_MIN) ? INT32_MAX : -sp;
@@ -1105,7 +1108,7 @@ static bool validate_sensorless_runtime(MotorRuntime *m, float detect_current_a)
         } else {
             stable_ms = 0U;
         }
-        osDelay(10U);
+        vTaskDelay(pdMS_TO_TICKS(10U));
     }
 
     motor_stop(m);
@@ -1220,7 +1223,7 @@ void blocking_thread(void *argument) {
     blocking_job_t job;
     for (;;) {
         memset(&job, 0, sizeof(job));
-        if (osMessageQueueGet(s_block_queue, &job, NULL, osWaitForever) != osOK) continue;
+        if (xQueueReceive(s_block_queue, &job, portMAX_DELAY) != pdTRUE) continue;
         MotorRuntime *m = motor_get(job.motor == MOTOR_RIGHT ? MOTOR_RIGHT : MOTOR_LEFT);
         int old_motor = mc_interface_get_motor_thread();
         mc_interface_select_motor_thread(m->id == MOTOR_RIGHT ? 2 : 1);
@@ -1565,7 +1568,7 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
 
     /* COMM_FW_VERSION and the local motor-2 forwarding FW_VERSION path must work even when
      * ADC/PWM/FOC initialization has failed. Motor-driving and detection
-     * commands stay inhibited until motor_boot_thread completes. */
+     * commands stay inhibited until the five-task controller startup marks the motor ready. */
     if (s_shutdown_latched && command_requires_motor_ready(cmd)) return;
     if (!s_motor_ready && command_requires_motor_ready(cmd)) {
         return;
@@ -1784,14 +1787,14 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
                     motor_hw_emergency_all_off();
                     hw_status_tone_stop();
                     motor_hw_led(false);
-                    osDelay(20U);
+                    vTaskDelay(pdMS_TO_TICKS(20U));
                     if (restart) NVIC_SystemReset();
                     else hw_status_power_hold(false);
                 }
             }
             break;
         case COMM_REBOOT:
-            s_shutdown_latched = true; motor_hw_emergency_all_off(); osDelay(20U); NVIC_SystemReset();
+            s_shutdown_latched = true; motor_hw_emergency_all_off(); vTaskDelay(pdMS_TO_TICKS(20U)); NVIC_SystemReset();
             break;
         case COMM_ALIVE:
             timeout_reset();
@@ -1866,22 +1869,22 @@ void packet_process_thread(void *argument) {
         }
 
         if (received) {
-            (void)osThreadYield();
+            taskYIELD();
         } else {
-            osDelay(1U);
+            vTaskDelay(pdMS_TO_TICKS(1U));
         }
     }
 }
 
 static bool vesc_comm_send_payload_class(const uint8_t *payload, uint16_t len, bool low_priority) {
     if (payload == NULL || len == 0U || len > VESC_PACKET_MAX_PAYLOAD) return false;
-    if (s_send_mutex != NULL && osMutexAcquire(s_send_mutex, osWaitForever) != osOK) return false;
+    if (s_send_mutex != NULL && xSemaphoreTake(s_send_mutex, portMAX_DELAY) != pdTRUE) return false;
     uint16_t frame_len = vesc_packet_encode(payload, len, s_tx_frame, sizeof(s_tx_frame));
     bool queued = frame_len != 0U && (low_priority
         ? app_uartcomm_write_raw_low_priority(s_tx_frame, frame_len)
         : app_uartcomm_write_raw(s_tx_frame, frame_len));
     if (queued) s_diag.tx_frames++;
-    if (s_send_mutex != NULL) (void)osMutexRelease(s_send_mutex);
+    if (s_send_mutex != NULL) (void)xSemaphoreGive(s_send_mutex);
     return queued;
 }
 
@@ -1908,7 +1911,7 @@ static void vesc_comm_reply_diag(void) {
     put_u32(p, &i, u->tx_bytes); put_u32(p, &i, u->uart_errors); put_u32(p, &i, s_diag.tx_frames);
     put_u32(p, &i, u->tx_overruns); put_u32(p, &i, u->tx_complete_count); put_u32(p, &i, s_diag.blocking_busy_drops);
     put_u32(p, &i, s_diag.motor2_forwards); put_u32(p, &i, s_diag.unsupported_forward_ids);
-    put_u32(p, &i, VESC_UART_BAUD); p[i++] = (uint8_t)osMessageQueueGetCount(s_block_queue);
+    put_u32(p, &i, VESC_UART_BAUD); p[i++] = (uint8_t)uxQueueMessagesWaiting(s_block_queue);
     p[i++] = timeout_has_timeout() ? 1U : 0U; p[i++] = conf_general_is_valid() ? 1U : 0U;
     put_u32(p, &i, u->rx_dma_irq_count); put_u32(p, &i, u->tx_dma_irq_count);
     put_u32(p, &i, u->idle_irq_count); put_u32(p, &i, u->dma_errors);
@@ -2057,7 +2060,7 @@ static void send_sample_buffer_impl(const debug_sample_t *samples, uint16_t coun
         reply(p, i);
         /* At 115200 the software TX ring is back-pressure aware; yielding also
          * keeps the sample sender from starving control threads. */
-        osDelay(1U);
+        vTaskDelay(pdMS_TO_TICKS(1U));
     }
 }
 
@@ -2080,12 +2083,12 @@ void vesc_comm_register_appdata_handler(vesc_appdata_handler_t handler) {
 void vesc_comm_get_resource_stats(vesc_comm_resource_stats_t *out) {
     if (out == NULL) return;
     out->packet_stack_free_bytes = s_packet_tp == NULL ? 0U :
-        osThreadGetStackSpace(s_packet_tp);
+        (uint32_t)uxTaskGetStackHighWaterMark(s_packet_tp) * sizeof(StackType_t);
     out->blocking_stack_free_bytes = s_blocking_tp == NULL ? 0U :
-        osThreadGetStackSpace(s_blocking_tp);
+        (uint32_t)uxTaskGetStackHighWaterMark(s_blocking_tp) * sizeof(StackType_t);
 }
 
-void vesc_comm_set_thread_ids(osThreadId_t packet, osThreadId_t blocking) {
+void vesc_comm_set_thread_ids(TaskHandle_t packet, TaskHandle_t blocking) {
     s_packet_tp = packet;
     s_blocking_tp = blocking;
 }
@@ -2099,20 +2102,16 @@ bool vesc_comm_task_init(void) {
     s_config_ready = false;
     vesc_packet_parser_init(&s_parser);
 
-    const osMutexAttr_t payload_attr = {.name = "VescPayload"};
-    const osMutexAttr_t send_attr = {.name = "VescSend"};
-    s_payload_mutex = osMutexNew(&payload_attr);
-    s_send_mutex = osMutexNew(&send_attr);
-
-    const osMessageQueueAttr_t blockq_attr = {.name = "VescBlockQ"};
-    s_block_queue = osMessageQueueNew(BLOCK_QUEUE_DEPTH, sizeof(blocking_job_t), &blockq_attr);
+    s_payload_mutex = xSemaphoreCreateMutex();
+    s_send_mutex = xSemaphoreCreateMutex();
+    s_block_queue = xQueueCreate(BLOCK_QUEUE_DEPTH, sizeof(blocking_job_t));
 
     if (s_payload_mutex == NULL || s_send_mutex == NULL || s_block_queue == NULL) {
         return false;
     }
 
     /* The packet/blocking threads are spawned centrally in main.c via
-     * osThreadNew and registered through vesc_comm_set_thread_ids(). Validate
+     * xTaskCreate and registered through vesc_comm_set_thread_ids(). Validate
      * that the handles were provided before starting the serial peripheral. */
     if (s_packet_tp == NULL || s_blocking_tp == NULL) {
         return false;

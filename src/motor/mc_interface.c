@@ -22,7 +22,8 @@
 #include "timeout.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 MotorRuntime g_motor_left;
 MotorRuntime g_motor_right;
@@ -272,7 +273,7 @@ void motor_control_init(void) {
     motor_defaults(&g_motor_right, MOTOR_RIGHT);
     memset(s_setup_stats, 0, sizeof(s_setup_stats));
     memset(s_setup_stats_div, 0, sizeof(s_setup_stats_div));
-    s_setup_stats[MOTOR_LEFT].time_start = osKernelGetTickCount();
+    s_setup_stats[MOTOR_LEFT].time_start = xTaskGetTickCount();
     s_setup_stats[MOTOR_RIGHT].time_start = s_setup_stats[MOTOR_LEFT].time_start;
     foc_math_init();
     /* Precompute every float-derived coefficient before ADC/DMA can enter the
@@ -289,14 +290,14 @@ void motor_control_init(void) {
 MotorRuntime *motor_get(motor_id_t id) { return (id == MOTOR_RIGHT) ? &g_motor_right : &g_motor_left; }
 
 void motor_touch_command(MotorRuntime *m) {
-    m->last_command_tick = osKernelGetTickCount();
+    m->last_command_tick = xTaskGetTickCount();
     m->command_active = true;
     m->timeout_active = false;
 }
 
 void motor_keepalive(MotorRuntime *m) {
     if (m == NULL) return;
-    m->last_command_tick = osKernelGetTickCount();
+    m->last_command_tick = xTaskGetTickCount();
     m->timeout_active = false;
 }
 void motor_set_current(MotorRuntime *m, float amp) {
@@ -1380,7 +1381,7 @@ void motor_pid_update_1khz(MotorRuntime *m) {
            Do not bypass the blend merely because observer_control_ready became
            true during the forced sequence. */
         if (m->openloop_started || !observer_control_ready) {
-            if (!foc_sensorless_startup_1khz(m, osKernelGetTickCount(),
+            if (!foc_sensorless_startup_1khz(m, xTaskGetTickCount(),
                                              direction_hint, iq_hint)) {
                 if (m->sensorless_start_failures >= 3U) {
                     motor_raise_fault_from_task(m, MOTOR_FAULT_SENSORLESS_OBSERVER);
@@ -1397,7 +1398,7 @@ void motor_pid_update_1khz(MotorRuntime *m) {
         m->sensor_mode==SENSOR_MODE_ENCODER && !m->encoder.synced) {
         /* Incremental AB requires a runtime electrical reference. Use the
            proven observer/open-loop alignment path before switching to AB. */
-        if (!foc_encoder_ab_startup_1khz(m, osKernelGetTickCount())) return;
+        if (!foc_encoder_ab_startup_1khz(m, xTaskGetTickCount())) return;
         m->using_encoder = true;
     }
     float iq=0.0f;
@@ -1476,7 +1477,7 @@ void motor_pid_update_1khz(MotorRuntime *m) {
 /* ========================================================================
  * VESC master-compatible mc_interface wrappers
  * ======================================================================== */
-typedef struct { osThreadId_t tid; uint8_t motor; } motor_thread_sel_t;
+typedef struct { TaskHandle_t tid; uint8_t motor; } motor_thread_sel_t;
 static motor_thread_sel_t s_motor_sel[16];
 static bool s_mc_interface_inited=false;
 static volatile bool s_mc_locked=false;
@@ -1491,7 +1492,7 @@ static float s_odometer_fraction_m[2]={0.0f,0.0f};
 static bool s_wheel_speed_override=false;
 static float s_wheel_speed_override_value=0.0f;
 
-static int sel_index(osThreadId_t tid,bool alloc){
+static int sel_index(TaskHandle_t tid,bool alloc){
     if(!tid)return -1;
     for(int i=0;i<16;i++)if(s_motor_sel[i].tid==tid)return i;
     if(alloc){for(int i=0;i<16;i++)if(!s_motor_sel[i].tid){s_motor_sel[i].tid=tid;s_motor_sel[i].motor=1;return i;}}
@@ -1505,7 +1506,7 @@ void mc_interface_select_motor_thread(int motor) {
         motor = 2;
     }
 
-    osThreadId_t tid = osThreadGetId();
+    TaskHandle_t tid = xTaskGetCurrentTaskHandle();
     uint32_t pm = __get_PRIMASK();
     __disable_irq();
     int i = sel_index(tid, true);
@@ -1516,7 +1517,7 @@ void mc_interface_select_motor_thread(int motor) {
         __enable_irq();
     }
 }
-int mc_interface_get_motor_thread(void){osThreadId_t tid=osThreadGetId();int i=sel_index(tid,false);return i>=0?s_motor_sel[i].motor:1;}
+int mc_interface_get_motor_thread(void){TaskHandle_t tid=xTaskGetCurrentTaskHandle();int i=sel_index(tid,false);return i>=0?s_motor_sel[i].motor:1;}
 int mc_interface_motor_now(void){
     /* VESC: the motor active in the FOC ISR wins over the thread-selected one. */
     int isr_motor = mcpwm_foc_isr_motor();
@@ -1997,7 +1998,7 @@ void mc_interface_set_pwm_callback(void(*p)(void)){s_pwm_callback=p;}
 void mc_interface_lock(void){s_mc_locked=true;}
 void mc_interface_unlock(void){s_mc_locked=false;}
 void mc_interface_lock_override_once(void){s_mc_lock_override_once=true;}
-int mc_interface_try_input_motor(motor_id_t id){uint32_t now=osKernelGetTickCount();if((int32_t)(s_ignore_until[id]-now)>0)return 0;if(s_mc_locked&&!s_mc_lock_override_once)return 0;s_mc_lock_override_once=false;return 1;}
+int mc_interface_try_input_motor(motor_id_t id){uint32_t now=xTaskGetTickCount();if((int32_t)(s_ignore_until[id]-now)>0)return 0;if(s_mc_locked&&!s_mc_lock_override_once)return 0;s_mc_lock_override_once=false;return 1;}
 int mc_interface_try_input(void){return mc_interface_try_input_motor(mc_interface_motor_runtime_now()->id);}
 mc_fault_code motor_fault_to_vesc(motor_fault_t f) {
     switch (f) {
@@ -2101,7 +2102,7 @@ int mc_interface_set_tachometer_value(int steps){MotorRuntime*m=mc_interface_mot
 void mc_interface_brake_now(void){MotorRuntime*m=mc_interface_motor_runtime_now();motor_set_brake_current(m,m->current_max_a);}
 void mc_interface_release_motor(void){motor_stop(mc_interface_motor_runtime_now());}
 void mc_interface_release_motor_override(void){mc_interface_release_motor();}
-bool mc_interface_wait_for_motor_release(float timeout){uint32_t st=osKernelGetTickCount(),ms=(uint32_t)fmaxf(timeout*1000.0f,0.0f);MotorRuntime*m=mc_interface_motor_runtime_now();while(m->pwm_enabled){if((uint32_t)(osKernelGetTickCount()-st)>ms)return false;osDelay(1);}return true;}
+bool mc_interface_wait_for_motor_release(float timeout){uint32_t st=xTaskGetTickCount(),ms=(uint32_t)fmaxf(timeout*1000.0f,0.0f);MotorRuntime*m=mc_interface_motor_runtime_now();while(m->pwm_enabled){if((uint32_t)(xTaskGetTickCount()-st)>ms)return false;vTaskDelay(pdMS_TO_TICKS(1));}return true;}
 
 float mc_interface_get_duty_cycle_set(void){return mc_interface_motor_runtime_now()->duty_command;}
 float mc_interface_get_duty_cycle_now(void){return mc_interface_motor_runtime_now()->duty_now;}
@@ -2248,12 +2249,12 @@ uint64_t mc_interface_get_odometer_motor(motor_id_t id){return s_odometer[id==MO
 void mc_interface_set_odometer_motor(motor_id_t id,uint64_t v){unsigned idx=id==MOTOR_RIGHT?1U:0U;s_odometer[idx]=v;s_odometer_fraction_m[idx]=0.0f;}
 uint64_t mc_interface_get_odometer(void){return mc_interface_get_odometer_motor(mc_interface_get_motor_thread()==2?MOTOR_RIGHT:MOTOR_LEFT);}
 void mc_interface_set_odometer(uint64_t v){mc_interface_set_odometer_motor(mc_interface_get_motor_thread()==2?MOTOR_RIGHT:MOTOR_LEFT,v);}
-void mc_interface_ignore_input(int time_ms){MotorRuntime*m=mc_interface_motor_runtime_now();s_ignore_until[m->id]=osKernelGetTickCount()+(time_ms>0?(uint32_t)time_ms:0U);}
+void mc_interface_ignore_input(int time_ms){MotorRuntime*m=mc_interface_motor_runtime_now();s_ignore_until[m->id]=xTaskGetTickCount()+(time_ms>0?(uint32_t)time_ms:0U);}
 void mc_interface_set_current_off_delay(float d){mcpwm_foc_set_current_off_delay(d);}
 void mc_interface_override_temp_motor(float t){s_temp_motor_override=t;}
-void mc_interface_ignore_input_both(int time_ms){uint32_t u=osKernelGetTickCount()+(time_ms>0?(uint32_t)time_ms:0U);s_ignore_until[0]=u;s_ignore_until[1]=u;}
+void mc_interface_ignore_input_both(int time_ms){uint32_t u=xTaskGetTickCount()+(time_ms>0?(uint32_t)time_ms:0U);s_ignore_until[0]=u;s_ignore_until[1]=u;}
 void mc_interface_release_motor_override_both(void){motor_stop(&g_motor_left);motor_stop(&g_motor_right);}
-bool mc_interface_wait_for_motor_release_both(float timeout){uint32_t st=osKernelGetTickCount(),ms=(uint32_t)fmaxf(timeout*1000.0f,0.0f);while(g_motor_left.pwm_enabled||g_motor_right.pwm_enabled){if((uint32_t)(osKernelGetTickCount()-st)>ms)return false;osDelay(1);}return true;}
+bool mc_interface_wait_for_motor_release_both(float timeout){uint32_t st=xTaskGetTickCount(),ms=(uint32_t)fmaxf(timeout*1000.0f,0.0f);while(g_motor_left.pwm_enabled||g_motor_right.pwm_enabled){if((uint32_t)(xTaskGetTickCount()-st)>ms)return false;vTaskDelay(pdMS_TO_TICKS(1));}return true;}
 
 static setup_stats *setup_stats_now(void){return &s_setup_stats[mc_interface_get_motor_thread()==2?MOTOR_RIGHT:MOTOR_LEFT];}
 float mc_interface_stat_speed_avg(void){setup_stats*s=setup_stats_now();return s->samples>0.0?(float)(s->speed_sum/s->samples):0.0f;}
@@ -2266,8 +2267,8 @@ float mc_interface_stat_temp_mosfet_avg(void){setup_stats*s=setup_stats_now();re
 float mc_interface_stat_temp_mosfet_max(void){return setup_stats_now()->max_temp_mos;}
 float mc_interface_stat_temp_motor_avg(void){setup_stats*s=setup_stats_now();return s->samples>0.0?(float)(s->temp_motor_sum/s->samples):0.0f;}
 float mc_interface_stat_temp_motor_max(void){return setup_stats_now()->max_temp_motor;}
-float mc_interface_stat_count_time(void){uint32_t now=osKernelGetTickCount();return (float)(now-setup_stats_now()->time_start)/1000.0f;}
-void mc_interface_stat_reset(void){setup_stats*s=setup_stats_now();memset(s,0,sizeof(*s));s->time_start=osKernelGetTickCount();}
+float mc_interface_stat_count_time(void){uint32_t now=xTaskGetTickCount();return (float)(now-setup_stats_now()->time_start)/1000.0f;}
+void mc_interface_stat_reset(void){setup_stats*s=setup_stats_now();memset(s,0,sizeof(*s));s->time_start=xTaskGetTickCount();}
 void mc_interface_set_fault_info(const char*str,int argn,float arg0,float arg1){(void)str;(void)argn;(void)arg0;(void)arg1;}
 void mc_interface_fault_stop(mc_fault_code f,bool is_second_motor,bool is_isr){MotorRuntime*m=motor_get(is_second_motor?MOTOR_RIGHT:MOTOR_LEFT);motor_fault_t native=motor_fault_from_vesc(f);if(is_isr)motor_request_fault_from_isr(m,native);else motor_raise_fault_from_task(m,native);}
 void mc_interface_mc_timer_isr(bool is_second_motor,float dt){(void)is_second_motor;(void)dt;if(s_pwm_callback)s_pwm_callback();}
@@ -2276,13 +2277,9 @@ void mc_interface_mc_timer_isr(bool is_second_motor,float dt){(void)is_second_mo
 /* ============================================================================
  * VESC-standard consolidation: debug sampler + RTOS service/sample/fault threads.
  * Upstream VESC keeps these inside mc_interface.c (ChibiOS THD_FUNCTION + static
- * working areas). This F103 port uses CMSIS-RTOS2/FreeRTOS, so the same
+ * working areas). This F103 port uses FreeRTOS/FreeRTOS, so the same
  * ownership is retained here in the single compatibility translation unit.
  * ============================================================================ */
-
-/* Some host compile stubs expose TaskHandle_t without the optional deletion
- * prototype. The real FreeRTOS task.h declaration has this exact signature. */
-extern void vTaskDelete(TaskHandle_t task_to_delete);
 
 #include <stddef.h>
 
@@ -2294,23 +2291,23 @@ extern void vTaskDelete(TaskHandle_t task_to_delete);
  */
 #define RTOS_READY_HEAP_RESERVE_BYTES 2048U
 
-static osThreadId_t s_timer_thread;
-static osThreadId_t s_sample_send_thread;
-static osThreadId_t s_fault_stop_thread;
+static TaskHandle_t s_timer_thread;
+static TaskHandle_t s_sample_send_thread;
+static TaskHandle_t s_fault_stop_thread;
 static bool s_threads_started;
 
 void timer_thread(void *argument);
 void sample_send_thread(void *argument);
 void fault_stop_thread(void *argument);
 
-void mc_interface_set_thread_ids(osThreadId_t timer, osThreadId_t sample,
-                                 osThreadId_t fault) {
+void mc_interface_set_thread_ids(TaskHandle_t timer, TaskHandle_t sample,
+                                 TaskHandle_t fault) {
     s_timer_thread = timer;
     s_sample_send_thread = sample;
     s_fault_stop_thread = fault;
 }
 
-static uint32_t thread_stack_free_bytes(osThreadId_t thread) {
+static uint32_t thread_stack_free_bytes(TaskHandle_t thread) {
 	if (thread == NULL) {
 		return 0U;
 	}
@@ -2320,13 +2317,13 @@ static uint32_t thread_stack_free_bytes(osThreadId_t thread) {
 
 static void fault_signal(motor_id_t motor) {
 	if (s_fault_stop_thread != NULL) {
-		(void)osThreadFlagsSet(s_fault_stop_thread, 1UL << (uint32_t)motor);
+		(void)xTaskNotify(s_fault_stop_thread, 1UL << (uint32_t)motor, eSetBits);
 	}
 }
 
 static void sample_signal(void) {
 	if (s_sample_send_thread != NULL) {
-		(void)osThreadFlagsSet(s_sample_send_thread, 1UL);
+		(void)xTaskNotify(s_sample_send_thread, 1UL, eSetBits);
 	}
 }
 
@@ -2351,7 +2348,7 @@ void mc_interface_get_resource_stats(mc_interface_resource_stats_t *stats) {
 			thread_stack_free_bytes(s_sample_send_thread);
 	stats->fault_stack_free_bytes =
 			thread_stack_free_bytes(s_fault_stop_thread);
-	stats->status_stack_free_bytes = hw_status_stack_free_bytes();
+	stats->status_stack_free_bytes = stats->motor_service_stack_free_bytes; /* status service shares timer task */
 }
 
 void timer_thread(void *argument) {
@@ -2359,11 +2356,10 @@ void timer_thread(void *argument) {
 	bool current_offset_fault_reported = false;
 	uint8_t calibration_divider = 0U;
 	uint8_t ten_ms_divider = 0U;
-	uint32_t next = osKernelGetTickCount();
+	TickType_t last_wake = xTaskGetTickCount();
 
 	for (;;) {
-		next += 1U;
-		const uint32_t now = osKernelGetTickCount();
+		const uint32_t now = (uint32_t)xTaskGetTickCount();
 		timeout_heartbeat(TIMEOUT_HEARTBEAT_MOTOR_SERVICE);
 
 		motor_slow_update_1khz(&g_motor_left, now);
@@ -2386,6 +2382,7 @@ void timer_thread(void *argument) {
 			telemetry_stats_update_100hz();
 			telemetry_snapshot_100hz();
 			vesc_comm_periodic_100hz();
+			hw_status_service_10ms(now);
 		}
 
 		/* The ISR only accumulates fixed-point calibration statistics. */
@@ -2425,18 +2422,15 @@ void timer_thread(void *argument) {
 		if (mc_interface_sample_ready()) {
 			sample_signal();
 		}
-		osDelayUntil(next);
+		vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1U));
 	}
 }
 
 void sample_send_thread(void *argument) {
 	(void)argument;
 	for (;;) {
-		const uint32_t flags = osThreadFlagsWait(1UL, osFlagsWaitAny,
-				osWaitForever);
-		if ((flags & osFlagsError) != 0U) {
-			continue;
-		}
+		uint32_t flags = 0U;
+		(void)xTaskNotifyWait(0U, UINT32_MAX, &flags, portMAX_DELAY);
 		if (mc_interface_sample_ready()) {
 			void (*reply)(unsigned char *, unsigned int) =
 					mc_interface_sample_reply_func();
@@ -2457,11 +2451,9 @@ void fault_stop_thread(void *argument) {
 	const uint32_t mask = (1UL << MOTOR_LEFT) | (1UL << MOTOR_RIGHT);
 
 	for (;;) {
-		const uint32_t flags = osThreadFlagsWait(mask, osFlagsWaitAny, 50U);
+		uint32_t flags = 0U;
+		(void)xTaskNotifyWait(0U, mask, &flags, pdMS_TO_TICKS(50U));
 		timeout_heartbeat(TIMEOUT_HEARTBEAT_FAULT);
-		if ((flags & osFlagsError) != 0U) {
-			continue;
-		}
 		/* A stale task-side fault-stop flag (for example FLASH_CONFIG raised at
 		 * boot) must not tear down the safe 50% zero-vector while offset
 		 * calibration is active. Hardware PVD/BKIN/ADC faults already clear MOE
@@ -2484,8 +2476,8 @@ bool mc_interface_start_threads(void) {
 				s_fault_stop_thread != NULL;
 	}
 
-	/* Inisialisasi app_command/app_adc/timeout dilakukan di main.c SEBELUM
-	 * spawn thread (lihat motor_boot_thread). Fungsi ini hanya memvalidasi
+	/* app_command/app_adc/timeout are initialized in main.c before the scheduler.
+	 * This function only validates
 	 * handle yang didaftarkan lewat mc_interface_set_thread_ids() dan
 	 * menjalankan pemeriksaan resource/heap. */
 	const bool threads_ok = s_timer_thread != NULL &&

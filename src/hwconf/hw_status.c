@@ -3,7 +3,6 @@
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
 #include "stm32f1xx_hal.h"
-#include "cmsis_os2.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -18,7 +17,6 @@ static volatile bool s_tone_running = false;
 static volatile bool s_tone_infinite = false;
 static volatile uint32_t s_tone_toggle_remaining = 0U;
 static volatile bool s_power_held = true;
-static osThreadId_t s_status_thread;
 static bool s_status_started = false;
 
 typedef struct {
@@ -227,213 +225,206 @@ void hw_status_tim3_irq_handler(void) {
     }
 }
 
-void status_thread(void *argument) {
-    (void)argument;
+void hw_status_service_10ms(uint32_t now) {
+    /* Status/LED/buzzer is intentionally NOT a sixth task. Its non-blocking
+     * state machine is serviced by VESC timer_thread every 10 ms. */
+    static bool initialized = false;
+    static uint32_t startup_deadline;
+    static uint32_t fault_deadline;
+    static uint8_t led_state;       /* 0=burst / 1=gap */
+    static uint8_t led_pulses_left;
+    static bool led_output_on;
+    static uint32_t led_deadline;
+    static bool hb_led_on;
+    static uint8_t hb_divider;
+    static uint8_t startup_index;
+    static bool startup_done;
+    static motor_fault_t announced;
+    static uint8_t fault_tens;
+    static uint8_t fault_ones;
+    static uint8_t fault_group;
+    static uint8_t fault_pulses_left;
+    static uint8_t fault_stage;
+    static bool fault_output_on;
 
-    uint32_t next = osKernelGetTickCount();
-    uint32_t startup_deadline = next;
-    uint32_t fault_deadline = next;
-    uint8_t led_state = 0U;       /* 0=burst / 1=gap */
-    uint8_t led_pulses_left = 0U;
-    bool led_output_on = false;
-    uint32_t led_deadline = 0U;
-    bool hb_led_on = true;
-    uint8_t hb_divider = 0U;
-    uint8_t startup_index = 0U;
-    bool startup_done = false;
+    if (!initialized) {
+        startup_deadline = now;
+        fault_deadline = now;
+        led_state = 0U;
+        led_pulses_left = 0U;
+        led_output_on = false;
+        led_deadline = now;
+        hb_led_on = true;
+        hb_divider = 0U;
+        startup_index = 0U;
+        startup_done = false;
+        announced = MOTOR_FAULT_NONE;
+        fault_tens = fault_ones = fault_group = 0U;
+        fault_pulses_left = fault_stage = 0U;
+        fault_output_on = false;
+        initialized = true;
+    }
 
-    motor_fault_t announced = MOTOR_FAULT_NONE;
-    uint8_t fault_tens = 0U;
-    uint8_t fault_ones = 0U;
-    uint8_t fault_group = 0U;
-    uint8_t fault_pulses_left = 0U;
-    uint8_t fault_stage = 0U;
-    bool fault_output_on = false;
+    const motor_fault_t fault = highest_priority_fault();
 
-    for (;;) {
-        next += 10U;
-        const uint32_t now = osKernelGetTickCount();
-        const motor_fault_t fault = highest_priority_fault();
+    if (fault != MOTOR_FAULT_NONE && !startup_done) {
+        hw_status_tone_stop();
+        startup_done = true;
+    }
 
-        if (fault != MOTOR_FAULT_NONE && !startup_done) {
-            hw_status_tone_stop();
-            startup_done = true;
-        }
-
-        if (fault != MOTOR_FAULT_NONE) {
-            if (fault != announced) {
-                announced = fault;
-                const uint8_t code = (uint8_t)motor_fault_to_vesc(fault);
-                fault_tens = (uint8_t)(code / 10U);
-                fault_ones = (uint8_t)(code % 10U);
+    if (fault != MOTOR_FAULT_NONE) {
+        if (fault != announced) {
+            announced = fault;
+            const uint8_t code = (uint8_t)motor_fault_to_vesc(fault);
+            fault_tens = (uint8_t)(code / 10U);
+            fault_ones = (uint8_t)(code % 10U);
+            fault_group = fault_tens != 0U ? 0U : 1U;
+            const uint8_t digit = fault_group == 0U ? fault_tens : fault_ones;
+            fault_pulses_left = fault_digit_pulses(digit);
+            fault_stage = 1U;
+            fault_output_on = true;
+            motor_hw_led(true);
+            hw_status_tone_start_for(fault_group == 0U ? 1500U : 2400U, 100U);
+            fault_deadline = now + 100U;
+        } else if ((int32_t)(now - fault_deadline) >= 0) {
+            if (fault_stage == 1U) {
+                if (fault_output_on) {
+                    motor_hw_led(false);
+                    hw_status_tone_stop();
+                    fault_output_on = false;
+                    if (fault_pulses_left > 0U) {
+                        fault_pulses_left--;
+                    }
+                    if (fault_pulses_left == 0U) {
+                        if (fault_group == 0U) {
+                            fault_stage = 2U;
+                            fault_deadline = now + 350U;
+                        } else {
+                            fault_stage = 3U;
+                            fault_deadline = now + 1000U;
+                        }
+                    } else {
+                        fault_deadline = now + 100U;
+                    }
+                } else {
+                    fault_output_on = true;
+                    motor_hw_led(true);
+                    hw_status_tone_start(fault_group == 0U ? 1500U : 2400U);
+                    fault_deadline = now + 100U;
+                }
+            } else if (fault_stage == 2U) {
+                fault_group = 1U;
+                fault_pulses_left = fault_digit_pulses(fault_ones);
+                fault_stage = 1U;
+                fault_output_on = true;
+                motor_hw_led(true);
+                hw_status_tone_start_for(2400U, 100U);
+                fault_deadline = now + 100U;
+            } else {
                 fault_group = fault_tens != 0U ? 0U : 1U;
                 const uint8_t digit = fault_group == 0U ? fault_tens : fault_ones;
                 fault_pulses_left = fault_digit_pulses(digit);
                 fault_stage = 1U;
                 fault_output_on = true;
                 motor_hw_led(true);
-                hw_status_tone_start_for(fault_group == 0U ? 1500U : 2400U, 100U);
+                hw_status_tone_start(fault_group == 0U ? 1500U : 2400U);
                 fault_deadline = now + 100U;
-            } else if ((int32_t)(now - fault_deadline) >= 0) {
-                if (fault_stage == 1U) {
-                    if (fault_output_on) {
-                        motor_hw_led(false);
-                        hw_status_tone_stop();
-                        fault_output_on = false;
-                        if (fault_pulses_left > 0U) {
-                            fault_pulses_left--;
-                        }
-                        if (fault_pulses_left == 0U) {
-                            if (fault_group == 0U) {
-                                fault_stage = 2U;
-                                fault_deadline = now + 350U;
-                            } else {
-                                fault_stage = 3U;
-                                fault_deadline = now + 1000U;
-                            }
-                        } else {
-                            fault_deadline = now + 100U;
-                        }
-                    } else {
-                        fault_output_on = true;
-                        motor_hw_led(true);
-                        hw_status_tone_start(fault_group == 0U ? 1500U : 2400U);
-                        fault_deadline = now + 100U;
-                    }
-                } else if (fault_stage == 2U) {
-                    fault_group = 1U;
-                    fault_pulses_left = fault_digit_pulses(fault_ones);
-                    fault_stage = 1U;
-                    fault_output_on = true;
-                    motor_hw_led(true);
-                    hw_status_tone_start_for(2400U, 100U);
-                    fault_deadline = now + 100U;
-                } else {
-                    fault_group = fault_tens != 0U ? 0U : 1U;
-                    const uint8_t digit = fault_group == 0U ? fault_tens : fault_ones;
-                    fault_pulses_left = fault_digit_pulses(digit);
-                    fault_stage = 1U;
-                    fault_output_on = true;
-                    motor_hw_led(true);
-                    hw_status_tone_start(fault_group == 0U ? 1500U : 2400U);
-                    fault_deadline = now + 100U;
-                }
             }
-        } else {
-            if (announced != MOTOR_FAULT_NONE || fault_output_on) {
-                hw_status_tone_stop();
-                fault_output_on = false;
-                /* Reset mesin mode-cue (burst/gap) biar LED gak nyangkut di
-                 * tengah pulsa saat keluar dari fault. */
-                led_state = 0U;
-                led_pulses_left = 0U;
-                led_output_on = false;
-                hb_divider = 0U;
-            }
-            announced = MOTOR_FAULT_NONE;
-            fault_stage = 0U;
+        }
+    } else {
+        if (announced != MOTOR_FAULT_NONE || fault_output_on) {
+            hw_status_tone_stop();
+            fault_output_on = false;
+            /* Reset mesin mode-cue (burst/gap) biar LED gak nyangkut di
+             * tengah pulsa saat keluar dari fault. */
+            led_state = 0U;
+            led_pulses_left = 0U;
+            led_output_on = false;
+            hb_divider = 0U;
+        }
+        announced = MOTOR_FAULT_NONE;
+        fault_stage = 0U;
 
-            /* LED mode cue (plain GPIO flash, bukan PWM). Setiap 1 detik
-             * keluarkan N pulsa: nyala 200 ms / mati 200 ms, lalu mati 1 detik.
-             *   calibrating -> 1 pulsa
-             *   detecting   -> 2 pulsa
-             *   running     -> 3 pulsa
-             * Di luar mode itu -> heartbeat 1 Hz (1 s nyala / 1 s mati). */
-            const bool calibrating = !foc_calibration_done();
-            const bool detecting = g_motor_left.detect.busy ||
-                    g_motor_right.detect.busy;
-            const bool running = g_motor_left.pwm_enabled ||
-                    g_motor_right.pwm_enabled;
-            const uint8_t pulses = calibrating ? 1U :
-                                   (detecting ? 2U :
-                                   (running ? 3U : 0U));
+        /* LED mode cue (plain GPIO flash, bukan PWM). Setiap 1 detik
+         * keluarkan N pulsa: nyala 200 ms / mati 200 ms, lalu mati 1 detik.
+         *   calibrating -> 1 pulsa
+         *   detecting   -> 2 pulsa
+         *   running     -> 3 pulsa
+         * Di luar mode itu -> heartbeat 1 Hz (1 s nyala / 1 s mati). */
+        const bool calibrating = !foc_calibration_done();
+        const bool detecting = g_motor_left.detect.busy ||
+                g_motor_right.detect.busy;
+        const bool running = g_motor_left.pwm_enabled ||
+                g_motor_right.pwm_enabled;
+        const uint8_t pulses = calibrating ? 1U :
+                               (detecting ? 2U :
+                               (running ? 3U : 0U));
 
-            if (pulses != 0U) {
-                if (led_state == 0U) {          /* burst */
-                    if (led_pulses_left == 0U) {
-                        led_pulses_left = pulses;
-                        led_output_on = true;
-                        motor_hw_led(true);
-                        led_deadline = now + 200U;
-                    } else if ((int32_t)(now - led_deadline) >= 0) {
-                        led_output_on = !led_output_on;
-                        motor_hw_led(led_output_on);
-                        if (!led_output_on) {   /* barusan mati */
-                            led_pulses_left--;
-                            if (led_pulses_left == 0U) {
-                                led_state = 1U; /* masuk gap 1 detik */
-                                led_deadline = now + 1000U;
-                            } else {
-                                led_deadline = now + 200U;
-                            }
+        if (pulses != 0U) {
+            if (led_state == 0U) {          /* burst */
+                if (led_pulses_left == 0U) {
+                    led_pulses_left = pulses;
+                    led_output_on = true;
+                    motor_hw_led(true);
+                    led_deadline = now + 200U;
+                } else if ((int32_t)(now - led_deadline) >= 0) {
+                    led_output_on = !led_output_on;
+                    motor_hw_led(led_output_on);
+                    if (!led_output_on) {   /* barusan mati */
+                        led_pulses_left--;
+                        if (led_pulses_left == 0U) {
+                            led_state = 1U; /* masuk gap 1 detik */
+                            led_deadline = now + 1000U;
                         } else {
                             led_deadline = now + 200U;
                         }
-                    }
-                } else {                        /* gap */
-                    motor_hw_led(false);
-                    if ((int32_t)(now - led_deadline) >= 0) {
-                        led_state = 0U;
-                        led_pulses_left = 0U;
-                        led_output_on = false;
+                    } else {
+                        led_deadline = now + 200U;
                     }
                 }
-            } else {
-                /* Heartbeat 1 Hz (1 detik nyala / 1 detik mati). */
-                hb_divider++;
-                if (hb_divider >= 100U) {       /* 100 * 10 ms = 1 s */
-                    hb_divider = 0U;
-                    hb_led_on = !hb_led_on;
-                    motor_hw_led(hb_led_on);
+            } else {                        /* gap */
+                motor_hw_led(false);
+                if ((int32_t)(now - led_deadline) >= 0) {
+                    led_state = 0U;
+                    led_pulses_left = 0U;
+                    led_output_on = false;
                 }
             }
-
-            if (!startup_done && (int32_t)(now - startup_deadline) >= 0) {
-                if (startup_index >=
-                        (uint8_t)(sizeof(s_startup_notes) / sizeof(s_startup_notes[0]))) {
-                    hw_status_tone_stop();
-                    startup_done = true;
-                } else {
-                    const startup_note_t *note = &s_startup_notes[startup_index++];
-                    if (note->hz == 0U) {
-                        hw_status_tone_stop();
-                    } else {
-                        /* Each note self-terminates after its duration, so the
-                         * melody cannot leave the buzzer stuck ON if the thread
-                         * is late reaching the next scheduler tick. */
-                        hw_status_tone_start_for(note->hz, note->duration_ms);
-                    }
-                    startup_deadline = now + note->duration_ms;
-                }
+        } else {
+            /* Heartbeat 1 Hz (1 detik nyala / 1 detik mati). */
+            hb_divider++;
+            if (hb_divider >= 100U) {       /* 100 * 10 ms = 1 s */
+                hb_divider = 0U;
+                hb_led_on = !hb_led_on;
+                motor_hw_led(hb_led_on);
             }
         }
 
-        osDelayUntil(next);
+        if (!startup_done && (int32_t)(now - startup_deadline) >= 0) {
+            if (startup_index >=
+                    (uint8_t)(sizeof(s_startup_notes) / sizeof(s_startup_notes[0]))) {
+                hw_status_tone_stop();
+                startup_done = true;
+            } else {
+                const startup_note_t *note = &s_startup_notes[startup_index++];
+                if (note->hz == 0U) {
+                    hw_status_tone_stop();
+                } else {
+                    /* Each note self-terminates after its duration, so the
+                     * melody cannot leave the buzzer stuck ON if the thread
+                     * is late reaching the next scheduler tick. */
+                    hw_status_tone_start_for(note->hz, note->duration_ms);
+                }
+                startup_deadline = now + note->duration_ms;
+            }
+        }
     }
-}
 
-void hw_status_set_thread_id(osThreadId_t id) {
-    s_status_thread = id;
 }
 
 bool hw_status_init(void) {
-    /* The StatusIO thread is spawned centrally in main.c via osThreadNew. This
-     * function only validates that the handle was registered and guards against
-     * a repeated call. */
-    if (s_status_started) {
-        return s_status_thread != NULL;
-    }
-
     s_status_started = true;
-    return s_status_thread != NULL;
-}
-
-uint32_t hw_status_stack_free_bytes(void) {
-    if (s_status_thread == NULL) {
-        return 0U;
-    }
-    return (uint32_t)uxTaskGetStackHighWaterMark((TaskHandle_t)s_status_thread) *
-            (uint32_t)sizeof(StackType_t);
+    return true;
 }
 
 void hw_status_early_fatal_loop(void) {

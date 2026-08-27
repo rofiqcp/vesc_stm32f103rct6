@@ -1,8 +1,10 @@
 #include "stm32f1xx_hal.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include "hwconf/hw.h"
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
+#include "motor/mcconf_default.h"
 #include "applications/app_command.h"
 #include "applications/app_adc.h"
 #include "telemetry.h"
@@ -14,207 +16,92 @@
 static void SystemClock_Config(void);
 static void dwt_init(void);
 static void early_fatal(void);
-static void motor_boot_thread(void *argument);
 
-/* Thread functions owned by other translation units (central thread registry). */
-extern void status_thread(void *argument);
+/* VESC-standard worker names, with SmartESC-like priority distribution. */
+#define VESC_PRIO_LOW       ((UBaseType_t)4U)
+#define VESC_PRIO_NORMAL    ((UBaseType_t)5U)
+#define VESC_PRIO_SAFETY    ((UBaseType_t)6U)
+
 extern void packet_process_thread(void *argument);
 extern void blocking_thread(void *argument);
 extern void timer_thread(void *argument);
 extern void sample_send_thread(void *argument);
 extern void fault_stop_thread(void *argument);
 
+static bool create_vesc_tasks(void) {
+    TaskHandle_t packet = NULL, blocking = NULL;
+    TaskHandle_t timer = NULL, sample = NULL, fault = NULL;
+
+    if (xTaskCreate(fault_stop_thread, "fault_stop", 192U, NULL, VESC_PRIO_SAFETY, &fault) != pdPASS) return false;
+    if (xTaskCreate(timer_thread, "timer", 256U, NULL, VESC_PRIO_NORMAL, &timer) != pdPASS) return false;
+    if (xTaskCreate(packet_process_thread, "packet_process", 384U, NULL, VESC_PRIO_NORMAL, &packet) != pdPASS) return false;
+    if (xTaskCreate(blocking_thread, "blocking", 768U, NULL, VESC_PRIO_NORMAL, &blocking) != pdPASS) return false;
+    if (xTaskCreate(sample_send_thread, "sample_send", 192U, NULL, VESC_PRIO_LOW, &sample) != pdPASS) return false;
+
+    vesc_comm_set_thread_ids(packet, blocking);
+    mc_interface_set_thread_ids(timer, sample, fault);
+    return true;
+}
+
 int main(void) {
     HAL_Init();
     timeout_capture_reset_reason();
     HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
 
-    /* PB2 LED + PA4 buzzer + PA5 power-hold are alive before PLL/motor init. */
     hw_status_early_init();
-
     SystemClock_Config();
     dwt_init();
     hw_status_timer_init();
+    if (!hw_status_init()) early_fatal();
 
-    /* Handshake-first boot architecture.
-     *
-     * Upstream app_uartcomm is an independent communication subsystem. Do not
-     * make COMM_FW_VERSION depend on ADC/PWM/FOC initialization succeeding.
-     * Initialize the RTOS and VESC UART/packet resources first, then perform
-     * all motor hardware startup from a lower-priority boot thread after the
-     * scheduler is already running. */
-    if (osKernelInitialize() != osOK) {
-        early_fatal();
-    }
-
-    /* ======================================================================
-     * Central RTOS thread registry.
-     *
-     * Semua osThreadNew() dikumpulkan di main.c supaya seluruh thread RTOS2 v2
-     * mudah di-maintain dari satu tempat. Fungsi thread tetap diimplementasikan
-     * di file modul masing-masing (hw_status.c, commands.c, mc_interface.c,
-     * main.c sendiri); main.c hanya memanggil osThreadNew lalu mendaftarkan
-     * handle kembali ke modul pemilik lewat setter. Setiap modul tetap memiliki
-     * handle-nya untuk flag-set / stack-check / rollback.
-     *
-     * Urutan spawn mengikuti dependensi boot:
-     *   1) StatusIO    — LED/buzzer independen, dipakai sebagai status awal.
-     *   2) uartcomm    — packet_process + blocking (handshake VESC Tool).
-     *   3) motor_boot  — boot helper yang nanti me-spawn mc timer/sample/fault.
-     * ====================================================================== */
-
-    /* Satu status thread non-blocking (LED+buzzer) start independen dari motor/ADC. */
-    const osThreadAttr_t status_attr = {
-        .name = "StatusIO",
-        .priority = osPriorityNormal,
-        .stack_size = 512U
-    };
-    hw_status_set_thread_id(osThreadNew(status_thread, NULL, &status_attr));
-    if (!hw_status_init()) {
-        early_fatal();
-    }
-
-    /* VESC UART/packet communication threads. */
-    const osThreadAttr_t packet_attr = {
-        .name = "uartcomm proc",
-        .priority = osPriorityHigh,
-        .stack_size = 1536U
-    };
-    const osThreadAttr_t block_attr = {
-        .name = "comm_block",
-        .priority = osPriorityNormal,
-        .stack_size = 3072U
-    };
-    vesc_comm_set_thread_ids(osThreadNew(packet_process_thread, NULL, &packet_attr),
-                             osThreadNew(blocking_thread, NULL, &block_attr));
-
-    commands_init();
-    if (!commands_is_initialized()) {
-        early_fatal();
-    }
-
-    /* Boot helper: motor/FOC/config startup. Men-spawn mc timer/sample/fault
-     * di dalam thread ini (lihat motor_boot_thread di bawah). */
-    const osThreadAttr_t boot_attr = {
-        .name = "motor_boot_thread",
-        .priority = osPriorityBelowNormal,
-        .stack_size = 2048U
-    };
-    if (osThreadNew(motor_boot_thread, NULL, &boot_attr) == NULL) {
-        early_fatal();
-    }
-
-    if (osKernelStart() != osOK) {
-        early_fatal();
-    }
-
-    while (1) { }
-}
-
-static void motor_boot_thread(void *argument) {
-    (void)argument;
-
-    /* uartcomm proc berprioritas lebih tinggi daripada boot helper, sehingga
-     * FW_VERSION dapat mem-preempt inisialisasi motor. Any motor HAL failure stays confined to
-     * this thread and must not globally disable USART interrupts. */
+    /* Match SmartESC's boot model: hardware/configuration is initialized before
+     * vTaskStartScheduler(), while all run-time work is owned by five tasks. */
     motor_hw_init();
 
-    /* Konfigurasi VESC 6.00 dipisahkan dari record eksperimen lama.
-     * Build the exact VESC-6.00 wire defaults, then import only a CRC-valid
-     * transactional record. Failure simply keeps compiled safe defaults; communication is
-     * already alive in the higher-priority packet thread. */
+    /* Initialize the VESC motor runtime before applying wire configuration.
+     * The previous boot path read g_motor_left.foc_calibrate_on_boot
+     * before motor_defaults(), which made the zero-initialized flag suppress
+     * boot current calibration. The VESC6 wire image does not carry this
+     * runtime-only field, so use its compiled default before FOC init. */
+    foc_calibration_set_skip(!MCCONF_FOC_CALIBRATE_ON_BOOT_DEFAULT);
+    mc_interface_init(false);
+
     vesc_config_init_defaults();
     if (!vesc_config_apply_defaults()) {
         motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_FLASH_CONFIG);
         motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_FLASH_CONFIG);
-        vesc_comm_set_config_ready(true);
-        osThreadExit();
     }
-    bool loaded_cfg = conf_general_init();
-    if (!loaded_cfg) {
-        /* Virgin erased flash is a valid first boot and uses compiled safe
-           defaults. Non-blank flash with no valid transactional record is
-           corruption: keep defaults for communication/repair but latch a
-           configuration fault so neither bridge can enable until repaired and
-           rebooted. */
-        if (conf_general_boot_status() == CONF_BOOT_CORRUPT) {
-            motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_FLASH_CONFIG);
-            motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_FLASH_CONFIG);
-        }
+
+    const bool loaded_cfg = conf_general_init();
+    if (!loaded_cfg && conf_general_boot_status() == CONF_BOOT_CORRUPT) {
+        motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_FLASH_CONFIG);
+        motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_FLASH_CONFIG);
     }
-    /* From this point VESC Tool may safely repair/write MC/APPCONF even when a
-       later telemetry/control-task startup step fails. */
-    vesc_comm_set_config_ready(true);
-
-    /* Config is now loaded (or safe defaults applied). Decide whether the boot
-     * offset-calibration pipeline should run. When mc_configuration.
-     * foc_calibrate_on_boot is false, skip calibration and run with the
-     * stored/gross-default offsets immediately. This MUST be set before
-     * mc_interface_init() calls mcpwm_foc_init_hw(). */
-    foc_calibration_set_skip(!g_motor_left.foc_calibrate_on_boot);
-
-    mc_interface_init(false);
-
-    if (!telemetry_init()) {
-        /* Communication remains alive, but do not expose a motor-ready state
-           without an atomic telemetry snapshot path. */
-        osThreadExit();
-    }
+    if (!telemetry_init()) early_fatal();
     mc_interface_sample_init();
-
-    /* Inisialisasi dependensi thread motor SEBELUM spawn: timer_thread adalah
-     * prioritas High dan langsung preempt boot thread, jadi semua state yang
-     * dipakainya (app_command / app_adc / timeout) harus sudah siap. */
     app_command_init();
     app_adc_init();
-    if (!timeout_init()) {
-        osThreadExit();
-    }
+    if (!timeout_init()) early_fatal();
 
-    /* Spawn the three motor-control worker threads here (inside the boot
-     * thread) so mc_interface_start_threads() can validate the handles and run
-     * the heap-reserve check. osThreadNew is allowed from a running thread. */
-    const osThreadAttr_t timer_attr = {
-        .name = "mc timer",
-        .priority = osPriorityHigh,
-        .stack_size = 896U
-    };
-    const osThreadAttr_t sample_attr = {
-        .name = "mc sample",
-        .priority = osPriorityBelowNormal,
-        .stack_size = 640U
-    };
-    const osThreadAttr_t fault_attr = {
-        .name = "mc fault",
-        .priority = osPriorityHigh,
-        .stack_size = 512U
-    };
-    mc_interface_set_thread_ids(osThreadNew(timer_thread, NULL, &timer_attr),
-                                osThreadNew(sample_send_thread, NULL, &sample_attr),
-                                osThreadNew(fault_stop_thread, NULL, &fault_attr));
+    /* Create all five tasks before resources that validate their handles. */
+    if (!create_vesc_tasks()) early_fatal();
+    commands_init();
+    if (!commands_is_initialized()) early_fatal();
+    vesc_comm_set_config_ready(true);
+    if (!mc_interface_start_threads()) early_fatal();
 
-    if (!mc_interface_start_threads()) {
-        /* One missing control/stat/periodic thread is a partial controller,
-           not a ready VESC. Keep UART handshakes alive and refuse motor use. */
-        osThreadExit();
-    }
-
-    /* Start synchronized PWM counters + dual ADC DMA only after communication
-     * is alive. TIM1/TIM8 MOE remain off through current-zero calibration. */
     motor_hw_start_sampling();
     if (!motor_hw_sampling_contract_valid()) {
-        /* A timer/ADC/DMA contract mismatch can invalidate current feedback.
-         * Leave USART3 alive for diagnostics/config repair, but never expose
-         * the controller as motor-ready. */
         motor_hw_emergency_all_off();
         motor_raise_fault_from_task(&g_motor_left, MOTOR_FAULT_ADC_DMA);
         motor_raise_fault_from_task(&g_motor_right, MOTOR_FAULT_ADC_DMA);
-        osThreadExit();
+        early_fatal();
     }
     timeout_watchdog_require_foc(true);
-
     vesc_comm_set_motor_ready(true);
-    osThreadExit();
+
+    vTaskStartScheduler();
+    early_fatal();
 }
 
 static void dwt_init(void) {

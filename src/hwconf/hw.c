@@ -5,7 +5,8 @@
 #include "motor/mcpwm_foc.h"
 #include "comm/commands.h"
 #include "motor/foc_math.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <string.h>
 
 ADC_HandleTypeDef hadc1;
@@ -53,7 +54,11 @@ static void Error_Handler_Local(void) {
      * IRQs enabled lets packet_process_thread continue answering FW_VERSION. */
     motor_hw_emergency_all_off();
     for (;;) {
-        osDelay(1000U);
+        if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) {
+            vTaskDelay(pdMS_TO_TICKS(1000U));
+        } else {
+            HAL_Delay(1000U);
+        }
     }
 }
 

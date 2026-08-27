@@ -34,8 +34,8 @@ static tx_slot_t s_tx_q[VESC_UART_TX_QUEUE_DEPTH];
 static volatile uint8_t s_tx_head;
 static volatile uint8_t s_tx_tail;
 static volatile bool s_tx_active;
-static osMutexId_t s_tx_mutex;
-static osMutexId_t s_packet_mutex;
+static SemaphoreHandle_t s_tx_mutex;
+static SemaphoreHandle_t s_packet_mutex;
 static uint8_t s_packet_frame[VESC_PACKET_BUFFER_SIZE];
 static app_uartcomm_stats_t s_stats;
 
@@ -143,11 +143,9 @@ bool app_uartcomm_init(void) {
     s_tx_head = s_tx_tail = 0U;
     s_tx_active = false;
 
-    const osMutexAttr_t attr = {.name = "VescUartTx"};
-    const osMutexAttr_t packet_attr = {.name = "VescPktTx"};
-    s_tx_mutex = osMutexNew(&attr);
+    s_tx_mutex = xSemaphoreCreateMutex();
     if (s_tx_mutex == NULL) return false;
-    s_packet_mutex = osMutexNew(&packet_attr);
+    s_packet_mutex = xSemaphoreCreateMutex();
     if (s_packet_mutex == NULL) return false;
 
     huart3_vesc.Instance = USART3;
@@ -232,7 +230,7 @@ static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len, bool
      * additionally prevented from consuming the last usable ring slot. This
      * preserves one frame of response headroom for VESC command/config/fault
      * traffic without allocating a second ~520-byte queue on the 48-KiB F103. */
-    if (osMutexAcquire(s_tx_mutex, 0U) != osOK) {
+    if (xSemaphoreTake(s_tx_mutex, 0U) != pdTRUE) {
         if (low_priority) s_stats.tx_low_priority_drops++;
         else s_stats.tx_queue_busy_drops++;
         return false;
@@ -241,7 +239,7 @@ static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len, bool
     uint8_t used_before = tx_queue_used_snapshot();
     if (low_priority && used_before >= (uint8_t)(VESC_UART_TX_QUEUE_DEPTH - 2U)) {
         s_stats.tx_low_priority_drops++;
-        (void)osMutexRelease(s_tx_mutex);
+        (void)xSemaphoreGive(s_tx_mutex);
         return false;
     }
 
@@ -249,7 +247,7 @@ static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len, bool
     if (next == s_tx_tail) {
         if (low_priority) s_stats.tx_low_priority_drops++;
         else s_stats.tx_overruns++;
-        (void)osMutexRelease(s_tx_mutex);
+        (void)xSemaphoreGive(s_tx_mutex);
         return false;
     }
 
@@ -266,7 +264,7 @@ static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len, bool
     tx_start_locked();
     if (!primask) __enable_irq();
 
-    (void)osMutexRelease(s_tx_mutex);
+    (void)xSemaphoreGive(s_tx_mutex);
     return true;
 }
 
@@ -381,8 +379,8 @@ void app_uartcomm_send_packet(unsigned char *data,unsigned int len,UART_PORT por
     if(!data||len>VESC_PACKET_MAX_PAYLOAD||s_packet_mutex==NULL)return;
     /* Avoid a >500-byte transient task stack allocation on STM32F103. The
        packet scratch is serialized separately from the DMA frame queue. */
-    if(osMutexAcquire(s_packet_mutex,osWaitForever)!=osOK)return;
+    if(xSemaphoreTake(s_packet_mutex, portMAX_DELAY) != pdTRUE)return;
     uint16_t fl=vesc_packet_encode(data,(uint16_t)len,s_packet_frame,sizeof(s_packet_frame));
     if(fl>0U)(void)app_uartcomm_write_raw(s_packet_frame,fl);
-    (void)osMutexRelease(s_packet_mutex);
+    (void)xSemaphoreGive(s_packet_mutex);
 }

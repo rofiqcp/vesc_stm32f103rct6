@@ -8,7 +8,8 @@
 #include "encoder/encoder.h"
 #include "timeout.h"
 #include "comm/commands.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <math.h>
 #include <string.h>
 #include <limits.h>
@@ -1683,7 +1684,7 @@ static int32_t cal_driven_mean(uint64_t sum, uint8_t idx) {
 
 /* Task-side portion of mcpwm_foc_dc_cal(): switch one bridge at a time into
  * 50%/50%/50% zero-vector PWM. The ISR only accumulates ADC samples and never
- * calls HAL/RTOS. This preserves the VESC ISR/task boundary on CMSIS-RTOS2. */
+ * calls HAL/RTOS. This preserves the VESC ISR/task boundary on FreeRTOS. */
 void foc_calibration_service_task(void) {
     switch (s_cal_stage) {
     case FOC_CAL_STAGE_WAIT_LEFT_DRIVEN:
@@ -2156,13 +2157,13 @@ static bool detect_begin(MotorRuntime *m, uint8_t sensor_mode, float current_a) 
 }
 
 static bool detect_wait_pwm(MotorRuntime *m, uint32_t timeout_ms) {
-    uint32_t start = osKernelGetTickCount();
-    while ((uint32_t)(osKernelGetTickCount() - start) < timeout_ms) {
+    uint32_t start = xTaskGetTickCount();
+    while ((uint32_t)(xTaskGetTickCount() - start) < timeout_ms) {
         if (m->fault != MOTOR_FAULT_NONE) return false;
         if (m->pwm_enabled && m->pwm_enable_pending_events == 0U &&
             m->pwm_enable_blank_cycles == 0U) return true;
         timeout_reset();
-        osDelay(1U);
+        vTaskDelay(pdMS_TO_TICKS(1U));
     }
     return false;
 }
@@ -2200,7 +2201,7 @@ static void detect_end(MotorRuntime *m, bool ok) {
     m->detect.l_capture_done = false;
     m->detect.l_capture_axis = 0U;
     motor_set_foc_targets(m, 0.0f, 0.0f);
-    osDelay(20U);
+    vTaskDelay(pdMS_TO_TICKS(20U));
     m->detect_force_angle = false;
     m->phase_observer_override = false;
     m->openloop_started = false;
@@ -2228,7 +2229,7 @@ static bool detect_ramp_id(MotorRuntime *m, float current_a, uint32_t ramp_ms) {
         m->detect_phase_u16 = 0U;
         motor_set_foc_targets(m, current_a * ((float)k / (float)ramp_ms), 0.0f);
         timeout_reset();
-        osDelay(1U);
+        vTaskDelay(pdMS_TO_TICKS(1U));
     }
     return true;
 }
@@ -2281,7 +2282,7 @@ int mcpwm_foc_hall_detect_motor(MotorRuntime *m, float current, uint8_t *hall_ta
         for (uint32_t k = 0U; k < 360U * SENSOR_DETECT_SWEEPS && ok; k++) {
             m->detect_phase_u16 = foc_deg_to_u16((float)(k % 360U));
             motor_set_foc_targets(m, m->detect.drive_current_a, 0.0f);
-            osDelay(SENSOR_DETECT_STEP_MS);
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_DETECT_STEP_MS));
             detect_hall_sample(m);
             timeout_reset();
             if (m->fault != MOTOR_FAULT_NONE) ok = false;
@@ -2294,7 +2295,7 @@ int mcpwm_foc_hall_detect_motor(MotorRuntime *m, float current, uint8_t *hall_ta
             float deg = 360.0f - (float)(k % 360U);
             m->detect_phase_u16 = foc_deg_to_u16(deg);
             motor_set_foc_targets(m, m->detect.drive_current_a, 0.0f);
-            osDelay(SENSOR_DETECT_STEP_MS);
+            vTaskDelay(pdMS_TO_TICKS(SENSOR_DETECT_STEP_MS));
             detect_hall_sample(m);
             timeout_reset();
             if (m->fault != MOTOR_FAULT_NONE) ok = false;
@@ -2323,7 +2324,7 @@ static bool detect_rotate_phase(MotorRuntime *m, float *phase_deg, float delta_d
         m->detect_phase_u16 = foc_deg_to_u16(*phase_deg);
         motor_set_foc_targets(m, current_a, 0.0f);
         timeout_reset();
-        osDelay(delay_ms);
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
         left -= fabsf(d);
     }
     return true;
@@ -2380,7 +2381,7 @@ int mcpwm_foc_encoder_detect_motor(MotorRuntime *m, float current, bool print,
     if (ok) {
         /* One full electrical rotation for mechanical settling/synchronizing. */
         ok = detect_rotate_phase(m, &phase_deg, 360.0f, m->detect.drive_current_a, 0.72f, 1U);
-        osDelay(500U);
+        vTaskDelay(pdMS_TO_TICKS(500U));
     }
 
     /* Direction and electrical/mechanical ratio. Upstream repeats 120-degree
@@ -2391,7 +2392,7 @@ int mcpwm_foc_encoder_detect_motor(MotorRuntime *m, float current, bool print,
     for (unsigned i = 0U; i < ratio_iterations && ok; i++) {
         float before = encoder_read_deg(m);
         ok = detect_rotate_phase(m, &phase_deg, 120.0f, m->detect.drive_current_a, 0.72f, 1U);
-        osDelay(150U);
+        vTaskDelay(pdMS_TO_TICKS(150U));
         float diff = detect_angle_diff_deg(encoder_read_deg(m), before);
         float r = diff * ((float)M_PI / 180.0f);
         sin_sum += sinf(r); cos_sum += cosf(r);
@@ -2399,7 +2400,7 @@ int mcpwm_foc_encoder_detect_motor(MotorRuntime *m, float current, bool print,
     for (unsigned i = 0U; i < ratio_iterations && ok; i++) {
         float before = encoder_read_deg(m);
         ok = detect_rotate_phase(m, &phase_deg, -120.0f, m->detect.drive_current_a, 0.72f, 1U);
-        osDelay(150U);
+        vTaskDelay(pdMS_TO_TICKS(150U));
         /* Reverse traversal is accumulated with the same positive convention. */
         float diff = detect_angle_diff_deg(before, encoder_read_deg(m));
         float r = diff * ((float)M_PI / 180.0f);
@@ -2436,7 +2437,7 @@ int mcpwm_foc_encoder_detect_motor(MotorRuntime *m, float current, bool print,
                 float delta = target - phase_deg;
                 ok = detect_rotate_phase(m, &phase_deg, delta, m->detect.drive_current_a,
                                          fmaxf(fabsf(delta) / 40.0f, 0.72f), 2U);
-                osDelay(40U);
+                vTaskDelay(pdMS_TO_TICKS(40U));
                 float enc_e = detect_encoder_electrical_deg(m, ratio_result, inv_result);
                 float err = detect_angle_diff_deg(enc_e, detect_wrap_deg(phase_deg));
                 float er = err * ((float)M_PI / 180.0f);
@@ -2479,7 +2480,7 @@ int mcpwm_foc_measure_resistance_motor(MotorRuntime *m, float current, int sampl
         return MOTOR_FAULT_SENSOR_DETECT;
 
     bool ok = detect_ramp_id(m, m->detect.drive_current_a, 250U);
-    if (ok) osDelay(FOC_DETECT_SETTLE_MS);
+    if (ok) vTaskDelay(pdMS_TO_TICKS(FOC_DETECT_SETTLE_MS));
     float sum = 0.0f;
     unsigned n = 0U;
     for (int k = 0; k < samples && ok; k++) {
@@ -2493,7 +2494,7 @@ int mcpwm_foc_measure_resistance_motor(MotorRuntime *m, float current, int sampl
         }
         if (m->fault != MOTOR_FAULT_NONE) ok = false;
         timeout_reset();
-        osDelay(1U);
+        vTaskDelay(pdMS_TO_TICKS(1U));
     }
     if (n < (unsigned)(samples / 4)) ok = false;
     float out = ok ? (sum / (float)n) : 0.0f;
@@ -2540,7 +2541,7 @@ int mcpwm_foc_measure_inductance_current_motor(MotorRuntime *m, float curr_goal,
     const float r = m->detect_rl_valid ? m->detect_resistance_ohm : fmaxf(m->foc_motor_r, 0.0f);
     const float lock_current = fminf(goal, foc_clampf(goal * 0.35f, 0.20f, 0.75f));
     bool ok = detect_ramp_id(m, lock_current, 120U);
-    if (ok) osDelay(80U);
+    if (ok) vTaskDelay(pdMS_TO_TICKS(80U));
 
     float l_axis[2] = {0.0f, 0.0f};
     float i_axis[2] = {0.0f, 0.0f};
@@ -2560,7 +2561,7 @@ int mcpwm_foc_measure_inductance_current_motor(MotorRuntime *m, float curr_goal,
         for (unsigned pulse = 0U; pulse < pulses && ok; pulse++) {
             const float q_sign = (pulse & 1U) ? -1.0f : 1.0f;
             motor_set_foc_targets(m, lock_current, 0.0f);
-            osDelay(axis == 0U ? 8U : 12U);
+            vTaskDelay(pdMS_TO_TICKS(axis == 0U ? 8U : 12U));
 
             m->detect.l_capture_active = false;
             m->detect.l_capture_done = false;
@@ -2574,9 +2575,9 @@ int mcpwm_foc_measure_inductance_current_motor(MotorRuntime *m, float curr_goal,
                 motor_set_foc_targets(m, lock_current, q_sign * goal);
             }
 
-            uint32_t start_tick = osKernelGetTickCount();
+            uint32_t start_tick = xTaskGetTickCount();
             while (!m->detect.l_capture_done &&
-                   (uint32_t)(osKernelGetTickCount() - start_tick) < 20U) {
+                   (uint32_t)(xTaskGetTickCount() - start_tick) < 20U) {
                 if (m->fault != MOTOR_FAULT_NONE) { ok = false; break; }
                 /* Lq probing is intended for a locked rotor. Abort if the short
                    torque pulse manages to accelerate the shaft materially. */
@@ -2585,7 +2586,7 @@ int mcpwm_foc_measure_inductance_current_motor(MotorRuntime *m, float curr_goal,
                     ok = false; break;
                 }
                 timeout_reset();
-                osDelay(1U);
+                vTaskDelay(pdMS_TO_TICKS(1U));
             }
             m->detect.l_capture_active = false;
             motor_set_foc_targets(m, lock_current, 0.0f);
@@ -2717,7 +2718,7 @@ int mcpwm_foc_measure_flux_linkage_motor_bounded(MotorRuntime *m, float current_
         phase += erpm * 6.0f * 0.001f; /* ERPM -> electrical deg/s */
         m->detect_phase_u16 = foc_deg_to_u16(phase);
         motor_set_foc_targets(m, 0.0f, m->detect.drive_current_a);
-        osDelay(1U);
+        vTaskDelay(pdMS_TO_TICKS(1U));
         timeout_reset();
         if (m->fault != MOTOR_FAULT_NONE) ok = false;
         if (ok && erpm >= 400.0f && fabsf(m->duty_now) >= max_duty) break;
@@ -2731,7 +2732,7 @@ int mcpwm_foc_measure_flux_linkage_motor_bounded(MotorRuntime *m, float current_
         phase += erpm * 6.0f * 0.001f;
         m->detect_phase_u16 = foc_deg_to_u16(phase);
         motor_set_foc_targets(m, 0.0f, m->detect.drive_current_a);
-        osDelay(1U); timeout_reset();
+        vTaskDelay(pdMS_TO_TICKS(1U)); timeout_reset();
         if (m->fault != MOTOR_FAULT_NONE) ok = false;
     }
 
@@ -2741,7 +2742,7 @@ int mcpwm_foc_measure_flux_linkage_motor_bounded(MotorRuntime *m, float current_
         phase += erpm * 6.0f * 0.001f;
         m->detect_phase_u16 = foc_deg_to_u16(phase);
         motor_set_foc_targets(m, 0.0f, m->detect.drive_current_a);
-        osDelay(1U); timeout_reset();
+        vTaskDelay(pdMS_TO_TICKS(1U)); timeout_reset();
         if (m->fault != MOTOR_FAULT_NONE) ok = false;
         if (ok) {
             float omega = erpm * (2.0f * (float)M_PI / 60.0f);
@@ -3020,7 +3021,7 @@ mc_state mcpwm_foc_get_state_motor(bool second){return foc_state_of(motor_get(se
 
 /* This board has a dedicated PA4 buzzer, so the VESC motor-audio API is
  * mapped to that output instead of injecting acoustic voltage into a motor. */
-int mcpwm_foc_dc_cal(bool cal_undriven){(void)cal_undriven;foc_request_recalibration();uint32_t st=osKernelGetTickCount();while(!foc_calibration_done()&&(uint32_t)(osKernelGetTickCount()-st)<10000U)osDelay(1);return foc_calibration_valid()?MOTOR_FAULT_NONE:MOTOR_FAULT_CURRENT_OFFSET;}
+int mcpwm_foc_dc_cal(bool cal_undriven){(void)cal_undriven;foc_request_recalibration();uint32_t st=xTaskGetTickCount();while(!foc_calibration_done()&&(uint32_t)(xTaskGetTickCount()-st)<10000U)vTaskDelay(pdMS_TO_TICKS(1));return foc_calibration_valid()?MOTOR_FAULT_NONE:MOTOR_FAULT_CURRENT_OFFSET;}
 void mcpwm_foc_print_state(void) {
     MotorRuntime *m = mc_interface_motor_runtime_now();
     if (m == NULL) {

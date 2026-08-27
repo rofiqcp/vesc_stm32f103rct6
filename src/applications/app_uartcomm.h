@@ -1,7 +1,9 @@
 #pragma once
 
 #include "stm32f1xx_hal.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
 #include <stdint.h>
 #include <stdbool.h>
 

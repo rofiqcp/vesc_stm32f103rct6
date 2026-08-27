@@ -3,7 +3,8 @@
 #include "motor/mc_interface.h"
 #include "hwconf/hw.h"
 #include "stm32f1xx_hal.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <string.h>
 
 #define CFG_REGION_ADDR      0x0803E000UL
@@ -128,7 +129,7 @@ static HAL_StatusTypeDef write_commit(uint32_t addr,const config_record_t*r){
 }
 
 static bool store_stage(void){
-    motor_stop(&g_motor_left);motor_stop(&g_motor_right);if(osKernelGetState()==osKernelRunning)osDelay(5);
+    motor_stop(&g_motor_left);motor_stop(&g_motor_right);if (xTaskGetSchedulerState() == taskSCHEDULER_RUNNING) vTaskDelay(pdMS_TO_TICKS(5U));
     s_stage.h.magic=CFG_MAGIC;s_stage.h.version=CFG_VERSION;s_stage.h.payload_len=CFG_PAYLOAD_LEN;s_stage.h.sequence=s_save_count+1U;
     put_u64_be8(s_stage.payload.odometer_left_be,mc_interface_get_odometer_motor(MOTOR_LEFT));
     put_u64_be8(s_stage.payload.odometer_right_be,mc_interface_get_odometer_motor(MOTOR_RIGHT));

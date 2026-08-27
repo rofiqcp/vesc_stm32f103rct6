@@ -2,7 +2,8 @@
 #include "applications/app.h"
 #include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
-#include "cmsis_os2.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <stddef.h>
 
 static volatile app_command_source_t s_source[2];
@@ -96,14 +97,14 @@ bool app_command_uart_claim(motor_id_t id) {
     if (m == NULL || m->detect.busy || app_is_output_disabled() ||
         m->fault != MOTOR_FAULT_NONE || !foc_calibration_done() || !foc_calibration_valid()) return false;
     s_source[id] = APP_CMD_SRC_UART;
-    s_uart_last_ms[id] = osKernelGetTickCount();
+    s_uart_last_ms[id] = xTaskGetTickCount();
     s_adc_rearm[id] = true;
     return true;
 }
 
 void app_command_uart_keepalive(motor_id_t id) {
     if (id != MOTOR_LEFT && id != MOTOR_RIGHT) return;
-    if (s_source[id] == APP_CMD_SRC_UART) s_uart_last_ms[id] = osKernelGetTickCount();
+    if (s_source[id] == APP_CMD_SRC_UART) s_uart_last_ms[id] = xTaskGetTickCount();
 }
 
 bool app_command_adc_claim(motor_id_t id, bool neutral_stable) {

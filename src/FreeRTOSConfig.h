@@ -3,32 +3,18 @@
 #include <stdint.h>
 extern uint32_t SystemCoreClock;
 
-/* CMSIS-RTOS2 wrapper configuration for STM32CubeF1 1.8.6.
- * freertos_os2.h includes CMSIS_device_header after FreeRTOS.h, therefore the
- * macro must expand to a quoted CMSIS device header name. */
-#ifndef CMSIS_device_header
-#define CMSIS_device_header                    "stm32f1xx.h"
-#endif
-
-/* We do not use osThreadEnumerate(). Disabling it avoids enabling the FreeRTOS
- * trace facility solely for that optional CMSIS-RTOS2 API. */
-#define configUSE_OS2_THREAD_ENUMERATE          0
-
-/* cmsis_os2.c from CubeF1 otherwise supplies its own SysTick_Handler. The
- * application provides a custom handler that advances both HAL and FreeRTOS. */
-#define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 1
-
+/* Native FreeRTOS configuration. Application task priorities intentionally
+ * mirror the SmartESC layout: safety/fault=6, three normal workers=5,
+ * sample/telemetry=4, timer-service=2, idle=0. */
 #define configUSE_PREEMPTION                    1
 #define configUSE_PORT_OPTIMISED_TASK_SELECTION 0
 #define configUSE_TICKLESS_IDLE                 0
 #define configCPU_CLOCK_HZ                      (SystemCoreClock)
 #define configTICK_RATE_HZ                      ((TickType_t)1000)
-#define configMAX_PRIORITIES                    56
+#define configMAX_PRIORITIES                    7
 #define configMINIMAL_STACK_SIZE                ((uint16_t)128)
-/* STM32F103RCT6 has exactly 48 KiB SRAM. 18 KiB is sufficient for the
- * seven application threads, idle/timer tasks, mutexes and the one-entry
- * blocking queue while leaving several KiB linker headroom. Do not grow
- * this without checking the final .map file. */
+/* STM32F103RCT6 has 48 KiB SRAM. 18 KiB covers the five application tasks,
+ * idle/timer tasks, mutexes and the blocking queue while retaining headroom. */
 #define configTOTAL_HEAP_SIZE                   ((size_t)(18 * 1024))
 #define configMAX_TASK_NAME_LEN                 16
 #define configUSE_16_BIT_TICKS                  0
@@ -36,8 +22,8 @@ extern uint32_t SystemCoreClock;
 #define configUSE_TASK_NOTIFICATIONS            1
 #define configTASK_NOTIFICATION_ARRAY_ENTRIES   1
 #define configUSE_MUTEXES                       1
-#define configUSE_RECURSIVE_MUTEXES             1
-#define configUSE_COUNTING_SEMAPHORES           1
+#define configUSE_RECURSIVE_MUTEXES             0
+#define configUSE_COUNTING_SEMAPHORES           0
 #define configUSE_QUEUE_SETS                    0
 #define configUSE_TIME_SLICING                  1
 #define configUSE_NEWLIB_REENTRANT              0
