@@ -2,6 +2,14 @@ import math
 import struct
 
 
+def pack_i8(value: int) -> bytes:
+    return struct.pack(">b", value)
+
+
+def pack_u8(value: int) -> bytes:
+    return struct.pack(">B", value)
+
+
 def pack_i16(value: int) -> bytes:
     return struct.pack(">h", value)
 
@@ -18,12 +26,25 @@ def pack_u32(value: int) -> bytes:
     return struct.pack(">I", value)
 
 
+def _round_double(x: float) -> int:
+    """Persis roundDouble() di vbytearray.cpp (C++ VESC Tool).
+
+    C++ memakai *half-away-from-zero* (floor(x+0.5) untuk x>=0,
+    ceil(x-0.5) untuk x<0), BUKAN banker's rounding seperti ``round()``
+    Python. Perbedaan muncul tepat di nilai .5 (mis. 2.5 -> 3 vs 2),
+    sehingga byte wire yang dihasilkan harus sama persis dengan firmware.
+    """
+    if x < 0.0:
+        return math.ceil(x - 0.5)
+    return math.floor(x + 0.5)
+
+
 def scaled_i16(value: float, scale: float) -> bytes:
-    return pack_i16(round(value * scale))
+    return pack_i16(_round_double(value * scale))
 
 
 def scaled_i32(value: float, scale: float) -> bytes:
-    return pack_i32(round(value * scale))
+    return pack_i32(_round_double(value * scale))
 
 
 class BufferUnderflow(ValueError):

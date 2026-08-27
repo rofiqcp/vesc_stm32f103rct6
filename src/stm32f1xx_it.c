@@ -62,10 +62,12 @@ void DMA1_Channel1_IRQHandler(void) {
     /* Fast path: the first three dual ranks are all six stock-board current
        channels (DC L/R, LEFT A/B, RIGHT B/C). Half-transfer is therefore the
        earliest coherent entry for both 16-kHz current loops. No kernel/UART/
-       formatted-output/flash/blocking HAL calls are permitted here. */
+       formatted-output/flash/blocking HAL calls are permitted here. APP ADC
+       (PA2/PA3 at rank 4) is NOT touched in the ISR — it is read from the
+       DMA buffer directly in app_adc_service_1khz() at 1 kHz, matching the
+       VESC standard where application ADC sampling lives in the app thread. */
     if ((isr & DMA_ISR_HTIF1) != 0U) {
         DMA1->IFCR = DMA_IFCR_CHTIF1;
-        motor_hw_capture_app_adc_from_isr();
         foc_adc_dma_isr(g_adc_dual_dma);
     }
 }

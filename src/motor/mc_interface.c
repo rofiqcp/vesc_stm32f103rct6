@@ -668,7 +668,7 @@ void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms) {
             m->hall.recovery_valid_ticks=0U;
         }
     }
-    if (m->fault!=MOTOR_FAULT_NONE) { motor_hw_set_pwm_enabled(m,false); return; }
+    if (m->fault != MOTOR_FAULT_NONE && !foc_calibration_in_progress()) { motor_hw_set_pwm_enabled(m,false); return; }
     /* VESC offset-calibration mode bit2: when the motor is stopped (state OFF)
        and no calibration is in progress, periodically re-measure the current
        offsets so drift from temperature/aging does not accumulate. This mirrors

@@ -283,9 +283,15 @@ static void reply_fw_version(motor_id_t id) {
     p[i++] = 6U;
     p[i++] = 0U;
 
-    const char hw[] = "HOVERBOARD_DUAL_FOC";
-    memcpy(&p[i], hw, sizeof(hw));
-    i = (uint16_t)(i + sizeof(hw));
+    /* VESC Tool shows the HW name plus a forwarding suffix: "NAME (local)"
+     * for the onboard controller and "NAME (2)" for the forwarded bridge.
+     * The user wants the two bridges labelled by function, not by board type,
+     * so report a per-motor HW name: MOTOR_LEFT for the local bridge and
+     * MOTOR_RIGHT for the forwarded bridge. */
+    const char *hw = (id == MOTOR_RIGHT) ? "MOTOR_RIGHT" : "MOTOR_LEFT";
+    uint8_t hw_len = (uint8_t)(strlen(hw) + 1U); /* include NUL terminator */
+    memcpy(&p[i], hw, hw_len);
+    i = (uint16_t)(i + hw_len);
 
     const uint32_t *uid = (const uint32_t *)0x1FFFF7E8UL;
     for (uint8_t w = 0U; w < 3U; w++) {
@@ -1938,12 +1944,17 @@ static void vesc_comm_reply_diag(void) {
 
 void vesc_comm_periodic_100hz(void) {
     conf_general_service_100hz();
-    if (!s_motor_ready) return;
-    /* VESC Tool "Realtime Data" tab relies on the controller periodically
-     * pushing COMM_GET_VALUES for both bridges. Send it at the 100 Hz hook so
-     * the live data view populates without an external poll loop. */
-    reply_get_values(COMM_GET_VALUES, 0x003FFFFFUL, MOTOR_LEFT);
-    reply_get_values(COMM_GET_VALUES, 0x003FFFFFUL, MOTOR_RIGHT);
+    /* Push the RT data feed unconditionally. VESC Tool's Real-Time Data tab
+     * relies on the controller pushing COMM_GET_VALUES periodically; if we
+     * gate it behind s_motor_ready the tab stalls (no frames for 0.5-1 s at a
+     * time) whenever the motor is stopped or the boot thread has not yet
+     * flagged the sampling contract valid. A stopped motor simply reports
+     * zero current/duty, which is the correct live view. Only motor-control
+     * and config commands need the motor_ready gate, not the telemetry push. */
+    static uint8_t s_rt_toggle = 0U;
+    motor_id_t rt_motor = (s_rt_toggle & 1U) ? MOTOR_RIGHT : MOTOR_LEFT;
+    s_rt_toggle++;
+    reply_get_values(COMM_GET_VALUES, 0x003FFFFFUL, rt_motor);
     /* Kedua bridge lokal memiliki display-position state sendiri. Motor-2
      * mengikuti semantics local dual-motor forwarding, tanpa driver CAN. */
     if (s_display_owner == 0) send_rotor_position(MOTOR_LEFT);

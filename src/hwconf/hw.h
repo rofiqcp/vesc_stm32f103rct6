@@ -12,7 +12,7 @@ extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim8;
 extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim4;
-extern volatile uint32_t g_adc_dual_dma[6];
+extern volatile uint32_t g_adc_dual_dma[5];
 extern volatile uint16_t g_adc3_vbus_dma[2];
 
 /* ADC3 DMA2_CH5 uses a two-halfword circular buffer. CNDTR=1 means slot 0

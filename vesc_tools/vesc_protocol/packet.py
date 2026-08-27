@@ -49,17 +49,22 @@ class PacketParser:
 
             if start == 2:
                 payload_size = self.buffer[1]
+                # Sesuai C++ try_decode_packet: len 8-bit menolak len 0
+                # (no zero-length packets).
                 canonical = 1 <= payload_size <= 0xFF
             elif start == 3:
                 payload_size = (self.buffer[1] << 8) | self.buffer[2]
-                canonical = payload_size >= 0x100
+                # C++: "A shorter packet should use less length bytes"
+                # -> header 3-byte hanya sah bila len >= 255.
+                canonical = payload_size >= 0xFF
             else:
                 payload_size = (
                     (self.buffer[1] << 16)
                     | (self.buffer[2] << 8)
                     | self.buffer[3]
                 )
-                canonical = payload_size >= 0x10000
+                # C++: header 4-byte hanya sah bila len >= 65535.
+                canonical = payload_size >= 0xFFFF
 
             if not canonical or payload_size > self.max_payload:
                 del self.buffer[0]

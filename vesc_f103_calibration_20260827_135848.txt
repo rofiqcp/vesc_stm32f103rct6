@@ -1,0 +1,151 @@
+timestamp               : 2026-08-27T13:58:48
+port                    : /dev/ttyUSB0
+baud                    : 115200
+Calibration started; both motor PWM commands stopped.
+
+=== CURRENT CALIBRATION RESULT ===
+done                    : True
+valid                   : False
+count                   : 4096
+target                  : 6096
+left_u                  : 2676
+left_v                  : 2668
+left_dc                 : 1957
+right_u                 : 2646
+right_v                 : 2633
+right_dc                : 1988
+
+=== HARDWARE LIVENESS ===
+adc_isr_count           : 37792
+dma_cndtr               : 5
+tim2_cnt                : 0
+tim1_dir                : 0
+tim1_running            : True
+tim8_running            : True
+tim2_running            : False
+adc1_enabled            : True
+adc2_enabled            : True
+dma1_ch1_enabled        : True
+
+=== CURRENT CALIBRATION STATISTICS ===
+diag_revision           : 18
+warn_mask               : 0x0000
+fail_range_mask         : 0x0000
+fail_noise_mask         : 0x0003
+channel      mean   min   max spread  stddev outlier      status
+left_u         0 65535     0 -65535    0.000       0  FAIL_NOISE
+left_v         0 65535     0 -65535    0.000       0  FAIL_NOISE
+left_dc        0 65535     0 -65535    0.000       0  PASS
+right_u        0 65535     0 -65535    0.000       0  PASS
+right_v        0 65535     0 -65535    0.000       0  PASS
+right_dc       0 65535     0 -65535    0.000       0  PASS
+
+Threshold policy:
+  undriven pass         : only reject ADC rail / gross hardware fault
+  driven offset source  : 50%/50%/50% zero-vector switching, 1000 samples/motor
+  hard mean range       : 128..3967 ADC counts
+  robust inlier window  : +/-256 counts around undriven mean
+  warning noise         : any outlier OR raw spread >160 OR clean stddev >16
+  hard driven-noise fail: >10 outliers, <990 inliers, OR clean stddev >80
+  PWM start blanking    : 8 driven samples at 50% zero vector; DC trip 17 A
+  warning does NOT inhibit PWM; hard failure does.
+
+=== DRIVEN/OFFSET SPLIT ===
+cal_stage               : 9 FAILED
+shift_warn_mask         : 0x0000
+channel      undriven driven  delta
+left_u         2676      0  -2676
+left_v         2668      0  -2668
+left_dc        1957      0  -1957
+right_u        2646      0  -2646
+right_v        2633      0  -2633
+right_dc       1988      0  -1988
+
+=== FIRST ACTIVE-DRIVE CURRENT-FAULT SNAPSHOT ===
+valid                   : False (no active-drive current fault captured)
+
+=== ADC/PWM SCHEDULE ===
+adc_phase_offset_ticks  : 120
+foc_isr_event_hz        : 16000
+foc_isr_slot_cycles     : 4000
+tim8_rcr                : 1
+tim1_cnt/tim8_cnt       : 1998 / 1869
+rank1                   : ADC1 RIGHT_DC | ADC2 LEFT_DC
+rank2                   : ADC1 LEFT_A   | ADC2 LEFT_B
+rank3                   : ADC1 RIGHT_B  | ADC2 RIGHT_C
+
+=== ADC3 DCLINK PATH ===
+adc3_enabled            : True
+dma2_ch5_enabled        : True
+dma2_ch5_cndtr          : 1
+adc3_vbus_raw0          : 1675
+adc3_vbus_raw1          : 1669
+vbus_dma_stale_count    : 0
+vbus_dma_stale_events   : 0
+trigger                  : TIM8_TRGO (same PWM frame as current scan)
+DCLINK                   : PC2 / ADC3_IN12 / DMA2 Channel 5
+
+=== PWM MOE CALIBRATION TRACE ===
+moe_fail_mask           : 0x01
+moe_confirmed_mask      : 0x01
+motor        request_adc confirm_adc first_sample delta_confirm delta_sample
+LEFT             36210       36213            0             3           -1
+RIGHT                0           0            0            -1           -1
+
+=== RAW PERIPHERAL REGISTERS ===
+rcc_cfgr                : 0x0038840A (3703818)
+adc1_cr1                : 0x00060100 (393472)
+adc1_cr2                : 0x009C0101 (10223873)
+adc1_sqr1               : 0x00400000 (4194304)
+adc1_sqr3               : 0x0101380B (16857099)
+adc2_cr1                : 0x00000100 (256)
+adc2_cr2                : 0x001E0001 (1966081)
+adc2_sqr1               : 0x00400000 (4194304)
+adc2_sqr3               : 0x00B1BDAA (11648426)
+dma1_ch1_ccr            : 0x00003AAD (15021)
+dma1_ch1_cndtr32        : 0x00000005 (5)
+dma1_isr                : 0x00000003 (3)
+tim1_cr1                : 0x00000021 (33)
+tim1_arr                : 0x000007D0 (2000)
+tim1_cnt                : 0x0000078A (1930)
+tim1_bdtr               : 0x00000C30 (3120)
+tim8_cr1                : 0x00000031 (49)
+tim8_arr                : 0x000007D0 (2000)
+tim8_cnt                : 0x000004B3 (1203)
+tim8_bdtr               : 0x00000C30 (3120)
+tim2_cr1                : 0x00000000 (0)
+tim2_smcr               : 0x00000000 (0)
+tim2_ccr2               : 0x00000000 (0)
+tim2_cnt32              : 0x00000000 (0)
+adc3_cr1                : 0x00000000 (0)
+adc3_cr2                : 0x00180101 (1573121)
+adc3_sqr1               : 0x00000000 (0)
+adc3_sqr3               : 0x0000000C (12)
+dma2_ch5_ccr            : 0x000035A9 (13737)
+dma2_ch5_cndtr32        : 0x00000002 (2)
+dma2_isr                : 0x00070000 (458752)
+
+=== ADC DUAL DMA RAW WORDS ===
+rank1: word=0x07A307C2 ADC1=1986 ADC2=1955
+rank2: word=0x0A6D0A6C ADC1=2668 ADC2=2669
+rank3: word=0x0A4E0A5B ADC1=2651 ADC2=2638
+rank4: word=0x08320867 ADC1=2151 ADC2=2098
+rank5: word=0x07C30689 ADC1=1673 ADC2=1987
+rank6: word=0x40020458 ADC1=1112 ADC2=16386
+
+=== LIVENESS SAMPLES DURING CALIBRATION ===
+sample[00] cal=4096 adc_isr=     11391 dma_cndtr=  5 tim8_cnt=  128
+sample[01] cal=4096 adc_isr=     13791 dma_cndtr=  5 tim8_cnt=  116
+sample[02] cal=4096 adc_isr=     16191 dma_cndtr=  5 tim8_cnt=  128
+sample[03] cal=4096 adc_isr=     18591 dma_cndtr=  5 tim8_cnt=  128
+sample[04] cal=4096 adc_isr=     20991 dma_cndtr=  5 tim8_cnt=  128
+sample[05] cal=4096 adc_isr=     23391 dma_cndtr=  5 tim8_cnt=  128
+sample[06] cal=4096 adc_isr=     25791 dma_cndtr=  5 tim8_cnt=  151
+sample[07] cal=4096 adc_isr=     28191 dma_cndtr=  5 tim8_cnt=  351
+sample[08] cal=4096 adc_isr=     30591 dma_cndtr=  4 tim8_cnt=  384
+sample[09] cal=4096 adc_isr=     32991 dma_cndtr=  5 tim8_cnt=  151
+sample[10] cal=4096 adc_isr=     35391 dma_cndtr=  5 tim8_cnt=  121
+sample[11] cal=4096 adc_isr=     37792 dma_cndtr=  5 tim8_cnt= 1869
+adc_isr_delta            : 35966
+
+RESULT: FAIL - calibration hard sanity check failed.

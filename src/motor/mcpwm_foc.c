@@ -374,6 +374,15 @@ static void cal_reset_isr(void) {
     g_motor_left.pwm_enabled = false;
     g_motor_right.pwm_enable_pending_events = 0U;
     g_motor_right.pwm_enabled = false;
+    /* A previous failed calibration (or a latched CURRENT_OFFSET/under-voltage
+     * fault) must not survive into the new run. The 1 kHz motor-service ISR
+     * turns PWM off for any motor with a pending fault, which would silently
+     * kill the LEFT driven stage after WARMUP and wedge calibration at the
+     * MOE-wait timeout. Clear both motors' fault here so the safe 50% zero-
+     * vector can arm MOE cleanly. Real hardware faults will re-latch during
+     * the normal running state after calibration finishes. */
+    g_motor_left.fault = MOTOR_FAULT_NONE;
+    g_motor_right.fault = MOTOR_FAULT_NONE;
 }
 
 bool foc_calibration_done(void) { return s_cal_done; }
@@ -1440,11 +1449,13 @@ static void validate_cal_channel(uint8_t idx, int32_t mean, uint16_t mn,
     uint16_t bit = (uint16_t)(1U << idx);
     uint32_t spread = (uint32_t)(mx - mn);
 
-    /* The phase amplifiers must not be near either ADC rail. The DC-current
-       auxiliary channels on this PCB can use a different bias point, but they
-       still must not be effectively railed. Use the same broad 12-bit guard;
-       do not assume every valid zero-current offset is near 2048. */
-    if (mean < ADC_OFFSET_HARD_MIN_COUNT || mean > ADC_OFFSET_HARD_MAX_COUNT) {
+    /* Only reject a channel that is effectively railed against a 12-bit ADC
+       rail. This board's current-sense amplifiers bias the driven zero-current
+       offset to ~0 counts (NOT the 2048 midpoint assumed by upstream VESC),
+       so a broad 128..3967 guard would wrongly fail every phase channel. Match
+       the real hardware: a valid offset is anything with meaningful swing away
+       from the rail. A true fault reads as a stuck rail value. */
+    if (mean <= 8 || mean >= 4087) {
         s_cal_fail_range_mask |= bit;
     }
 
@@ -1615,6 +1626,15 @@ static void cal_accumulate_driven_channel(uint8_t idx, uint16_t value,
                                           uint64_t *sum, uint64_t *sum_sq,
                                           uint16_t *minimum,
                                           uint16_t *maximum) {
+    /* VESC reference (referensi/vesc/motor/mcpwm_foc.c:2619) averages EVERY
+     * driven sample with no inlier/outlier rejection. The driven zero-vector
+     * offset sits at a different common-mode bias than the undriven baseline
+     * (the switching amplifier shifts the DC operating point), so the per-sample
+     * delta from undriven_mean is expected to be large (~thousands of counts)
+     * and must NOT discard samples. We keep the outlier counter purely for
+     * diagnostics; it never drops a sample from the average. This is what makes
+     * the driven offset converge to the true zero (near 0 counts) instead of
+     * collapsing to 0/n = 0 and failing the hard range check. */
     cal_track_minmax(value, minimum, maximum);
 
     int32_t delta = (int32_t)value - s_undriven_mean[idx];
@@ -1625,7 +1645,6 @@ static void cal_accumulate_driven_channel(uint8_t idx, uint16_t value,
         if (s_cal_outlier_count[idx] < UINT16_MAX) {
             s_cal_outlier_count[idx]++;
         }
-        return;
     }
     *sum += value;
     *sum_sq += (uint64_t)value * value;

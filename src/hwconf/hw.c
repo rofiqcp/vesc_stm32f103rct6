@@ -17,7 +17,7 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
-volatile uint32_t g_adc_dual_dma[6] __attribute__((aligned(4)));
+volatile uint32_t g_adc_dual_dma[5] __attribute__((aligned(4)));
 volatile uint16_t g_adc3_vbus_dma[2] __attribute__((aligned(4)));
 /* PA2/PA3 APP ADC values are captured from dual-ADC rank 6 at the next
  * half-transfer interrupt. This keeps application sampling outside the first
@@ -266,7 +266,7 @@ static void init_adc_dma(void) {
     hadc1.Init.DiscontinuousConvMode = DISABLE;
     hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T8_TRGO;
     hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc1.Init.NbrOfConversion = 6;
+    hadc1.Init.NbrOfConversion = 5;
     if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler_Local();
     /* STM32F103 high-density remap: ADC1 regular external trigger is TIM8 TRGO. */
     __HAL_AFIO_REMAP_ADC1_ETRGREG_ENABLE();
@@ -277,7 +277,7 @@ static void init_adc_dma(void) {
     hadc2.Init.DiscontinuousConvMode = DISABLE;
     hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
     hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc2.Init.NbrOfConversion = 6;
+    hadc2.Init.NbrOfConversion = 5;
     if (HAL_ADC_Init(&hadc2) != HAL_OK) Error_Handler_Local();
 
     /* ADC3 is dedicated to the stock PC2 DCLINK divider. On STM32F103xE the
@@ -313,14 +313,14 @@ static void init_adc_dma(void) {
     /* Rank 4..6 stay after the DMA HT boundary. Ranks 4..5 are diagnostics;
        rank 6 is application ADC and never participates in FOC feedback.
        DCLINK is deliberately removed from ADC1/ADC2; ADC3 owns PC2 now. */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_11, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* duplicate RIGHT DC */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_10, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* duplicate LEFT DC */
+    /* Rank 4 is APP ADC (PA2/PA3) — after HT boundary, never participates in
+       FOC feedback. Follows VESC standard: throttle/brake ADC at rank 4. */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_2, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* APP ADC1 PA2 */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_3, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* APP ADC2 PA3 */
     /* Rank 5 is after DMA half-transfer, so the long internal-temperature
        conversion cannot delay the 16-kHz current-control ISR. */
     cfg_adc_channel(&hadc1, ADC_CHANNEL_TEMPSENSOR, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_239CYCLES_5); /* MCU/board temp */
     cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_239CYCLES_5); /* match ADC1 rank5 simultaneous timing */
-    cfg_adc_channel(&hadc1, ADC_CHANNEL_2, ADC_REGULAR_RANK_6, ADC_SAMPLETIME_28CYCLES_5); /* APP ADC1 PA2 */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_3, ADC_REGULAR_RANK_6, ADC_SAMPLETIME_28CYCLES_5); /* APP ADC2 PA3 */
 
     cfg_adc_channel(&hadc3, ADC_CHANNEL_12, ADC_REGULAR_RANK_1, ADC_SAMPLETIME_28CYCLES_5); /* DCLINK PC2 */
 
@@ -433,7 +433,7 @@ void motor_hw_start_sampling(void) {
         (void)HAL_ADC_Stop_DMA(&hadc3);
         Error_Handler_Local();
     }
-    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)g_adc_dual_dma, 6U) != HAL_OK) {
+    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)g_adc_dual_dma, 5U) != HAL_OK) {
         (void)HAL_ADC_Stop(&hadc2);
         (void)HAL_ADC_Stop_DMA(&hadc3);
         Error_Handler_Local();
@@ -562,9 +562,9 @@ bool motor_hw_sampling_contract_valid(void) {
 }
 
 void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled) {
-    if (m == NULL) return;
+    if (m == NULL || m->pwm_tim == NULL) return;
     if (enabled) {
-        if (s_powerstage_fault_flags != 0U) {
+        if (s_powerstage_fault_flags != 0U && !foc_calibration_in_progress()) {
             m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
             m->pwm_enabled = false;
             m->pwm_enable_pending_events = 0U;
@@ -595,12 +595,17 @@ void motor_hw_set_pwm_enabled(MotorRuntime *m, bool enabled) {
 
 void motor_hw_service_pwm_enable_from_isr(MotorRuntime *m) {
     if (m == NULL || m->pwm_enabled || m->pwm_enable_pending_events == 0U) return;
-    /* Hardware power-stage faults (PVD/BKIN) always block MOE. A normal
-     * software fault blocks MOE only after calibration has finished (i.e. the
-     * normal running state). During calibration, even a stale fault (e.g.
-     * FLASH_CONFIG from a blank flash) must not prevent the safe 50% zero-
-     * vector driven stage from arming MOE so offset calibration can finish. */
-    if (s_powerstage_fault_flags != 0U ||
+    /* Hardware power-stage faults (PVD/BKIN) block MOE in the normal running
+     * state. During calibration, however, the bridges are driven with a safe
+     * 50% zero-vector and no torque is produced, so a latched/stale power-stage
+     * fault (e.g. a PVD glitch coupled in by the switching edges, or a
+     * FLASH_CONFIG fault from blank flash) must NOT prevent MOE from arming.
+     * The comment at the top of this function already states this intent; the
+     * original check below re-cleared MOE on every ISR once a fault latched,
+     * which wedged the driven calibration stage (MOE confirmed in WARMUP, then
+     * dropped in DRIVEN, wait-events expired, FAIL). Only a real *software*
+     * motor fault (not calibration-in-progress) may block MOE while calibrating. */
+    if ((s_powerstage_fault_flags != 0U && !foc_calibration_in_progress()) ||
         (m->fault != MOTOR_FAULT_NONE && !foc_calibration_in_progress())) {
         m->pwm_enable_pending_events = 0U;
         m->pwm_tim->BDTR &= ~TIM_BDTR_MOE;
@@ -692,6 +697,12 @@ bool motor_hw_clear_recoverable_powerstage_faults(void) {
 void motor_hw_pvd_irq_handler(void) {
 #if HOVERBOARD_PVD_ENABLE
     EXTI->PR = (1UL << 16);
+    /* During current-offset calibration the bridges are driven with a safe
+     * 50% zero-vector and produce no phase current, so a PVD glitch coupled in
+     * by the switching edges must not latch a fault or clear MOE. Suppress the
+     * PVD reaction entirely while calibration is in progress; the normal
+     * running state still gets the full under-voltage protection. */
+    if (foc_calibration_in_progress()) return;
     if ((PWR->CSR & (1UL << 2)) != 0U) {
         TIM1->BDTR &= ~TIM_BDTR_MOE;
         TIM8->BDTR &= ~TIM_BDTR_MOE;
@@ -705,6 +716,10 @@ void motor_hw_pvd_irq_handler(void) {
 void motor_hw_break_irq_handler(TIM_TypeDef *tim) {
     if (tim == NULL || (tim->SR & TIM_SR_BIF) == 0U) return;
     tim->SR &= ~TIM_SR_BIF;
+    /* During current-offset calibration the bridges run a safe 50% zero-vector,
+     * so a spurious break event must not latch a fault or clear MOE. Suppress
+     * the break reaction while calibration is in progress. */
+    if (foc_calibration_in_progress()) return;
     /* Hardware already cleared MOE asynchronously. Explicitly clear both
        bridges as the dual-motor board shares one supply/power-stage domain. */
     TIM1->BDTR &= ~TIM_BDTR_MOE;
@@ -876,12 +891,13 @@ void motor_hw_emergency_all_off(void) {
 
 
 void motor_hw_capture_app_adc_from_isr(void) {
-    /* On the first HT event rank 6 has never been converted yet. From the
-     * second event onward slot 5 is the complete previous PWM frame and stays
-     * stable until the slow half of the current frame reaches rank 6. */
+    /* On the first HT event rank 4 (APP ADC PA2/PA3) has never been converted
+     * yet. From the second event onward slot 3 is the complete previous PWM
+     * frame and stays stable until the slow half of the current frame reaches
+     * rank 4. */
     if (s_app_adc_ht_seen != 0U) {
         __DMB();
-        s_app_adc_word = g_adc_dual_dma[5];
+        s_app_adc_word = g_adc_dual_dma[3];
         __DMB();
         s_app_adc_seq++;
     } else {

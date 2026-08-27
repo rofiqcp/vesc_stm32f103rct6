@@ -16,7 +16,7 @@
  * interrupt and is completely independent from this transport. */
 #define VESC_UART_RX_RING_SIZE       1024U
 #define VESC_UART_RX_DMA_SIZE         256U
-#define VESC_UART_TX_QUEUE_DEPTH        4U
+#define VESC_UART_TX_QUEUE_DEPTH        8U
 #define VESC_UART_TX_FRAME_MAX        520U
 
 #if (VESC_UART_RX_RING_SIZE & (VESC_UART_RX_RING_SIZE - 1U)) != 0
