@@ -1,4 +1,5 @@
 #pragma once
+#include "cmsis_os2.h"
 #include "datatypes.h"
 
 extern MotorRuntime g_motor_left;
@@ -49,6 +50,7 @@ int32_t motor_encoder_extended_count(MotorRuntime *m);
  * ======================================================================== */
 void mc_interface_init(bool reset_conf);
 bool mc_interface_start_threads(void);
+void mc_interface_set_thread_ids(osThreadId_t timer, osThreadId_t sample, osThreadId_t fault);
 
 typedef struct {
 	uint32_t heap_free_bytes;

@@ -374,6 +374,8 @@ void app_uartcomm_configure(uint32_t baudrate,bool permanent_enabled,UART_PORT p
        reprogramming DMA/UART while packets are in flight. */
     (void)baudrate;
 }
+/* Legacy/compat API retained for parity with the reference app.h API. It has
+   no live callers in src/; real transmit uses vesc_comm_send_payload. */
 void app_uartcomm_send_packet(unsigned char *data,unsigned int len,UART_PORT port_number){
     (void)port_number;
     if(!data||len>VESC_PACKET_MAX_PAYLOAD||s_packet_mutex==NULL)return;

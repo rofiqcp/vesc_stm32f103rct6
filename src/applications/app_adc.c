@@ -190,8 +190,9 @@ void app_adc_service_1khz(uint32_t now_ms) {
     s_adc.pub.decoded2 = brake;
 
     if (control_uses_brake_adc(c->ctrl_type)) {
-        /* Safety-first arbitration: an intentional brake input above 5% owns
-         * the command and cancels positive throttle before generating regen. */
+        /* Port has no physical ADC buttons; brake channel is always treated
+         * as an intentional brake input. A brake reading above 5% cancels
+         * positive throttle then generates regen. */
         if (brake > 0.05f) pwr = 0.0f;
         pwr -= brake;
     }

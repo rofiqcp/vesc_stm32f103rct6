@@ -2,8 +2,9 @@
 #include "cmsis_os2.h"
 #include "hwconf/hw.h"
 #include "motor/mc_interface.h"
-#include "motor/mc_interface.h"
 #include "motor/mcpwm_foc.h"
+#include "applications/app_command.h"
+#include "applications/app_adc.h"
 #include "telemetry.h"
 #include "comm/commands.h"
 #include "conf_general.h"
@@ -14,6 +15,14 @@ static void SystemClock_Config(void);
 static void dwt_init(void);
 static void early_fatal(void);
 static void motor_boot_thread(void *argument);
+
+/* Thread functions owned by other translation units (central thread registry). */
+extern void status_thread(void *argument);
+extern void packet_process_thread(void *argument);
+extern void blocking_thread(void *argument);
+extern void timer_thread(void *argument);
+extern void sample_send_thread(void *argument);
+extern void fault_stop_thread(void *argument);
 
 int main(void) {
     HAL_Init();
@@ -38,16 +47,54 @@ int main(void) {
         early_fatal();
     }
 
+    /* ======================================================================
+     * Central RTOS thread registry.
+     *
+     * Semua osThreadNew() dikumpulkan di main.c supaya seluruh thread RTOS2 v2
+     * mudah di-maintain dari satu tempat. Fungsi thread tetap diimplementasikan
+     * di file modul masing-masing (hw_status.c, commands.c, mc_interface.c,
+     * main.c sendiri); main.c hanya memanggil osThreadNew lalu mendaftarkan
+     * handle kembali ke modul pemilik lewat setter. Setiap modul tetap memiliki
+     * handle-nya untuk flag-set / stack-check / rollback.
+     *
+     * Urutan spawn mengikuti dependensi boot:
+     *   1) StatusIO    — LED/buzzer independen, dipakai sebagai status awal.
+     *   2) uartcomm    — packet_process + blocking (handshake VESC Tool).
+     *   3) motor_boot  — boot helper yang nanti me-spawn mc timer/sample/fault.
+     * ====================================================================== */
+
     /* Satu status thread non-blocking (LED+buzzer) start independen dari motor/ADC. */
+    const osThreadAttr_t status_attr = {
+        .name = "StatusIO",
+        .priority = osPriorityNormal,
+        .stack_size = 512U
+    };
+    hw_status_set_thread_id(osThreadNew(status_thread, NULL, &status_attr));
     if (!hw_status_init()) {
         early_fatal();
     }
+
+    /* VESC UART/packet communication threads. */
+    const osThreadAttr_t packet_attr = {
+        .name = "uartcomm proc",
+        .priority = osPriorityHigh,
+        .stack_size = 1536U
+    };
+    const osThreadAttr_t block_attr = {
+        .name = "comm_block",
+        .priority = osPriorityNormal,
+        .stack_size = 3072U
+    };
+    vesc_comm_set_thread_ids(osThreadNew(packet_process_thread, NULL, &packet_attr),
+                             osThreadNew(blocking_thread, NULL, &block_attr));
 
     commands_init();
     if (!commands_is_initialized()) {
         early_fatal();
     }
 
+    /* Boot helper: motor/FOC/config startup. Men-spawn mc timer/sample/fault
+     * di dalam thread ini (lihat motor_boot_thread di bawah). */
     const osThreadAttr_t boot_attr = {
         .name = "motor_boot_thread",
         .priority = osPriorityBelowNormal,
@@ -114,6 +161,38 @@ static void motor_boot_thread(void *argument) {
         osThreadExit();
     }
     mc_interface_sample_init();
+
+    /* Inisialisasi dependensi thread motor SEBELUM spawn: timer_thread adalah
+     * prioritas High dan langsung preempt boot thread, jadi semua state yang
+     * dipakainya (app_command / app_adc / timeout) harus sudah siap. */
+    app_command_init();
+    app_adc_init();
+    if (!timeout_init()) {
+        osThreadExit();
+    }
+
+    /* Spawn the three motor-control worker threads here (inside the boot
+     * thread) so mc_interface_start_threads() can validate the handles and run
+     * the heap-reserve check. osThreadNew is allowed from a running thread. */
+    const osThreadAttr_t timer_attr = {
+        .name = "mc timer",
+        .priority = osPriorityHigh,
+        .stack_size = 896U
+    };
+    const osThreadAttr_t sample_attr = {
+        .name = "mc sample",
+        .priority = osPriorityBelowNormal,
+        .stack_size = 640U
+    };
+    const osThreadAttr_t fault_attr = {
+        .name = "mc fault",
+        .priority = osPriorityHigh,
+        .stack_size = 512U
+    };
+    mc_interface_set_thread_ids(osThreadNew(timer_thread, NULL, &timer_attr),
+                                osThreadNew(sample_send_thread, NULL, &sample_attr),
+                                osThreadNew(fault_stop_thread, NULL, &fault_attr));
+
     if (!mc_interface_start_threads()) {
         /* One missing control/stat/periodic thread is a partial controller,
            not a ready VESC. Keep UART handshakes alive and refuse motor use. */

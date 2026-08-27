@@ -56,7 +56,7 @@ static const motor_fault_t s_fault_priority[] = {
     MOTOR_FAULT_SENSORLESS_OBSERVER
 };
 
-static void status_thread(void *argument);
+void status_thread(void *argument);
 
 static motor_fault_t highest_priority_fault(void) {
     const motor_fault_t left = g_motor_left.fault;
@@ -227,7 +227,7 @@ void hw_status_tim3_irq_handler(void) {
     }
 }
 
-static void status_thread(void *argument) {
+void status_thread(void *argument) {
     (void)argument;
 
     uint32_t next = osKernelGetTickCount();
@@ -412,18 +412,19 @@ static void status_thread(void *argument) {
     }
 }
 
+void hw_status_set_thread_id(osThreadId_t id) {
+    s_status_thread = id;
+}
+
 bool hw_status_init(void) {
+    /* The StatusIO thread is spawned centrally in main.c via osThreadNew. This
+     * function only validates that the handle was registered and guards against
+     * a repeated call. */
     if (s_status_started) {
         return s_status_thread != NULL;
     }
 
     s_status_started = true;
-    const osThreadAttr_t attributes = {
-        .name = "StatusIO",
-        .priority = osPriorityNormal,
-        .stack_size = 512U
-    };
-    s_status_thread = osThreadNew(status_thread, NULL, &attributes);
     return s_status_thread != NULL;
 }
 

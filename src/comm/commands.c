@@ -92,8 +92,8 @@ static volatile bool s_shutdown_latched = false;
 
 static void process_payload(const uint8_t *data, uint16_t len);
 static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_id_t id);
-static void packet_process_thread(void *argument);
-static void blocking_thread(void *argument);
+void packet_process_thread(void *argument);
+void blocking_thread(void *argument);
 static void vesc_comm_reply_diag(void);
 static void vesc_comm_send_payload_low_priority(const uint8_t *payload, uint16_t len);
 static void process_terminal_text(const uint8_t *data, uint16_t len, motor_id_t id);
@@ -1215,7 +1215,7 @@ static bool battery_cut_apply_both(float start, float end, bool store) {
     return true;
 }
 
-static void blocking_thread(void *argument) {
+void blocking_thread(void *argument) {
     (void)argument;
     blocking_job_t job;
     for (;;) {
@@ -1852,7 +1852,7 @@ static void process_payload(const uint8_t *data, uint16_t len) {
     process_payload_for_motor(data, len, MOTOR_LEFT);
 }
 
-static void packet_process_thread(void *argument) {
+void packet_process_thread(void *argument) {
     (void)argument;
     for (;;) {
         timeout_heartbeat(TIMEOUT_HEARTBEAT_COMM);
@@ -2085,6 +2085,11 @@ void vesc_comm_get_resource_stats(vesc_comm_resource_stats_t *out) {
         osThreadGetStackSpace(s_blocking_tp);
 }
 
+void vesc_comm_set_thread_ids(osThreadId_t packet, osThreadId_t blocking) {
+    s_packet_tp = packet;
+    s_blocking_tp = blocking;
+}
+
 bool vesc_comm_task_init(void) {
     if (s_comm_initialized) return true;
     memset((void *)&s_diag, 0, sizeof(s_diag));
@@ -2106,15 +2111,9 @@ bool vesc_comm_task_init(void) {
         return false;
     }
 
-    const osThreadAttr_t packet_attr = {
-        .name="uartcomm proc", .priority=osPriorityHigh, .stack_size=1536U
-    };
-    const osThreadAttr_t block_attr = {
-        .name="comm_block", .priority=osPriorityNormal, .stack_size=3072U
-    };
-
-    s_packet_tp = osThreadNew(packet_process_thread, NULL, &packet_attr);
-    s_blocking_tp = osThreadNew(blocking_thread, NULL, &block_attr);
+    /* The packet/blocking threads are spawned centrally in main.c via
+     * osThreadNew and registered through vesc_comm_set_thread_ids(). Validate
+     * that the handles were provided before starting the serial peripheral. */
     if (s_packet_tp == NULL || s_blocking_tp == NULL) {
         return false;
     }

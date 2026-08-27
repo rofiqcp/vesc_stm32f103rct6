@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include "cmsis_os2.h"
 #include "datatypes.h"
 
 typedef void (*vesc_appdata_handler_t)(const uint8_t *data, uint16_t len, motor_id_t motor);
@@ -24,6 +25,7 @@ void commands_plot_set_graph(int graph);
 void commands_send_plot_points(float x, float y);
 
 bool vesc_comm_task_init(void);
+void vesc_comm_set_thread_ids(osThreadId_t packet, osThreadId_t blocking);
 void vesc_comm_set_config_ready(bool ready);
 void vesc_comm_set_motor_ready(bool ready);
 bool vesc_comm_motor_ready(void);

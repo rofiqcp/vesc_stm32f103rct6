@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include "cmsis_os2.h"
 #include "datatypes.h"
 
 extern ADC_HandleTypeDef hadc1;
@@ -76,6 +77,7 @@ void motor_hw_emergency_all_off(void);
 void hw_status_early_init(void);
 void hw_status_timer_init(void);
 bool hw_status_init(void);
+void hw_status_set_thread_id(osThreadId_t id);
 void hw_status_tone_start(uint16_t hz);
 void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms);
 void hw_status_tone_stop(void);

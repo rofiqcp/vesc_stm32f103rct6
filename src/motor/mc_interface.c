@@ -2299,9 +2299,16 @@ static osThreadId_t s_sample_send_thread;
 static osThreadId_t s_fault_stop_thread;
 static bool s_threads_started;
 
-static void timer_thread(void *argument);
-static void sample_send_thread(void *argument);
-static void fault_stop_thread(void *argument);
+void timer_thread(void *argument);
+void sample_send_thread(void *argument);
+void fault_stop_thread(void *argument);
+
+void mc_interface_set_thread_ids(osThreadId_t timer, osThreadId_t sample,
+                                 osThreadId_t fault) {
+    s_timer_thread = timer;
+    s_sample_send_thread = sample;
+    s_fault_stop_thread = fault;
+}
 
 static uint32_t thread_stack_free_bytes(osThreadId_t thread) {
 	if (thread == NULL) {
@@ -2347,7 +2354,7 @@ void mc_interface_get_resource_stats(mc_interface_resource_stats_t *stats) {
 	stats->status_stack_free_bytes = hw_status_stack_free_bytes();
 }
 
-static void timer_thread(void *argument) {
+void timer_thread(void *argument) {
 	(void)argument;
 	bool current_offset_fault_reported = false;
 	uint8_t calibration_divider = 0U;
@@ -2422,7 +2429,7 @@ static void timer_thread(void *argument) {
 	}
 }
 
-static void sample_send_thread(void *argument) {
+void sample_send_thread(void *argument) {
 	(void)argument;
 	for (;;) {
 		const uint32_t flags = osThreadFlagsWait(1UL, osFlagsWaitAny,
@@ -2445,7 +2452,7 @@ static void sample_send_thread(void *argument) {
 	}
 }
 
-static void fault_stop_thread(void *argument) {
+void fault_stop_thread(void *argument) {
 	(void)argument;
 	const uint32_t mask = (1UL << MOTOR_LEFT) | (1UL << MOTOR_RIGHT);
 
@@ -2477,36 +2484,12 @@ bool mc_interface_start_threads(void) {
 				s_fault_stop_thread != NULL;
 	}
 
-	app_command_init();
-	app_adc_init();
-	if (!timeout_init()) {
-		return false;
-	}
-
-	const osThreadAttr_t timer_attributes = {
-		.name = "mc timer",
-		.priority = osPriorityHigh,
-		.stack_size = 896U
-	};
-	const osThreadAttr_t sample_attributes = {
-		.name = "mc sample",
-		.priority = osPriorityBelowNormal,
-		.stack_size = 640U
-	};
-	const osThreadAttr_t fault_attributes = {
-		.name = "mc fault",
-		.priority = osPriorityHigh,
-		.stack_size = 512U
-	};
-
-	s_timer_thread = osThreadNew(timer_thread, NULL, &timer_attributes);
-	s_sample_send_thread = osThreadNew(sample_send_thread, NULL,
-			&sample_attributes);
-	s_fault_stop_thread = osThreadNew(fault_stop_thread, NULL,
-			&fault_attributes);
-
+	/* Inisialisasi app_command/app_adc/timeout dilakukan di main.c SEBELUM
+	 * spawn thread (lihat motor_boot_thread). Fungsi ini hanya memvalidasi
+	 * handle yang didaftarkan lewat mc_interface_set_thread_ids() dan
+	 * menjalankan pemeriksaan resource/heap. */
 	const bool threads_ok = s_timer_thread != NULL &&
-			s_sample_send_thread != NULL && s_fault_stop_thread != NULL;
+	        s_sample_send_thread != NULL && s_fault_stop_thread != NULL;
 	const bool heap_ok = mc_interface_free_heap_bytes() >=
 			RTOS_READY_HEAP_RESERVE_BYTES;
 	if (!threads_ok || !heap_ok) {
