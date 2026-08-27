@@ -312,7 +312,7 @@ static void reply_fw_version(motor_id_t id) {
     p[i++] = 0U; /* qml app */
     p[i++] = 0U; /* nrf flags */
 
-    const char fw[] = "vesc-f103-hoverboard-v33-vesc-layout";
+    const char fw[] = "vesc_stm32f103rct6";
     memcpy(&p[i], fw, sizeof(fw));
     i = (uint16_t)(i + sizeof(fw));
 
@@ -340,10 +340,18 @@ static void reply_fw_info(void) {
 }
 
 static void append_get_values_fields(uint8_t *p, uint16_t *i,
-                                     const motor_telemetry_t *t, uint32_t mask) {
-    /* Board ini tidak memiliki kanal NTC yang didefinisikan. Slot wajib
-     * protocol tetap dikirim dengan sentinel -300 C, bukan 0 C palsu. */
-    if (mask & (1UL << 0)) put_i16(p, i, VESC_TEMP_UNAVAILABLE_DECIC);
+                                     const motor_telemetry_t *t, uint32_t mask,
+                                     motor_id_t id) {
+    /* Stock hoverboard hardware has no individual MOSFET NTCs. It does have
+     * ADC1's internal MCU sensor, filtered per motor as board_temp_filter_c.
+     * Report that honest board-temperature proxy in the VESC FET slots; the
+     * motor NTC slot remains unavailable (-300 C), rather than fabricating a
+     * motor temperature. */
+    MotorRuntime *m = motor_get(id);
+    const float fet_proxy_c = (m != NULL && m->board_temp_valid)
+                            ? m->board_temp_filter_c : -300.0f;
+    const int16_t fet_proxy_decic = scaled_i16(fet_proxy_c, 10.0f);
+    if (mask & (1UL << 0)) put_i16(p, i, fet_proxy_decic);
     if (mask & (1UL << 1)) put_i16(p, i, VESC_TEMP_UNAVAILABLE_DECIC);
     if (mask & (1UL << 2)) put_i32(p, i, scaled_i32(t->current_motor, 100.0f));
     if (mask & (1UL << 3)) put_i32(p, i, scaled_i32(t->current_in, 100.0f));
@@ -362,13 +370,18 @@ static void append_get_values_fields(uint8_t *p, uint16_t *i,
     if (mask & (1UL << 16)) put_i32(p, i, scaled_i32(t->position_deg, 1000000.0f));
     if (mask & (1UL << 17)) p[(*i)++] = t->controller_id;
     if (mask & (1UL << 18)) {
-        put_i16(p, i, VESC_TEMP_UNAVAILABLE_DECIC);
-        put_i16(p, i, VESC_TEMP_UNAVAILABLE_DECIC);
-        put_i16(p, i, VESC_TEMP_UNAVAILABLE_DECIC);
+        put_i16(p, i, fet_proxy_decic);
+        put_i16(p, i, fet_proxy_decic);
+        put_i16(p, i, fet_proxy_decic);
     }
-    if (mask & (1UL << 19)) put_i32(p, i, scaled_i32(t->vd, 1000.0f));
-    if (mask & (1UL << 20)) put_i32(p, i, scaled_i32(t->vq, 1000.0f));
-    if (mask & (1UL << 21)) p[(*i)++] = timeout_has_timeout() ? 1U : 0U;
+    /* VESC 6.00 bit 19 is a grouped field: VD and VQ, both float32 scaled
+     * 1e3. Bit 20 is the 1-byte status. Do not split VD/VQ across bits; that
+     * shifts the trailing status byte and breaks VESC Tool/Python decoders. */
+    if (mask & (1UL << 19)) {
+        put_i32(p, i, scaled_i32(t->vd, 1000.0f));
+        put_i32(p, i, scaled_i32(t->vq, 1000.0f));
+    }
+    if (mask & (1UL << 20)) p[(*i)++] = timeout_has_timeout() ? 1U : 0U;
 }
 
 static void reply_get_values(uint8_t command, uint32_t mask, motor_id_t id) {
@@ -383,7 +396,7 @@ static void reply_get_values(uint8_t command, uint32_t mask, motor_id_t id) {
     uint8_t *p = payload_begin(); if (p == NULL) return;
     uint16_t i = 0U; p[i++] = command;
     if (command == COMM_GET_VALUES_SELECTIVE) put_u32(p, &i, mask);
-    append_get_values_fields(p, &i, &t, mask);
+    append_get_values_fields(p, &i, &t, mask, id);
     payload_end(i);
 }
 
@@ -1785,6 +1798,26 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
             app_command_uart_keepalive(id);
             (void)hw_status_power_is_held(); /* keepalive may hold power latch */
             break;
+        case COMM_GET_IMU_DATA: {
+            /* This board has no IMU. Reply with the requested mask and the
+             * standard trailing controller id so VESC Tool / scripts do not
+             * time out waiting for command 65. Requested fields are reported
+             * as 0.0 (auto float32), matching an absent sensor. */
+            uint16_t mask = 0U;
+            if (len >= 3U) mask = (uint16_t)((uint16_t)data[1] << 8) | data[2];
+            uint8_t *p = payload_begin(); if (p == NULL) break;
+            uint16_t i = 0U;
+            p[i++] = COMM_GET_IMU_DATA;
+            put_u16(p, &i, mask);
+            /* 16 IMU fields (roll/pitch/yaw, accel xyz, gyro xyz, mag xyz,
+             * quaternion xyzw). All absent -> 0.0. */
+            for (uint8_t b = 0U; b < 16U; b++) {
+                if (mask & (1U << b)) put_float32_auto(p, &i, 0.0f);
+            }
+            p[i++] = (id == MOTOR_RIGHT) ? VESC_CONTROLLER_ID_RIGHT
+                                        : VESC_CONTROLLER_ID_LEFT;
+            payload_end(i);
+        } break;
         case COMM_CUSTOM_APP_DATA:
             if (len >= 2U) {
                 if (s_appdata_handler != NULL) s_appdata_handler(&data[1], (uint16_t)(len - 1U), id);
@@ -1943,18 +1976,13 @@ static void vesc_comm_reply_diag(void) {
 }
 
 void vesc_comm_periodic_100hz(void) {
+    /* Standard VESC behaviour: the controller does NOT push COMM_GET_VALUES
+     * on its own. VESC Tool issues the request and the firmware replies via
+     * the normal packet thread. Pushing telemetry spontaneously both violates
+     * the wire convention and, under the polled-TX transport, would contend
+     * with command/config replies sent from the higher-priority packet thread.
+     * Keep only the non-UART housekeeping here. */
     conf_general_service_100hz();
-    /* Push the RT data feed unconditionally. VESC Tool's Real-Time Data tab
-     * relies on the controller pushing COMM_GET_VALUES periodically; if we
-     * gate it behind s_motor_ready the tab stalls (no frames for 0.5-1 s at a
-     * time) whenever the motor is stopped or the boot thread has not yet
-     * flagged the sampling contract valid. A stopped motor simply reports
-     * zero current/duty, which is the correct live view. Only motor-control
-     * and config commands need the motor_ready gate, not the telemetry push. */
-    static uint8_t s_rt_toggle = 0U;
-    motor_id_t rt_motor = (s_rt_toggle & 1U) ? MOTOR_RIGHT : MOTOR_LEFT;
-    s_rt_toggle++;
-    reply_get_values(COMM_GET_VALUES, 0x003FFFFFUL, rt_motor);
     /* Kedua bridge lokal memiliki display-position state sendiri. Motor-2
      * mengikuti semantics local dual-motor forwarding, tanpa driver CAN. */
     if (s_display_owner == 0) send_rotor_position(MOTOR_LEFT);
