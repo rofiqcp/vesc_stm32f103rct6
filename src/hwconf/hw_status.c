@@ -237,7 +237,8 @@ void hw_status_service_10ms(uint32_t now) {
     static bool led_output_on;
     static uint32_t led_deadline;
     static bool hb_led_on;
-    static uint8_t hb_divider;
+    static uint32_t hb_deadline;
+    static uint8_t led_mode;        /* 0=heartbeat, 1=cal, 2=detect, 3=run */
     static uint8_t startup_index;
     static bool startup_done;
     static motor_fault_t announced;
@@ -255,8 +256,10 @@ void hw_status_service_10ms(uint32_t now) {
         led_pulses_left = 0U;
         led_output_on = false;
         led_deadline = now;
-        hb_led_on = true;
-        hb_divider = 0U;
+        hb_led_on = false;
+        hb_deadline = now + 500U;
+        led_mode = 0xFFU;          /* force first-mode initialization */
+        motor_hw_led(false);
         startup_index = 0U;
         startup_done = false;
         announced = MOTOR_FAULT_NONE;
@@ -341,28 +344,48 @@ void hw_status_service_10ms(uint32_t now) {
             led_state = 0U;
             led_pulses_left = 0U;
             led_output_on = false;
-            hb_divider = 0U;
+            hb_led_on = false;
+            hb_deadline = now + 500U;
+            led_mode = 0xFFU;
+            motor_hw_led(false);
         }
         announced = MOTOR_FAULT_NONE;
         fault_stage = 0U;
 
-        /* LED mode cue (plain GPIO flash, bukan PWM). Setiap 1 detik
-         * keluarkan N pulsa: nyala 200 ms / mati 200 ms, lalu mati 1 detik.
-         *   calibrating -> 1 pulsa
-         *   detecting   -> 2 pulsa
-         *   running     -> 3 pulsa
-         * Di luar mode itu -> heartbeat 1 Hz (1 s nyala / 1 s mati). */
+        /* LED status follows the proven SmartESC idea: a healthy controller
+         * must always have an obvious periodic heartbeat. Additional burst modes
+         * are retained for calibration/detection/running, but every transition
+         * is explicitly re-initialized so the LED cannot inherit a stale pulse
+         * counter/deadline from the previous mode.
+         *
+         *   calibrating -> 1 pulse burst (200 ms on/off), 1 s gap
+         *   detecting   -> 2 pulse burst, 1 s gap
+         *   running     -> 3 pulse burst, 1 s gap
+         *   idle/ready  -> 500 ms toggle heartbeat (SmartESC-like normal blink)
+         */
         const bool calibrating = !foc_calibration_done();
         const bool detecting = g_motor_left.detect.busy ||
                 g_motor_right.detect.busy;
         const bool running = g_motor_left.pwm_enabled ||
                 g_motor_right.pwm_enabled;
-        const uint8_t pulses = calibrating ? 1U :
-                               (detecting ? 2U :
-                               (running ? 3U : 0U));
+        const uint8_t mode = calibrating ? 1U :
+                             (detecting ? 2U :
+                             (running ? 3U : 0U));
+        const uint8_t pulses = mode;
+
+        if (mode != led_mode) {
+            led_mode = mode;
+            led_state = 0U;
+            led_pulses_left = 0U;
+            led_output_on = false;
+            led_deadline = now;
+            hb_led_on = false;
+            hb_deadline = now + 500U;
+            motor_hw_led(false);
+        }
 
         if (pulses != 0U) {
-            if (led_state == 0U) {          /* burst */
+            if (led_state == 0U) {
                 if (led_pulses_left == 0U) {
                     led_pulses_left = pulses;
                     led_output_on = true;
@@ -371,10 +394,10 @@ void hw_status_service_10ms(uint32_t now) {
                 } else if ((int32_t)(now - led_deadline) >= 0) {
                     led_output_on = !led_output_on;
                     motor_hw_led(led_output_on);
-                    if (!led_output_on) {   /* barusan mati */
+                    if (!led_output_on) {
                         led_pulses_left--;
                         if (led_pulses_left == 0U) {
-                            led_state = 1U; /* masuk gap 1 detik */
+                            led_state = 1U;
                             led_deadline = now + 1000U;
                         } else {
                             led_deadline = now + 200U;
@@ -383,7 +406,7 @@ void hw_status_service_10ms(uint32_t now) {
                         led_deadline = now + 200U;
                     }
                 }
-            } else {                        /* gap */
+            } else {
                 motor_hw_led(false);
                 if ((int32_t)(now - led_deadline) >= 0) {
                     led_state = 0U;
@@ -391,14 +414,13 @@ void hw_status_service_10ms(uint32_t now) {
                     led_output_on = false;
                 }
             }
-        } else {
-            /* Heartbeat 1 Hz (1 detik nyala / 1 detik mati). */
-            hb_divider++;
-            if (hb_divider >= 100U) {       /* 100 * 10 ms = 1 s */
-                hb_divider = 0U;
-                hb_led_on = !hb_led_on;
-                motor_hw_led(hb_led_on);
-            }
+        } else if ((int32_t)(now - hb_deadline) >= 0) {
+            /* SmartESC normal path toggles its LED roughly every 0.5 s. Use an
+             * absolute deadline rather than an 8-bit divider so delayed timer
+             * service cannot permanently distort the blink cadence. */
+            hb_led_on = !hb_led_on;
+            motor_hw_led(hb_led_on);
+            hb_deadline = now + 500U;
         }
 
         if (!startup_done && (int32_t)(now - startup_deadline) >= 0) {

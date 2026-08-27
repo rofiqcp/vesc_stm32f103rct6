@@ -20,3 +20,11 @@ Validation included in package:
   python3 tools/rtos_audit.py
   python3 tools/comm_audit.py
   python3 vesc_tools/selftest_protocol.py
+
+Dual-motor forwarding fix (motor right / controller ID 2):
+- COMM_FORWARD_CAN ID 2 now follows upstream HW_HAS_DUAL_MOTORS behavior:
+  select motor thread 2 -> recursively process inner VESC command -> restore caller selection.
+- COMM_FW_VERSION uses the same hardware name for both local motor contexts.
+- Motor-2 UUID last byte is incremented only while motor thread 2 is selected, matching upstream VESC.
+- Added `tools/debug.py motor2-forward` raw forwarded FW_VERSION diagnostic.
+- Added `tools/debug.py vesc-tool-dual-basic` passive dual-controller routing/config verification.

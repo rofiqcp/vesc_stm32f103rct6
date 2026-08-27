@@ -1652,6 +1652,35 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     if v2.controller_id != 2:
         raise ValueError(f"forwarded GET_VALUES controller_id={v2.controller_id}, expected 2")
 
+    # VESC Tool uses COMM_GET_VALUES_SELECTIVE. Upstream ABI has three
+    # independent tail bits: 19=Vd (4 B), 20=Vq (4 B), 21=status (1 B).
+    # A grouped 19=(Vd,Vq) layout can pass full GET_VALUES yet break the GUI
+    # as soon as it changes the selective mask while polling a CAN-forwarded node.
+    for motor in (0,1):
+        for bit,field_len in ((19,4),(20,4),(21,1)):
+            mask=1 << bit
+            req=bytes((COMM_GET_VALUES_SELECTIVE,))+be_u32(mask)
+            rsp=link.request_std(motor,req,
+                    lambda x: len(x)>=5 and x[0]==COMM_GET_VALUES_SELECTIVE,2.0)
+            if len(rsp) != 1+4+field_len:
+                raise ValueError(f"M{motor+1} selective bit{bit} length={len(rsp)}, "
+                                 f"expected {1+4+field_len}")
+            if int.from_bytes(rsp[1:5],"big") != mask:
+                raise ValueError(f"M{motor+1} selective bit{bit} mask echo mismatch")
+
+    # Repeatedly alternate direct and forwarded FW_VERSION exactly as VESC Tool
+    # does while changing selected devices. This catches leaked motor-thread 2
+    # context: local must always return UUID1 and forwarded ID2 must return UUID2.
+    for n in range(8):
+        a=parse_fw_version(link.request(bytes((COMM_FW_VERSION,)),
+                lambda x: bool(x) and x[0]==COMM_FW_VERSION,2.0))
+        b=parse_fw_version(link.request_std(1,bytes((COMM_FW_VERSION,)),
+                lambda x: bool(x) and x[0]==COMM_FW_VERSION,2.0))
+        c=parse_fw_version(link.request(bytes((COMM_FW_VERSION,)),
+                lambda x: bool(x) and x[0]==COMM_FW_VERSION,2.0))
+        if a['uuid'] != i1['uuid'] or c['uuid'] != i1['uuid'] or b['uuid'] != i2['uuid']:
+            raise ValueError(f"dual route context leak on cycle {n+1}")
+
     # Both configuration read paths must be independently addressable.
     for motor,expected in ((0,1),(1,2)):
         mc_payload=link.request_std(motor,bytes((COMM_GET_MCCONF,)),lambda x: bool(x) and x[0]==COMM_GET_MCCONF,2.0)
@@ -1665,6 +1694,8 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     print(f"SCAN          : PASS  remote IDs={devs}")
     print(f"M2 FW/UUID/ID : PASS  {i2['major']}.{i2['minor']}  {i2['uuid']}  ID=2")
     print("M1/M2 VALUES  : PASS")
+    print("SELECTIVE ABI : PASS  bits 19=Vd, 20=Vq, 21=status")
+    print("ROUTE STRESS  : PASS  local/ID2 context stable")
     print("M1/M2 MCCONF  : PASS")
     print("M1/M2 APPCONF : PASS")
     print("PASS: basic VESC Tool dual-controller discovery/routing path is coherent")
@@ -1672,13 +1703,20 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
 
 
 def cmd_motor2_forward(link: Link, _args: argparse.Namespace) -> int:
-    # Board ini tidak memiliki CAN PHY. COMM_FORWARD_CAN ID 2 dipakai seperti
-    # cabang local second-motor pada VESC dual-motor: request diproses oleh
-    # runtime motor kanan di MCU yang sama. Motor-2 tetap diiklankan ke VESC
-    # Tool melalui COMM_PING_CAN agar muncul pada device scan.
-    fw=link.request_std(1,bytes((COMM_FW_VERSION,)),lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.0)
+    # This is the exact VESC Tool CAN-forwarded firmware-version transaction:
+    # payload [COMM_FORWARD_CAN, 2, COMM_FW_VERSION]. Upstream dual-motor VESC
+    # returns the bare inner COMM_FW_VERSION reply on the same UART transport.
+    inner=bytes((COMM_FW_VERSION,))
+    routed=Link.standard_route(1,inner)
+    print("TX payload:"," ".join(f"{b:02x}" for b in routed))
+    print("TX frame  :"," ".join(f"{b:02x}" for b in frame(routed)))
+    fw=link.request(routed,lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.5)
+    print("RX payload:"," ".join(f"{b:02x}" for b in fw))
     d=parse_fw_version(fw)
+    if d.get("hw_name") != "MOTOR_LEFT":
+        raise ValueError(f"motor-2 HW name {d.get('hw_name')!r}, expected upstream-style MOTOR_LEFT")
     print("RIGHT FW via local COMM_FORWARD_CAN ID 2:",d)
+    print("PASS: VESC Tool motor-(2) FW_VERSION forwarding path")
     return 0
 
 

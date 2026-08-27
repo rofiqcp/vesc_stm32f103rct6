@@ -289,7 +289,7 @@ static uint32_t main_calc_hw_crc(void) {
     return ~c;
 }
 
-static void reply_fw_version(motor_id_t id) {
+static void reply_fw_version(void) {
     uint8_t *p = payload_begin(); if (p == NULL) return;
     uint16_t i = 0U;
 
@@ -300,12 +300,12 @@ static void reply_fw_version(motor_id_t id) {
     p[i++] = 6U;
     p[i++] = 0U;
 
-    /* VESC Tool shows the HW name plus a forwarding suffix: "NAME (local)"
-     * for the onboard controller and "NAME (2)" for the forwarded bridge.
-     * The user wants the two bridges labelled by function, not by board type,
-     * so report a per-motor HW name: MOTOR_LEFT for the local bridge and
-     * MOTOR_RIGHT for the forwarded bridge. */
-    const char *hw = (id == MOTOR_RIGHT) ? "MOTOR_RIGHT" : "MOTOR_LEFT";
+    /* Match upstream HW_HAS_DUAL_MOTORS semantics exactly: both local motor
+     * contexts report the same hardware name. VESC Tool distinguishes the
+     * second local motor by the forwarded controller ID and by the UUID whose
+     * last byte is incremented below. Using a different HW name for motor-2
+     * is not how upstream dual-motor VESC identifies the second bridge. */
+    const char *hw = "MOTOR_LEFT";
     uint8_t hw_len = (uint8_t)(strlen(hw) + 1U); /* include NUL terminator */
     memcpy(&p[i], hw, hw_len);
     i = (uint16_t)(i + hw_len);
@@ -318,7 +318,7 @@ static void reply_fw_version(motor_id_t id) {
         p[i++] = (uint8_t)(v >> 16);
         p[i++] = (uint8_t)(v >> 24);
     }
-    if (id == MOTOR_RIGHT) p[i - 1U]++;
+    if (mc_interface_get_motor_thread() == 2) p[i - 1U]++;
 
     p[i++] = 1U; /* pairing done */
     p[i++] = 0U; /* FW test version */
@@ -391,14 +391,16 @@ static void append_get_values_fields(uint8_t *p, uint16_t *i,
         put_i16(p, i, fet_proxy_decic);
         put_i16(p, i, fet_proxy_decic);
     }
-    /* VESC 6.00 bit 19 is a grouped field: VD and VQ, both float32 scaled
-     * 1e3. Bit 20 is the 1-byte status. Do not split VD/VQ across bits; that
-     * shifts the trailing status byte and breaks VESC Tool/Python decoders. */
-    if (mask & (1UL << 19)) {
-        put_i32(p, i, scaled_i32(t->vd, 1000.0f));
-        put_i32(p, i, scaled_i32(t->vq, 1000.0f));
+    /* VESC upstream selective-values layout: bit 19 = Vd, bit 20 = Vq,
+     * bit 21 = status. Keep these as three independent fields; VESC Tool can
+     * request each bit separately when it polls a forwarded controller. */
+    if (mask & (1UL << 19)) put_i32(p, i, scaled_i32(t->vd, 1000.0f));
+    if (mask & (1UL << 20)) put_i32(p, i, scaled_i32(t->vq, 1000.0f));
+    if (mask & (1UL << 21)) {
+        uint8_t status = 0U;
+        if (timeout_has_timeout()) status |= 1U;
+        p[(*i)++] = status;
     }
-    if (mask & (1UL << 20)) p[(*i)++] = timeout_has_timeout() ? 1U : 0U;
 }
 
 static void reply_get_values(uint8_t command, uint32_t mask, motor_id_t id) {
@@ -1251,19 +1253,14 @@ void blocking_thread(void *argument) {
             const bool store = job.cmd == COMM_SET_APPCONF;
             bool ok = false;
             if (job.len == (1U + VESC6_APPCONF_WIRE_SIZE)) {
-                /* The queue owns a private 512-byte copy already. Motor-2 is a
-                   fixed local VESC identity, not a mutable CAN node: only an
-                   APPCONF image that still identifies it as ID 2 is accepted.
-                   After validating that public identity, normalize the shared
-                   internal app-config ID to motor-1 before persistence. */
+                /* Match HW_HAS_DUAL_MOTORS upstream: APPCONF is shared. When
+                   a packet is forwarded to motor-thread 2, ignore the public
+                   controller-ID carried in that image and restore the local
+                   primary ID before applying/storing the shared app config. */
                 if (m->id == MOTOR_RIGHT) {
-                    if (job.data[1U + VESC6_APP_OFF_CONTROLLER_ID] == VESC_CONTROLLER_ID_RIGHT) {
-                        job.data[1U + VESC6_APP_OFF_CONTROLLER_ID] = VESC_CONTROLLER_ID_LEFT;
-                        ok = vesc_config_set_app_wire(&job.data[1], VESC6_APPCONF_WIRE_SIZE, store);
-                    }
-                } else {
-                    ok = vesc_config_set_app_wire(&job.data[1], VESC6_APPCONF_WIRE_SIZE, store);
+                    job.data[1U + VESC6_APP_OFF_CONTROLLER_ID] = VESC_CONTROLLER_ID_LEFT;
                 }
+                ok = vesc_config_set_app_wire(&job.data[1], VESC6_APPCONF_WIRE_SIZE, store);
             }
             if (ok) reply_ack(job.cmd);
             else commands_send_print("VESC F103: APPCONF rejected; VESC6 signature/layout invalid.");
@@ -1606,7 +1603,7 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
 
     switch (cmd) {
         case COMM_FW_VERSION:
-            reply_fw_version(id);
+            reply_fw_version();
             break;
         case COMM_FW_INFO:
             reply_fw_info();
@@ -1752,13 +1749,22 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
             break;
         case COMM_FORWARD_CAN:
             if (len >= 3U) {
-                uint8_t target = data[1];
+                const uint8_t target = data[1];
+                const uint8_t inner_cmd = data[2];
+                (void)inner_cmd;
+
+                /* Match upstream HW_HAS_DUAL_MOTORS literally: only the derived
+                 * second-motor CAN ID is handled as an in-MCU virtual node. The
+                 * inner command runs recursively with motor-thread 2 selected,
+                 * and the packet-processing thread is ALWAYS returned to motor 1
+                 * afterwards. Non-local IDs would go to physical CAN upstream;
+                 * this target has no CAN PHY, so they are intentionally ignored. */
                 if (target == VESC_LOCAL_MOTOR2_FORWARD_ID) {
                     s_diag.motor2_forwards++;
+                    mc_interface_select_motor_thread(2);
                     process_payload_for_motor(&data[2], (uint16_t)(len - 2U), MOTOR_RIGHT);
+                    mc_interface_select_motor_thread(1);
                 } else {
-                    /* Tidak ada CAN PHY/driver pada build ini. ID selain motor-2
-                     * lokal sengaja tidak diteruskan dan tidak diberi reply palsu. */
                     s_diag.unsupported_forward_ids++;
                 }
             }
@@ -1863,10 +1869,12 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
 static void process_payload(const uint8_t *data, uint16_t len) {
     if (data == NULL || len == 0U) return;
     s_diag.rx_frames_ok++;
-    /* UART default memilih motor-1. Seperti cabang HW_HAS_DUAL_MOTORS upstream,
-     * COMM_FORWARD_CAN untuk ID motor-2 dipakai sebagai local motor selector;
-     * build ini tidak memuat driver CAN fisik. */
+    /* A raw UART packet is always the directly-connected controller (motor 1).
+     * Force that context before AND after dispatch so a forwarded command can
+     * never leak motor-thread 2 into the next local VESC Tool request. */
+    mc_interface_select_motor_thread(1);
     process_payload_for_motor(data, len, MOTOR_LEFT);
+    mc_interface_select_motor_thread(1);
 }
 
 bool vesc_comm_poll_once(void) {

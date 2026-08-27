@@ -47,9 +47,18 @@ need(app, 'UART_FLAG_TC', 'task-context final stop-bit TC polling')
 
 for token,desc in [
     ('case COMM_FW_VERSION:','COMM_FW_VERSION dispatcher'),
-    ('reply_fw_version(id);','COMM_FW_VERSION reply'),
+    ('reply_fw_version();','COMM_FW_VERSION reply'),
     ('vesc_packet_process_byte(&s_parser, byte, process_payload);','packet parser in packet task'),
+    ('case COMM_FORWARD_CAN:','COMM_FORWARD_CAN dispatcher'),
+    ('mc_interface_select_motor_thread(2);','upstream-style local motor-2 thread selection'),
+    ('process_payload_for_motor(&data[2], (uint16_t)(len - 2U), MOTOR_RIGHT);','recursive local motor-2 inner command'),
+    ('mc_interface_select_motor_thread(1);','forwarding restores primary motor-thread exactly like upstream'),
+    ('const char *hw = "MOTOR_LEFT";','same HW name for both local motor contexts'),
+    ('if (mc_interface_get_motor_thread() == 2) p[i - 1U]++;','second-motor UUID +1 identity from thread context'),
 ]: need(cmd,token,desc)
+
+if 'const char *hw = (id == MOTOR_RIGHT)' in cmd:
+    issues.append('motor-2 FW_VERSION must not report a different HW name from motor-1')
 
 
 # STM32F1 SWD safety: never use generic MAPR RMW remap helpers after boot.
@@ -80,5 +89,5 @@ if issues:
 print('COMM AUDIT: PASS')
 print('USART3 PB10/PB11: RX DMA1_Ch3 circular -> task CNDTR parser; TX DMA1_Ch2 + task-polled USART TC')
 print('TX readiness: huart3_vesc.gState only (RxState BUSY_RX allowed)')
-print('COMM_FW_VERSION dispatcher/reply present; UART initialized before motor_hw_init')
+print('COMM_FW_VERSION dispatcher/reply present; dual-motor forwarding restores thread 1; UART initialized before motor_hw_init')
 print('AFIO/SWD: one controlled MAPR write; JTAG disabled, SWD preserved, USART3 PB10/PB11 + ADC1 TIM8 trigger retained')
