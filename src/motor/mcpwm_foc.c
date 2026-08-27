@@ -21,6 +21,19 @@ static volatile bool s_foc_init_done = false;
 static volatile bool s_cal_valid = false;
 static volatile bool s_cal_request = false;
 static volatile foc_cal_stage_t s_cal_stage = FOC_CAL_STAGE_UNDRIVEN;
+/* When true, boot calibration is skipped and the bridge is considered
+ * offset-calibrated using stored/gross-default offsets. Set from
+ * mc_interface_init() based on mc_configuration.foc_calibrate_on_boot. */
+static volatile bool s_calibration_skip = false;
+/* EFeru-reference boot-averaging offsets for the six raw current channels.
+ * Layout mirrors the reference adc_buffer: {dcr, dcl, rlA, rlB, rrB, rrC}.
+ * These are the offsets used by the VESC FOC (cur = offset - raw). */
+static volatile int16_t s_ofs_dcl = 2000, s_ofs_dcr = 2000;
+static volatile int16_t s_ofs_rlA = 2000, s_ofs_rlB = 2000;
+static volatile int16_t s_ofs_rrB = 2000, s_ofs_rrC = 2000;
+/* EFeru boot-averaging offset calibration in progress (default boot path). */
+static volatile bool s_bootcal_active = false;
+static volatile uint16_t s_bootcal_cnt = 0U;
 static uint32_t s_cal_count = 0U;          /* sample count in current stage */
 static uint32_t s_cal_progress = 0U;       /* total accepted calibration samples */
 static uint32_t s_cal_warmup = 0U;
@@ -398,6 +411,9 @@ void foc_request_recalibration(void) {
     __disable_irq();
     s_cal_request = true;
     s_cal_done = false;
+    /* Manual recalibration uses the elaborate undriven/driven pipeline, not the
+       EFeru boot-averaging path. */
+    s_bootcal_active = false;
     if (!primask) __enable_irq();
 }
 
@@ -409,9 +425,44 @@ void foc_get_fault_snapshot(foc_fault_snapshot_t *out) {
     if (!primask) __enable_irq();
 }
 
+void foc_calibration_set_skip(bool skip) {
+    /* Called once from mc_interface_init() before mcpwm_foc_init_hw().
+     * When skip is set, the boot offset-calibration pipeline is bypassed and
+     * the bridge is treated as already calibrated using the stored/gross
+     * default offsets. The DMA ISR still accumulates samples harmlessly; the
+     * task-side state machine simply never advances from DONE. */
+    s_calibration_skip = skip;
+}
+
 void mcpwm_foc_init_hw(void) {
     s_foc_init_done = true;
-    cal_reset_isr();
+    if (s_calibration_skip) {
+        /* Bypass the entire calibration pipeline. Mark done+valid so
+         * motor_slow_update_1khz() can enable the bridge immediately and
+         * foc_calibration_in_progress() returns false. Offsets remain at
+         * their stored/gross-default values (set by conf_general or
+         * cal_set_runtime_offsets during a prior calibrated boot). */
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        s_cal_done = true;
+        s_cal_valid = true;
+        s_cal_stage = FOC_CAL_STAGE_DONE;
+        s_cal_request = false;
+        if (!primask) __enable_irq();
+    } else {
+        /* EFeru-reference boot offset calibration: the DMA ISR averages the six
+           raw current channels for ADC_BOOT_CAL_SAMPLES frames, then the VESC
+           FOC runs with the converging offsets (EFeru semantics: cur=offset-raw).
+           Manual VESC Tool recalibration still uses the elaborate undriven/driven
+           pipeline via foc_request_recalibration(). */
+        cal_reset_isr();
+        s_bootcal_active = true;
+        s_bootcal_cnt = 0U;
+        s_ofs_dcl = s_ofs_dcr = s_ofs_rlA = s_ofs_rlB = s_ofs_rrB = s_ofs_rrC = 2000;
+        s_cal_done = false;
+        s_cal_valid = false;
+        s_cal_request = false;
+    }
     s_overrun_consecutive[0] = 0U;
     s_overrun_consecutive[1] = 0U;
     s_inv_vbus_q30 = 0; s_inv_vbus_last_q15 = 0; s_inv_vbus_age = 0U;
@@ -1798,11 +1849,67 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
     s_adc_isr_count++;
     if (s_cal_request) cal_reset_isr();
 
-    /* EFeru stock fast-current schedule remains untouched:
-       rank1 = RIGHT DC / LEFT DC, rank2 = LEFT A/B, rank3 = RIGHT B/C. */
-    uint16_t r_dc = low16(adc_words[0]), l_dc = high16(adc_words[0]);
-    uint16_t l_u  = low16(adc_words[1]), l_v  = high16(adc_words[1]);
-    uint16_t r_u  = low16(adc_words[2]), r_v  = high16(adc_words[2]);
+    /* EFeru-reference raw ADC read (DMA half-transfer, 16 kHz). Keep the exact
+       dual-ADC rank layout from the reference:
+         word0: ADC1 R_DC (PC1) | ADC2 L_DC (PC0)   -> {dcr, dcl}
+         word1: ADC1 L_A  (PA0) | ADC2 L_B  (PC3)   -> {rlA, rlB}
+         word2: ADC1 R_B  (PC4) | ADC2 R_C  (PC5)   -> {rrB, rrC}
+       These are the six raw current channels the F103 hoverboard board exposes,
+       named to match the reference current sense layout. */
+    uint16_t idcr = low16(adc_words[0]);   /* RIGHT DC  (ADC1 PC1) */
+    uint16_t idcl = high16(adc_words[0]);  /* LEFT  DC  (ADC2 PC0) */
+    uint16_t irla = low16(adc_words[1]);   /* LEFT  A   (ADC1 PA0) */
+    uint16_t irlb = high16(adc_words[1]);  /* LEFT  B   (ADC2 PC3) */
+    uint16_t irrb = low16(adc_words[2]);   /* RIGHT B   (ADC1 PC4) */
+    uint16_t irrc = high16(adc_words[2]);  /* RIGHT C   (ADC2 PC5) */
+    /* Convenience aliases used by the rest of the FOC path (matches prior
+       internal names so the downstream math is unchanged). */
+    uint16_t r_dc = idcr, l_dc = idcl;
+    uint16_t l_u  = irla, l_v  = irlb;
+    uint16_t r_u  = irrb, r_v  = irrc;
+
+    /* EFeru boot offset averaging: average the six raw channels until the
+       sample count is reached, then the FOC runs with the converging offsets
+       (EFeru semantics: cur = offset - raw). This runs only on the default
+       boot path; foc_request_recalibration() disables it and uses the
+       elaborate undriven/driven pipeline instead. Boot calibration is skipped
+       entirely when foc_calibrate_on_boot is false. */
+    if (s_bootcal_active) {
+        const uint16_t c = s_bootcal_cnt;
+        /* running average: ofs = (raw + ofs) / 2, seeded with the 2000 initial.
+           The 16-bit intermediate of (raw+ofs) can reach ~4095, so widen it to
+           int32_t to avoid any risk across the divide. */
+        s_ofs_dcr = (int16_t)(((int32_t)idcr + (int32_t)s_ofs_dcr) / 2);
+        s_ofs_dcl = (int16_t)(((int32_t)idcl + (int32_t)s_ofs_dcl) / 2);
+        s_ofs_rlA = (int16_t)(((int32_t)irla + (int32_t)s_ofs_rlA) / 2);
+        s_ofs_rlB = (int16_t)(((int32_t)irlb + (int32_t)s_ofs_rlB) / 2);
+        s_ofs_rrB = (int16_t)(((int32_t)irrb + (int32_t)s_ofs_rrB) / 2);
+        s_ofs_rrC = (int16_t)(((int32_t)irrc + (int32_t)s_ofs_rrC) / 2);
+        if (c + 1U >= ADC_BOOT_CAL_SAMPLES) {
+            /* Boot averaging complete. Load the converging offsets into both
+               motors' FOC runtime so the standard VESC current path (which
+               computes cur = offset - raw) starts from the EFeru-calibrated
+               zero. */
+            cal_set_runtime_offsets(&g_motor_left,  s_ofs_rlA, s_ofs_rlB, s_ofs_dcl);
+            cal_set_runtime_offsets(&g_motor_right, s_ofs_rrB, s_ofs_rrC, s_ofs_dcr);
+            s_bootcal_active = false;
+            s_cal_valid = true;
+            s_cal_done  = true;
+            s_cal_stage = FOC_CAL_STAGE_DONE;
+        } else {
+            s_bootcal_cnt = (uint16_t)(c + 1U);
+        }
+    }
+
+    /* During the EFeru boot-averaging window, skip the elaborate VESC
+       calibration state machine AND the FOC loop entirely (the reference
+       returns straight after averaging). This keeps the two offset paths
+       mutually exclusive: the driven-calibration bridge enable can never run
+       during what must be a passive boot average, and the boot offset owns the
+       six raw channels exclusively. */
+    if (s_bootcal_active) {
+        return;
+    }
 
     /* Batch 9 Part 2: PC2/DCLINK is sampled independently by ADC3 on the same
        TIM8_TRGO. ADC3's single 28.5-cycle conversion completes before the

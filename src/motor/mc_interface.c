@@ -229,6 +229,7 @@ static void motor_defaults(MotorRuntime *m, motor_id_t id) {
     m->foc_temp_comp = MCCONF_FOC_TEMP_COMP_DEFAULT;
     m->foc_temp_comp_base_temp = MCCONF_FOC_TEMP_COMP_BASE_TEMP_DEFAULT;
     m->foc_offsets_cal_mode = MCCONF_FOC_OFFSETS_CAL_MODE_DEFAULT;
+    m->foc_calibrate_on_boot = MCCONF_FOC_CALIBRATE_ON_BOOT_DEFAULT;
     m->foc_fw_current_now = 0.0f; m->mtpa_id_target = 0.0f;
     m->foc_fw_current_acc_q31 = 0; m->foc_fw_current_q15 = 0; m->foc_fw_duty_filter_q15 = 0;
     m->fw_override_current_q15 = 0; m->foc_fw_fast_active = false;
@@ -675,7 +676,8 @@ void motor_slow_update_1khz(MotorRuntime *m, uint32_t now_ms) {
        foc_offsets_cal_mode bit2 and never preempts a running motor. */
     {
         const volatile mc_configuration *cfg = mc_interface_get_configuration();
-        if (cfg && (cfg->foc_offsets_cal_mode & (1u << 2)) &&
+        if (cfg && cfg->foc_calibrate_on_boot &&
+            (cfg->foc_offsets_cal_mode & (1u << 2)) &&
             m->state == MC_STATE_OFF && !foc_calibration_in_progress()) {
             foc_request_recalibration();
         }
@@ -1564,7 +1566,7 @@ static void mirror_from_runtime(const MotorRuntime*m,mc_configuration*c){
     c->foc_fw_current_max=m->foc_fw_current_max;c->foc_fw_duty_start=m->foc_fw_duty_start;c->foc_fw_ramp_time=m->foc_fw_ramp_time;
     c->foc_fw_q_current_factor=m->foc_fw_q_current_factor;c->foc_fw_backoff=m->foc_fw_backoff;
     c->foc_mag_vd_max=m->foc_mag_vd_max;c->foc_overmod_factor=m->foc_overmod_factor;
-    c->foc_temp_comp=m->foc_temp_comp;c->foc_temp_comp_base_temp=m->foc_temp_comp_base_temp;c->foc_offsets_cal_mode=m->foc_offsets_cal_mode;
+    c->foc_temp_comp=m->foc_temp_comp;c->foc_temp_comp_base_temp=m->foc_temp_comp_base_temp;c->foc_offsets_cal_mode=m->foc_offsets_cal_mode;c->foc_calibrate_on_boot=m->foc_calibrate_on_boot;
     c->foc_pll_kp=m->foc_pll_kp;c->foc_pll_ki=m->foc_pll_ki;
     c->foc_openloop_rpm=m->foc_openloop_rpm;c->foc_openloop_rpm_low=m->foc_openloop_rpm_low;c->foc_sl_openloop_hyst=m->foc_sl_openloop_hyst;
     c->foc_sl_openloop_time=m->foc_sl_openloop_time;c->foc_sl_openloop_time_lock=m->foc_sl_openloop_time_lock;c->foc_sl_openloop_time_ramp=m->foc_sl_openloop_time_ramp;
@@ -1867,6 +1869,7 @@ void mc_interface_set_configuration(mc_configuration *c) {
     m->foc_temp_comp = c->foc_temp_comp;
     m->foc_temp_comp_base_temp = c->foc_temp_comp_base_temp;
     m->foc_offsets_cal_mode = c->foc_offsets_cal_mode;
+    m->foc_calibrate_on_boot = c->foc_calibrate_on_boot;
     m->foc_motor_l = c->foc_motor_l;
     m->foc_motor_ld_lq_diff = c->foc_motor_ld_lq_diff;
     m->foc_motor_r = c->foc_motor_r;

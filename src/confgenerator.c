@@ -1,5 +1,6 @@
 #include "confgenerator.h"
 #include "util/buffer.h"
+#include "util/maths.h"
 #include "motor/mc_interface.h"
 #include "motor/mcconf_default.h"
 #include "encoder/encoder.h"
@@ -58,6 +59,9 @@ static void put_auto_at(uint8_t *b,int off,float v){int32_t i=off;vesc_buf_appen
 static void put_f16_at(uint8_t *b,int off,float v,float scale){int32_t i=off;vesc_buf_append_float16(b,v,scale,&i);}
 static void put_u16_at(uint8_t *b,int off,uint16_t v){int32_t i=off;vesc_buf_append_u16(b,v,&i);}
 static void put_u32_at(uint8_t *b,int off,uint32_t v){int32_t i=off;vesc_buf_append_u32(b,v,&i);}
+/* Forward declaration so vesc_config_set_mc_wire() can reuse the wire decoder
+   for the range-validation clamp. Defined further below. */
+static void mcconf_decode_wire(const uint8_t *w, mc_configuration *c);
 static float clampf(float x,float lo,float hi){return x<lo?lo:(x>hi?hi:x);}
 static int32_t gain_q16(float v){
     if (!isfinite(v)) return 0;
@@ -876,6 +880,23 @@ static bool apply_app(const uint8_t *w) {
     return true;
 }
 
+/* Portable range validation mirroring VESC commands_apply_mcconf_hw_limits
+   (the portion that needs no board-specific HW_LIM_* macros). This port
+   forces foc_overmod_factor and foc_sl_erpm_start to fixed defaults in
+   apply_mc(), so clamping them here is a harmless no-op; the three
+   l_*_scale / l_erpm_start fields ARE carried on the VESC-6.00 wire image
+   and are clamped into s_mc_active[] by the call site below. The hardware
+   limit clamping half of the VESC function is covered by the apply_mc()
+   preflight, which rejects anything outside the F103 envelope. */
+void vesc_config_apply_mcconf_hw_limits(mc_configuration *mcconf) {
+    if (mcconf == NULL) return;
+    utils_truncate_number(&mcconf->l_current_max_scale, 0.0f, 1.0f);
+    utils_truncate_number(&mcconf->l_current_min_scale, 0.0f, 1.0f);
+    utils_truncate_number(&mcconf->l_erpm_start, 0.0f, 1.0f);
+    utils_truncate_number(&mcconf->foc_overmod_factor, 1.0f, 1.5f);
+    utils_truncate_number_abs(&mcconf->foc_sl_erpm_start, mcconf->foc_sl_erpm * 0.9f);
+}
+
 bool vesc_config_set_mc_wire(motor_id_t id,const uint8_t *wire,uint16_t len,bool store){
     vesc_config_init_defaults(); if(!wire||len!=VESC6_MCCONF_WIRE_SIZE||!sig_ok(wire,VESC6_MCCONF_SIGNATURE))return false;
     if(id!=MOTOR_LEFT && id!=MOTOR_RIGHT) return false;
@@ -886,6 +907,20 @@ bool vesc_config_set_mc_wire(motor_id_t id,const uint8_t *wire,uint16_t len,bool
     if(memcmp(wire,s_mc_active[id],VESC6_MCCONF_WIRE_SIZE)==0){return !store||conf_general_store_mc_wire_persistent(id,s_mc_active[id]);}
     MotorRuntime *m=motor_get(id); if(m->pwm_enabled||m->detect.busy)return false; motor_stop(m);
     memcpy(s_rollback_mc[id],s_mc_active[id],sizeof(s_rollback_mc[id]));memcpy(s_mc_active[id],wire,len);
+    /* Portable range validation (VESC commands_apply_mcconf_hw_limits, the
+       HW_LIM_*,-free part). The wire image carries l_current_max_scale /
+       l_current_min_scale / l_erpm_start as floats; decode, clamp the 5
+       fields, then write the wire-backed ones back so apply_mc() sees the
+       truncated values. foc_overmod_factor / foc_sl_erpm_start are
+       forced to defaults later in apply_mc(), so their clamp is cosmetic. */
+    {
+        mc_configuration mc_trunc;
+        mcconf_decode_wire(s_mc_active[id], &mc_trunc);
+        vesc_config_apply_mcconf_hw_limits(&mc_trunc);
+        put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_CURRENT_MAX_SCALE, mc_trunc.l_current_max_scale, 10000.0f);
+        put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_CURRENT_MIN_SCALE, mc_trunc.l_current_min_scale, 10000.0f);
+        put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_ERPM_START,        mc_trunc.l_erpm_start,        10000.0f);
+    }
     if(!apply_mc(id,s_mc_active[id])){memcpy(s_mc_active[id],s_rollback_mc[id],sizeof(s_rollback_mc[id]));(void)apply_mc(id,s_rollback_mc[id]);return false;}
     /* Keep the accepted VESC Tool wire image byte-exact. Preflight guarantees
        that every writable value is executable by this backend, so GET_MCCONF

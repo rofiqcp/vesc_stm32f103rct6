@@ -95,6 +95,10 @@
  * recalibration on motor-stopped (state OFF). Keep bit2 OFF until the
  * zero-vector/safety behavior of the hoverboard bridge is verified live. */
 #define MCCONF_FOC_OFFSETS_CAL_MODE_DEFAULT        1
+/* When false, the entire boot current-offset calibration pipeline is skipped
+ * and the motor runs with stored/gross-default offsets instead. True by
+ * default so a fresh flash still performs the driven+undriven calibration. */
+#define MCCONF_FOC_CALIBRATE_ON_BOOT_DEFAULT       true
 
 /* FOC defaults are board-qualified values from appconf_default.h. */
 #define MCCONF_FOC_F_ZV_DEFAULT               VESC_FOC_F_ZV_HZ

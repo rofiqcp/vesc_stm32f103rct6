@@ -87,6 +87,12 @@
 
 /* VESC-style boot current-offset calibration. */
 #define ADC_OFFSET_CAL_SAMPLES          4096U
+/* EFeru-reference boot offset averaging: number of 16-kHz DMA ISR frames the
+ * default boot path averages the six raw current channels before the FOC runs
+ * with the converging offsets (EFeru semantics: cur = offset - raw). 2000
+ * frames ~= 125 ms, matching the reference running-average window. Only used
+ * on the default boot path; VESC Tool recalibration uses the driven pipeline. */
+#define ADC_BOOT_CAL_SAMPLES            2000U
 /* VESC-style driven current-offset calibration. Upstream VESC stores
  * driven and undriven offsets separately; for low-side-shunt hardware its
  * alternative calibration runs all three phases at 50% (zero SVM amplitude)

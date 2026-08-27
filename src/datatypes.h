@@ -274,6 +274,10 @@ typedef struct mc_configuration {
     /* VESC offset-calibration mode bits: bit0 = driven, bit1 = undriven,
        bit2 = periodic re-calibration when motor stopped (state OFF). */
     uint8_t foc_offsets_cal_mode;
+    /* When false, the entire boot current-offset calibration pipeline is
+       skipped and the motor runs with stored/gross-default offsets instead.
+       VESC Tool can read/write this flag. Default is true. */
+    bool foc_calibrate_on_boot;
     float s_pid_kp, s_pid_ki, s_pid_kd, s_pid_kd_filter, s_pid_min_erpm;
     bool s_pid_allow_braking;
     float s_pid_ramp_erpms_s;
@@ -871,6 +875,10 @@ typedef struct MotorRuntime {
     bool foc_temp_comp;
     float foc_temp_comp_base_temp;
     uint8_t foc_offsets_cal_mode;
+    /* Cached mirror of mc_configuration.foc_calibrate_on_boot. The 1-kHz loop
+       and boot skip logic read this directly instead of dereferencing the
+       configuration mirror each tick. */
+    bool foc_calibrate_on_boot;
     /* VESC-style temperature-compensated R and Ki. The F103 port has no motor
        NTC, so the STM32 board-temperature proxy (board_temp_filter_c) is the
        thermal input. comp_factor = 1 + 0.00386*(T - base_temp); these hold

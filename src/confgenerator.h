@@ -127,6 +127,11 @@ bool vesc_config_set_mc_wire(motor_id_t id, const uint8_t *wire, uint16_t len, b
 bool vesc_config_set_app_wire(const uint8_t *wire, uint16_t len, bool store);
 void vesc_config_sync_motor_runtime(motor_id_t id);
 void vesc_config_sync_detect_all_runtime(motor_id_t id);
+/* Portable range validation mirroring VESC commands_apply_mcconf_hw_limits
+   (the part that needs no board-specific HW_LIM_* macros). Clamps the 5
+   fields that take float scales/erpm on a decoded mc_configuration. The
+   hardware-limit clamping half is covered by the apply_mc() preflight. */
+void vesc_config_apply_mcconf_hw_limits(mc_configuration *mcconf);
 /* Transactional helpers for detect/custom apply paths. These use the existing
    static rollback scratch so large 481-byte backups never live on RTOS stacks. */
 bool vesc_config_commit_motor_runtime(motor_id_t id);

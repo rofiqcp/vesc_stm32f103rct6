@@ -71,7 +71,6 @@ static void motor_boot_thread(void *argument) {
      * FW_VERSION dapat mem-preempt inisialisasi motor. Any motor HAL failure stays confined to
      * this thread and must not globally disable USART interrupts. */
     motor_hw_init();
-    mc_interface_init(false);
 
     /* Konfigurasi VESC 6.00 dipisahkan dari record eksperimen lama.
      * Build the exact VESC-6.00 wire defaults, then import only a CRC-valid
@@ -99,6 +98,15 @@ static void motor_boot_thread(void *argument) {
     /* From this point VESC Tool may safely repair/write MC/APPCONF even when a
        later telemetry/control-task startup step fails. */
     vesc_comm_set_config_ready(true);
+
+    /* Config is now loaded (or safe defaults applied). Decide whether the boot
+     * offset-calibration pipeline should run. When mc_configuration.
+     * foc_calibrate_on_boot is false, skip calibration and run with the
+     * stored/gross-default offsets immediately. This MUST be set before
+     * mc_interface_init() calls mcpwm_foc_init_hw(). */
+    foc_calibration_set_skip(!g_motor_left.foc_calibrate_on_boot);
+
+    mc_interface_init(false);
 
     if (!telemetry_init()) {
         /* Communication remains alive, but do not expose a motor-ready state

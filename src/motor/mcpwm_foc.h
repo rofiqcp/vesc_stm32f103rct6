@@ -183,6 +183,9 @@ bool foc_calibration_valid(void);
 bool foc_calibration_in_progress(void);
 foc_cal_stage_t foc_calibration_stage(void);
 void foc_calibration_service_task(void);
+/* When skip is true, the boot offset-calibration pipeline is bypassed and the
+ * bridge is treated as already calibrated (stored/gross-default offsets). */
+void foc_calibration_set_skip(bool skip);
 void foc_request_recalibration(void);
 uint32_t foc_adc_isr_count(void);
 uint32_t foc_isr_total_max_cycles(void);

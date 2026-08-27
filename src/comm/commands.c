@@ -240,6 +240,38 @@ void commands_plot_add_graph(const char *name) {
 void commands_plot_set_graph(int graph){uint8_t p[2]={COMM_PLOT_SET_GRAPH,(uint8_t)graph};commands_send_packet(p,2U);}
 void commands_send_plot_points(float x,float y){uint8_t p[9];int32_t i=0;p[i++]=COMM_PLOT_DATA;buffer_append_float32_auto(p,x,&i);buffer_append_float32_auto(p,y,&i);commands_send_packet(p,(unsigned)i);}
 
+/* Hardware CRC reported to VESC Tool in the COMM_FW_VERSION reply.
+ * This hoverboard board has no genuine VESC HW CRC calculator, so we build a
+ * deterministic board signature: CRC32 (IEEE 802.3, same polynomial as
+ * conf_general.c) over the STM32F103 96-bit unique device ID plus the
+ * calibration / config flash region. VESC Tool expects a 4-byte CRC appended
+ * to the FW_VERSION reply and will otherwise flag the device as unverified. */
+static uint32_t main_calc_hw_crc(void) {
+    uint32_t c = 0xFFFFFFFFUL;
+
+    /* STM32F103 unique device ID: 96 bits @ 0x1FFFF7E8. */
+    const uint8_t *uid = (const uint8_t *)0x1FFFF7E8UL;
+    for (uint32_t n = 0U; n < 12U; n++) {
+        c ^= (uint32_t)uid[n];
+        for (uint8_t b = 0U; b < 8U; b++) {
+            uint32_t m = (uint32_t)-(int32_t)(c & 1U);
+            c = (c >> 1) ^ (0xEDB88320UL & m);
+        }
+    }
+
+    /* Calibration / config flash region: 4 pages of 2 KiB @ 0x0803E000. */
+    const uint8_t *cfg = (const uint8_t *)0x0803E000UL;
+    for (uint32_t n = 0U; n < (4U * 2048U); n++) {
+        c ^= (uint32_t)cfg[n];
+        for (uint8_t b = 0U; b < 8U; b++) {
+            uint32_t m = (uint32_t)-(int32_t)(c & 1U);
+            c = (c >> 1) ^ (0xEDB88320UL & m);
+        }
+    }
+
+    return ~c;
+}
+
 static void reply_fw_version(motor_id_t id) {
     uint8_t *p = payload_begin(); if (p == NULL) return;
     uint16_t i = 0U;
@@ -277,6 +309,15 @@ static void reply_fw_version(motor_id_t id) {
     const char fw[] = "vesc-f103-hoverboard-v33-vesc-layout";
     memcpy(&p[i], fw, sizeof(fw));
     i = (uint16_t)(i + sizeof(fw));
+
+    /* Append the 4-byte hardware CRC that VESC Tool expects at the end of the
+     * COMM_FW_VERSION reply (bounds-checked against the payload ceiling). */
+    uint32_t hw_crc = main_calc_hw_crc();
+    int32_t j = (int32_t)i;
+    if (j + 4 <= (int32_t)VESC_PACKET_MAX_PAYLOAD) {
+        buffer_append_uint32(p, hw_crc, &j);
+        i = (uint16_t)j;
+    }
 
     payload_end(i);
 }
@@ -1618,6 +1659,18 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
             put_i32(p, &bi, scaled_i32(app_adc_get_voltage(), 1000000.0f));
             put_i32(p, &bi, scaled_i32(app_adc_get_decoded_level2(), 1000000.0f));
             put_i32(p, &bi, scaled_i32(app_adc_get_voltage2(), 1000000.0f));
+            vesc_comm_send_payload(p, bi);
+        } break;
+        case COMM_GET_DECODED_PPM: {
+            /* This build has no app_ppm module (only app_adc is wired). Return
+             * the VESC-canonical zeroed payload so VESC Tool does not treat the
+             * controller as unresponsive. Format: decoded level, voltage (both
+             * scaled 1e6), matching the GET_DECODED_ADC layout. */
+            uint8_t p[9];
+            uint16_t bi = 0U;
+            p[bi++] = COMM_GET_DECODED_PPM;
+            put_i32(p, &bi, 0);
+            put_i32(p, &bi, 0);
             vesc_comm_send_payload(p, bi);
         } break;
         case COMM_GET_BATTERY_CUT: {
