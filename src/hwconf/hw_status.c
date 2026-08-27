@@ -11,7 +11,7 @@ static volatile bool s_tone_level = false;
 static volatile bool s_tone_running = false;
 /* VESC-correct finite-beep support. A tone may be infinite (stopped only by an
  * explicit hw_status_tone_stop) or self-terminate after a fixed number of
- * half-cycles. The self-terminating path is what the V33 status-thread refactor
+ * half-cycles. The self-terminating path is what the vesc_stm32f103rct6 status-thread refactor
  * accidentally dropped when it removed the old s_tone_toggle_remaining guard:
  * without it a tone that the status task fails to stop (delayed/blocked/stopped
  * thread) keeps TIM3 toggling the pin forever, i.e. a stuck-ON buzzer. */
@@ -233,8 +233,12 @@ static void status_thread(void *argument) {
     uint32_t next = osKernelGetTickCount();
     uint32_t startup_deadline = next;
     uint32_t fault_deadline = next;
-    uint8_t led_phase = 0U;
-    uint8_t led_divider = 0U;
+    uint8_t led_state = 0U;       /* 0=burst / 1=gap */
+    uint8_t led_pulses_left = 0U;
+    bool led_output_on = false;
+    uint32_t led_deadline = 0U;
+    bool hb_led_on = true;
+    uint8_t hb_divider = 0U;
     uint8_t startup_index = 0U;
     bool startup_done = false;
 
@@ -319,32 +323,69 @@ static void status_thread(void *argument) {
             if (announced != MOTOR_FAULT_NONE || fault_output_on) {
                 hw_status_tone_stop();
                 fault_output_on = false;
+                /* Reset mesin mode-cue (burst/gap) biar LED gak nyangkut di
+                 * tengah pulsa saat keluar dari fault. */
+                led_state = 0U;
+                led_pulses_left = 0U;
+                led_output_on = false;
+                hb_divider = 0U;
             }
             announced = MOTOR_FAULT_NONE;
             fault_stage = 0U;
 
-            led_divider++;
-            if (led_divider >= 10U) {
-                led_divider = 0U;
-                const bool calibrating = !foc_calibration_done();
-                const bool detecting = g_motor_left.detect.busy ||
-                        g_motor_right.detect.busy;
-                const bool running = g_motor_left.pwm_enabled ||
-                        g_motor_right.pwm_enabled;
-                bool led_on;
+            /* LED mode cue (plain GPIO flash, bukan PWM). Setiap 1 detik
+             * keluarkan N pulsa: nyala 200 ms / mati 200 ms, lalu mati 1 detik.
+             *   calibrating -> 1 pulsa
+             *   detecting   -> 2 pulsa
+             *   running     -> 3 pulsa
+             * Di luar mode itu -> heartbeat 1 Hz (1 s nyala / 1 s mati). */
+            const bool calibrating = !foc_calibration_done();
+            const bool detecting = g_motor_left.detect.busy ||
+                    g_motor_right.detect.busy;
+            const bool running = g_motor_left.pwm_enabled ||
+                    g_motor_right.pwm_enabled;
+            const uint8_t pulses = calibrating ? 1U :
+                                   (detecting ? 2U :
+                                   (running ? 3U : 0U));
 
-                if (calibrating) {
-                    led_on = (led_phase & 1U) == 0U;
-                } else if (detecting) {
-                    led_on = led_phase == 0U || led_phase == 2U;
-                } else if (running) {
-                    led_on = led_phase < 2U ||
-                            (led_phase >= 5U && led_phase < 7U);
-                } else {
-                    led_on = led_phase < 5U;
+            if (pulses != 0U) {
+                if (led_state == 0U) {          /* burst */
+                    if (led_pulses_left == 0U) {
+                        led_pulses_left = pulses;
+                        led_output_on = true;
+                        motor_hw_led(true);
+                        led_deadline = now + 200U;
+                    } else if ((int32_t)(now - led_deadline) >= 0) {
+                        led_output_on = !led_output_on;
+                        motor_hw_led(led_output_on);
+                        if (!led_output_on) {   /* barusan mati */
+                            led_pulses_left--;
+                            if (led_pulses_left == 0U) {
+                                led_state = 1U; /* masuk gap 1 detik */
+                                led_deadline = now + 1000U;
+                            } else {
+                                led_deadline = now + 200U;
+                            }
+                        } else {
+                            led_deadline = now + 200U;
+                        }
+                    }
+                } else {                        /* gap */
+                    motor_hw_led(false);
+                    if ((int32_t)(now - led_deadline) >= 0) {
+                        led_state = 0U;
+                        led_pulses_left = 0U;
+                        led_output_on = false;
+                    }
                 }
-                motor_hw_led(led_on);
-                led_phase = (uint8_t)((led_phase + 1U) % 10U);
+            } else {
+                /* Heartbeat 1 Hz (1 detik nyala / 1 detik mati). */
+                hb_divider++;
+                if (hb_divider >= 100U) {       /* 100 * 10 ms = 1 s */
+                    hb_divider = 0U;
+                    hb_led_on = !hb_led_on;
+                    motor_hw_led(hb_led_on);
+                }
             }
 
             if (!startup_done && (int32_t)(now - startup_deadline) >= 0) {

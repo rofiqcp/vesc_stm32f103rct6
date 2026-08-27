@@ -17,7 +17,12 @@ TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim4;
-volatile uint32_t g_adc_dual_dma[5] __attribute__((aligned(4)));
+/* Six dual-ADC regular ranks are configured. DMA length MUST match exactly:
+ * ranks 1..3 are the coherent FOC-current half; ranks 4..6 are app ADC,
+ * internal MCU temperature and spare/auxiliary conversion. A 5-word circular
+ * DMA silently rotates the scan boundary every PWM cycle and corrupts current
+ * feedback, so never reduce this independently from ADC SQR1.L. */
+volatile uint32_t g_adc_dual_dma[6] __attribute__((aligned(4)));
 volatile uint16_t g_adc3_vbus_dma[2] __attribute__((aligned(4)));
 /* PA2/PA3 APP ADC values are captured from dual-ADC rank 6 at the next
  * half-transfer interrupt. This keeps application sampling outside the first
@@ -266,7 +271,7 @@ static void init_adc_dma(void) {
     hadc1.Init.DiscontinuousConvMode = DISABLE;
     hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T8_TRGO;
     hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc1.Init.NbrOfConversion = 5;
+    hadc1.Init.NbrOfConversion = 6;
     if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler_Local();
     /* STM32F103 high-density remap: ADC1 regular external trigger is TIM8 TRGO. */
     __HAL_AFIO_REMAP_ADC1_ETRGREG_ENABLE();
@@ -277,7 +282,7 @@ static void init_adc_dma(void) {
     hadc2.Init.DiscontinuousConvMode = DISABLE;
     hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
     hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
-    hadc2.Init.NbrOfConversion = 5;
+    hadc2.Init.NbrOfConversion = 6;
     if (HAL_ADC_Init(&hadc2) != HAL_OK) Error_Handler_Local();
 
     /* ADC3 is dedicated to the stock PC2 DCLINK divider. On STM32F103xE the
@@ -310,17 +315,18 @@ static void init_adc_dma(void) {
     cfg_adc_channel(&hadc2, ADC_CHANNEL_13, ADC_REGULAR_RANK_2, ADC_SAMPLETIME_7CYCLES_5); /* LEFT  B  PC3 */
     cfg_adc_channel(&hadc1, ADC_CHANNEL_14, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT B  PC4 */
     cfg_adc_channel(&hadc2, ADC_CHANNEL_15, ADC_REGULAR_RANK_3, ADC_SAMPLETIME_7CYCLES_5); /* RIGHT C  PC5 */
-    /* Rank 4..6 stay after the DMA HT boundary. Ranks 4..5 are diagnostics;
-       rank 6 is application ADC and never participates in FOC feedback.
-       DCLINK is deliberately removed from ADC1/ADC2; ADC3 owns PC2 now. */
-    /* Rank 4 is APP ADC (PA2/PA3) — after HT boundary, never participates in
-       FOC feedback. Follows VESC standard: throttle/brake ADC at rank 4. */
+    /* Rank 4..6 stay after the DMA HT boundary and never participate in FOC
+       feedback. Rank 4 is APP ADC; rank 5/6 are deterministic thermal/aux
+       conversions. DCLINK is deliberately removed from ADC1/ADC2; ADC3 owns PC2. */
     cfg_adc_channel(&hadc1, ADC_CHANNEL_2, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* APP ADC1 PA2 */
     cfg_adc_channel(&hadc2, ADC_CHANNEL_3, ADC_REGULAR_RANK_4, ADC_SAMPLETIME_28CYCLES_5); /* APP ADC2 PA3 */
-    /* Rank 5 is after DMA half-transfer, so the long internal-temperature
-       conversion cannot delay the 16-kHz current-control ISR. */
+    /* Rank 5 is the MCU/board temperature proxy. Rank 6 is explicit because
+       SQR1.L=5 means six conversions; leaving SQ6 stale makes the sequence
+       depend on reset/register history. */
     cfg_adc_channel(&hadc1, ADC_CHANNEL_TEMPSENSOR, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_239CYCLES_5); /* MCU/board temp */
-    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_239CYCLES_5); /* match ADC1 rank5 simultaneous timing */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_5, ADC_SAMPLETIME_239CYCLES_5); /* timing match */
+    cfg_adc_channel(&hadc1, ADC_CHANNEL_TEMPSENSOR, ADC_REGULAR_RANK_6, ADC_SAMPLETIME_239CYCLES_5); /* deterministic spare */
+    cfg_adc_channel(&hadc2, ADC_CHANNEL_11, ADC_REGULAR_RANK_6, ADC_SAMPLETIME_239CYCLES_5); /* deterministic spare */
 
     cfg_adc_channel(&hadc3, ADC_CHANNEL_12, ADC_REGULAR_RANK_1, ADC_SAMPLETIME_28CYCLES_5); /* DCLINK PC2 */
 
@@ -433,7 +439,7 @@ void motor_hw_start_sampling(void) {
         (void)HAL_ADC_Stop_DMA(&hadc3);
         Error_Handler_Local();
     }
-    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)g_adc_dual_dma, 5U) != HAL_OK) {
+    if (HAL_ADCEx_MultiModeStart_DMA(&hadc1, (uint32_t *)g_adc_dual_dma, 6U) != HAL_OK) {
         (void)HAL_ADC_Stop(&hadc2);
         (void)HAL_ADC_Stop_DMA(&hadc3);
         Error_Handler_Local();
