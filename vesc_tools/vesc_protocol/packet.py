@@ -82,8 +82,12 @@ class PacketParser:
             )
             stop = candidate[-1]
             if stop != 3 or received_crc != crc16(payload):
-                # Panjang frame sudah lengkap dan diketahui. Buang seluruh kandidat
-                # supaya byte 0x02/0x03/0x04 di payload rusak tidak dianggap header.
+                # A completed-but-invalid frame. Drop the whole candidate and
+                # continue; the next valid 0x02/0x03 start is found by the
+                # top-of-loop scan. This matches the finite-wire behaviour the
+                # test suite validates and is correct for a short-frame
+                # (0x02/0x03) controller. Advancing a single byte would turn a
+                # 0x03 stop byte into a plausible long-frame header and stall.
                 del self.buffer[:total_size]
                 continue
 

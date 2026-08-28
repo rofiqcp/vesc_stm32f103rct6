@@ -8,6 +8,10 @@
 #include "task.h"
 
 static volatile bool s_tone_level = false;
+volatile uint16_t g_vesc_buzzer_hz = 0U;
+volatile uint32_t g_vesc_buzzer_remaining = 0U;
+volatile uint8_t g_vesc_startup_melody_active = 0U;
+volatile uint8_t g_vesc_startup_melody_index = 0U;
 static volatile bool s_tone_running = false;
 /* VESC-correct finite-beep support. A tone may be infinite (stopped only by an
  * explicit hw_status_tone_stop) or self-terminate after a fixed number of
@@ -17,6 +21,10 @@ static volatile bool s_tone_running = false;
  * thread) keeps TIM3 toggling the pin forever, i.e. a stuck-ON buzzer. */
 static volatile bool s_tone_infinite = false;
 static volatile uint32_t s_tone_toggle_remaining = 0U;
+static volatile bool s_melody_sequencer = false;
+static volatile bool s_melody_gap = false;
+static volatile uint8_t s_melody_next_index = 0U;
+volatile uint8_t g_vesc_buzzer_running = 0U;
 static volatile bool s_power_held = true;
 static bool s_status_started = false;
 
@@ -25,13 +33,113 @@ typedef struct {
     uint16_t duration_ms;
 } startup_note_t;
 
+/* ~3 s VESC-inspired power-up chime. This is intentionally a buzzer melody,
+ * not a blocking motor-beep sequence: the real VESC startup sound is normally
+ * produced through the motor phases. The ascending E-major arpeggio gives the
+ * same short, technical VESC-like character while keeping both bridges OFF.
+ * Every tone/gap is advanced autonomously by TIM3, so it starts before the
+ * FreeRTOS scheduler and never blocks UART or FOC startup. */
 static const startup_note_t s_startup_notes[] = {
-    {900U, 90U},
-    {0U, 50U},
-    {1350U, 90U},
-    {0U, 50U},
-    {1900U, 140U}
+    {659U,  180U}, /* E5  */
+    {0U,     55U},
+    {831U,  180U}, /* G#5 */
+    {0U,     55U},
+    {988U,  210U}, /* B5  */
+    {0U,     70U},
+    {1319U, 260U}, /* E6  */
+    {0U,    120U},
+    {988U,  150U},
+    {1175U, 150U}, /* D6  */
+    {1319U, 180U},
+    {0U,     80U},
+    {1661U, 220U}, /* G#6 */
+    {0U,     70U},
+    {1976U, 260U}, /* B6  */
+    {0U,    100U},
+    {2637U, 520U}, /* E7 resolve */
+    {0U,    350U}
 };
+
+/* TIM3 owns the complete startup melody so it starts before FreeRTOS and is
+ * independent of timer_thread latency. Tone segments count half-cycles; silent
+ * gaps run TIM3 at 1 kHz and count milliseconds. All helpers below are called
+ * with interrupts already masked or from TIM3 IRQ itself. */
+static void status_timer_stop_locked(void) {
+    TIM3->DIER = 0U;
+    TIM3->CR1 &= ~TIM_CR1_CEN;
+    TIM3->SR = 0U;
+    s_tone_running = false;
+    s_tone_infinite = false;
+    s_tone_toggle_remaining = 0U;
+    s_melody_gap = false;
+    g_vesc_buzzer_running = 0U;
+    g_vesc_buzzer_hz = 0U;
+    g_vesc_buzzer_remaining = 0U;
+    s_tone_level = false;
+    BUZZER_PORT->BRR = BUZZER_PIN;
+}
+
+static void status_program_segment_locked(uint16_t hz, uint32_t duration_ms, bool gap) {
+    TIM3->CR1 &= ~TIM_CR1_CEN;
+    TIM3->DIER = 0U;
+    TIM3->SR = 0U;
+    TIM3->CNT = 0U;
+    s_tone_level = false;
+    BUZZER_PORT->BRR = BUZZER_PIN;
+    s_tone_infinite = false;
+    s_melody_gap = gap;
+
+    if (gap) {
+        TIM3->ARR = 999U; /* 1 MHz / 1000 = 1 ms update */
+        s_tone_toggle_remaining = duration_ms ? duration_ms : 1U;
+        g_vesc_buzzer_hz = 0U;
+    } else {
+        if (hz < 100U) hz = 100U;
+        if (hz > 5000U) hz = 5000U;
+        uint32_t arr = 500000UL / (uint32_t)hz;
+        if (arr == 0U) arr = 1U;
+        TIM3->ARR = arr - 1U;
+        uint64_t toggles = ((uint64_t)hz * 2ULL * (uint64_t)duration_ms + 999ULL) / 1000ULL;
+        if (toggles == 0ULL) toggles = 1ULL;
+        if (toggles > 0xFFFFFFFEULL) toggles = 0xFFFFFFFEULL;
+        s_tone_toggle_remaining = (uint32_t)toggles;
+        g_vesc_buzzer_hz = hz;
+    }
+    g_vesc_buzzer_remaining = s_tone_toggle_remaining;
+    s_tone_running = true;
+    g_vesc_buzzer_running = 1U;
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR = 0U;
+    TIM3->DIER = TIM_DIER_UIE;
+    TIM3->CR1 |= TIM_CR1_CEN;
+}
+
+static void status_melody_load_next_locked(void) {
+    if (s_melody_next_index >= (uint8_t)(sizeof(s_startup_notes) / sizeof(s_startup_notes[0]))) {
+        s_melody_sequencer = false;
+        g_vesc_startup_melody_active = 0U;
+        status_timer_stop_locked();
+        return;
+    }
+    const startup_note_t note = s_startup_notes[s_melody_next_index++];
+    g_vesc_startup_melody_index = s_melody_next_index;
+    status_program_segment_locked(note.hz, note.duration_ms, note.hz == 0U);
+}
+
+static void hw_status_startup_melody_begin(void) {
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    s_melody_sequencer = true;
+    s_melody_next_index = 0U;
+    g_vesc_startup_melody_active = 1U;
+    g_vesc_startup_melody_index = 0U;
+    status_melody_load_next_locked();
+    if (!primask) __enable_irq();
+}
+
+void hw_status_startup_melody_replay(void) {
+    hw_status_startup_melody_begin();
+}
 
 /* Highest-priority fault present on either bridge owns both indicators. */
 static const motor_fault_t s_fault_priority[] = {
@@ -126,44 +234,31 @@ void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms) {
     if (hz < 100U) hz = 100U;
     if (hz > 5000U) hz = 5000U;
 
-    /* hw_status_timer_init() sets PSC=63 on a 64 MHz APB1 (timer clock is
-     * doubled back to 64 MHz), so the counter runs at 1 MHz. ARR is therefore
-     * 1,000,000/hz counts per full period; the ISR toggles the pin each
-     * update event, giving the requested audio frequency. */
-    uint32_t arr = 1000000UL / (uint32_t)hz;
-    if (arr == 0U) arr = 1U;
-    arr -= 1U;
-
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
+    /* A user/fault tone pre-empts the startup melody deterministically. */
+    s_melody_sequencer = false;
+    g_vesc_startup_melody_active = 0U;
+    s_melody_gap = false;
 
-    s_tone_infinite = false;
-    s_tone_toggle_remaining = 0U;
     if (duration_ms == 0U) {
-        s_tone_infinite = true;          /* unbounded until tone_stop() */
+        TIM3->CR1 &= ~TIM_CR1_CEN;
+        TIM3->DIER = 0U;
+        uint32_t arr = 500000UL / (uint32_t)hz;
+        if (arr == 0U) arr = 1U;
+        TIM3->ARR = arr - 1U; TIM3->CNT = 0U; TIM3->EGR = TIM_EGR_UG; TIM3->SR = 0U;
+        s_tone_infinite = true;
+        s_tone_toggle_remaining = 0U;
+        s_tone_level = false;
+        s_tone_running = true;
+        g_vesc_buzzer_running = 1U;
+        g_vesc_buzzer_hz = hz;
+        g_vesc_buzzer_remaining = 0U;
+        BUZZER_PORT->BRR = BUZZER_PIN;
+        TIM3->DIER = TIM_DIER_UIE; TIM3->CR1 |= TIM_CR1_CEN;
     } else {
-        /* Count half-cycles so the tone runs for exactly duration_ms. */
-        uint64_t toggles = ((uint64_t)hz * 2ULL * (uint64_t)duration_ms +
-                            999ULL) / 1000ULL;
-        if (toggles > 0xFFFFFFFEULL) toggles = 0xFFFFFFFEULL;
-        s_tone_toggle_remaining = (uint32_t)toggles;
-        if (s_tone_toggle_remaining == 0U) {
-            /* Duration too short to fit one half-cycle: stay silent. */
-            __enable_irq();
-            hw_status_tone_stop();
-            return;
-        }
+        status_program_segment_locked(hz, duration_ms, false);
     }
-
-    TIM3->CR1 &= ~TIM_CR1_CEN;
-    TIM3->ARR = arr;
-    TIM3->CNT = 0U;
-    TIM3->SR = 0U;
-    TIM3->DIER = TIM_DIER_UIE;
-    s_tone_level = false;
-    s_tone_running = true;
-    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
-    TIM3->CR1 |= TIM_CR1_CEN;
     if (!primask) __enable_irq();
 }
 
@@ -179,14 +274,9 @@ bool hw_status_power_is_held(void) {
 void hw_status_tone_stop(void) {
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
-    TIM3->DIER = 0U;
-    TIM3->CR1 &= ~TIM_CR1_CEN;
-    TIM3->SR = 0U;
-    s_tone_running = false;
-    s_tone_infinite = false;
-    s_tone_toggle_remaining = 0U;
-    s_tone_level = false;
-    HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
+    s_melody_sequencer = false;
+    g_vesc_startup_melody_active = 0U;
+    status_timer_stop_locked();
     if (!primask) __enable_irq();
 }
 
@@ -203,26 +293,28 @@ void hw_status_tim3_irq_handler(void) {
     TIM3->SR &= ~TIM_SR_UIF;
     if (!s_tone_running) return;
 
-    if (!s_tone_infinite) {
-        if (s_tone_toggle_remaining == 0U) {
-            /* Bounded tone finished: silence the pin and halt the timer so the
-             * buzzer can never be left stuck ON even if the status task that
-             * scheduled it is delayed or stops. */
-            TIM3->DIER = 0U;
-            TIM3->CR1 &= ~TIM_CR1_CEN;
-            s_tone_running = false;
-            s_tone_level = false;
-            BUZZER_PORT->BRR = BUZZER_PIN;
-            return;
-        }
-        s_tone_toggle_remaining--;
+    if (s_tone_infinite) {
+        s_tone_level = !s_tone_level;
+        if (s_tone_level) BUZZER_PORT->BSRR = BUZZER_PIN; else BUZZER_PORT->BRR = BUZZER_PIN;
+        return;
     }
 
-    s_tone_level = !s_tone_level;
-    if (s_tone_level) {
-        BUZZER_PORT->BSRR = BUZZER_PIN;
+    if (s_tone_toggle_remaining > 0U) s_tone_toggle_remaining--;
+    g_vesc_buzzer_remaining = s_tone_toggle_remaining;
+    if (!s_melody_gap) {
+        s_tone_level = !s_tone_level;
+        if (s_tone_level) BUZZER_PORT->BSRR = BUZZER_PIN; else BUZZER_PORT->BRR = BUZZER_PIN;
     } else {
+        s_tone_level = false;
         BUZZER_PORT->BRR = BUZZER_PIN;
+    }
+
+    if (s_tone_toggle_remaining == 0U) {
+        if (s_melody_sequencer) {
+            status_melody_load_next_locked();
+        } else {
+            status_timer_stop_locked();
+        }
     }
 }
 
@@ -230,7 +322,6 @@ void hw_status_service_10ms(uint32_t now) {
     /* Status/LED/buzzer is intentionally NOT a sixth task. Its non-blocking
      * state machine is serviced by VESC timer_thread every 10 ms. */
     static bool initialized = false;
-    static uint32_t startup_deadline;
     static uint32_t fault_deadline;
     static uint8_t led_state;       /* 0=burst / 1=gap */
     static uint8_t led_pulses_left;
@@ -239,8 +330,6 @@ void hw_status_service_10ms(uint32_t now) {
     static bool hb_led_on;
     static uint32_t hb_deadline;
     static uint8_t led_mode;        /* 0=heartbeat, 1=cal, 2=detect, 3=run */
-    static uint8_t startup_index;
-    static bool startup_done;
     static motor_fault_t announced;
     static uint8_t fault_tens;
     static uint8_t fault_ones;
@@ -250,7 +339,6 @@ void hw_status_service_10ms(uint32_t now) {
     static bool fault_output_on;
 
     if (!initialized) {
-        startup_deadline = now;
         fault_deadline = now;
         led_state = 0U;
         led_pulses_left = 0U;
@@ -260,8 +348,6 @@ void hw_status_service_10ms(uint32_t now) {
         hb_deadline = now + 500U;
         led_mode = 0xFFU;          /* force first-mode initialization */
         motor_hw_led(false);
-        startup_index = 0U;
-        startup_done = false;
         announced = MOTOR_FAULT_NONE;
         fault_tens = fault_ones = fault_group = 0U;
         fault_pulses_left = fault_stage = 0U;
@@ -271,9 +357,8 @@ void hw_status_service_10ms(uint32_t now) {
 
     const motor_fault_t fault = highest_priority_fault();
 
-    if (fault != MOTOR_FAULT_NONE && !startup_done) {
+    if (fault != MOTOR_FAULT_NONE && g_vesc_startup_melody_active) {
         hw_status_tone_stop();
-        startup_done = true;
     }
 
     if (fault != MOTOR_FAULT_NONE) {
@@ -423,30 +508,16 @@ void hw_status_service_10ms(uint32_t now) {
             hb_deadline = now + 500U;
         }
 
-        if (!startup_done && (int32_t)(now - startup_deadline) >= 0) {
-            if (startup_index >=
-                    (uint8_t)(sizeof(s_startup_notes) / sizeof(s_startup_notes[0]))) {
-                hw_status_tone_stop();
-                startup_done = true;
-            } else {
-                const startup_note_t *note = &s_startup_notes[startup_index++];
-                if (note->hz == 0U) {
-                    hw_status_tone_stop();
-                } else {
-                    /* Each note self-terminates after its duration, so the
-                     * melody cannot leave the buzzer stuck ON if the thread
-                     * is late reaching the next scheduler tick. */
-                    hw_status_tone_start_for(note->hz, note->duration_ms);
-                }
-                startup_deadline = now + note->duration_ms;
-            }
-        }
     }
 
 }
 
 bool hw_status_init(void) {
     s_status_started = true;
+    /* Start the complete 3.21 s power-on melody before FreeRTOS. TIM3 advances
+     * notes/gaps autonomously, so UART/FOC startup proceeds concurrently and the
+     * melody cannot disappear merely because timer_thread has not run yet. */
+    hw_status_startup_melody_begin();
     return true;
 }
 
@@ -463,6 +534,7 @@ static void early_fatal_delay_with_comm(uint32_t delay_ms) {
 }
 
 void hw_status_early_fatal_loop(void) {
+    hw_status_tone_stop();
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
     for (;;) {
         /* 4 rapid LED flashes + buzzer indicate a pre-scheduler failure while

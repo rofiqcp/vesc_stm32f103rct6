@@ -57,6 +57,7 @@ enum {
     CUSTOM_COMM_DIAG = 0xAA,
     CUSTOM_CONFIG_SAVE = 0xAB,
     CUSTOM_CONFIG_STATUS = 0xAC,
+    CUSTOM_BUZZER_TEST = 0xAD,
     INTERNAL_CUSTOM_SENSOR_DETECT = 0xF0
 };
 
@@ -89,7 +90,21 @@ static uint8_t s_tx_frame[VESC_PACKET_BUFFER_SIZE];
    of MCCONF rollback/work images on the 3-KiB RTOS worker stack. */
 static uint8_t s_mc_backup[2][VESC6_MCCONF_WIRE_SIZE];
 static uint8_t s_mc_work[VESC6_MCCONF_WIRE_SIZE];
+/* A blocking_job_t is >500 bytes because SET_MCCONF carries the complete
+ * VESC packet payload. Keep submit/worker copies in BSS rather than consuming
+ * a large fraction of the packet-process and blocking-task stacks. The submit
+ * object is only touched by packet_process; xQueueSend copies it atomically. */
+static blocking_job_t s_block_submit_job;
+static blocking_job_t s_block_worker_job;
+/* GET_VALUES is also reached through one-level COMM_FORWARD_CAN recursion.
+ * Keep the comparatively large telemetry/average snapshots in BSS rather than
+ * on packet_process' stack. This mirrors upstream's packet-buffer/mempool idea
+ * and prevents a motor-2-only stack overrun while preserving recursive routing. */
+static motor_telemetry_t s_get_values_telem;
+static motor_telemetry_avg_t s_get_values_avg;
 static comm_diag_t s_diag;
+vesc_comm_trace_t g_vesc_comm_trace;
+volatile uint32_t g_vesc_packet_stack_free_words = 0U;
 static vesc_appdata_handler_t s_appdata_handler = NULL;
 static volatile bool s_motor_ready = false;
 static volatile bool s_config_ready = false;
@@ -148,12 +163,14 @@ static void put_float32_auto(uint8_t *b, uint16_t *i, float number) {
 }
 
 static int16_t scaled_i16(float v, float scale) {
+    if (!isfinite(v) || !isfinite(scale)) return 0;
     float x = v * scale;
     if (x > 32767.0f) x = 32767.0f;
     if (x < -32768.0f) x = -32768.0f;
     return (int16_t)x; /* truncation matches upstream VESC buffer_append_float16 */
 }
 static int32_t scaled_i32(float v, float scale) {
+    if (!isfinite(v) || !isfinite(scale)) return 0;
     double x = (double)v * (double)scale;
     if (x > 2147483647.0) x = 2147483647.0;
     if (x < -2147483648.0) x = -2147483648.0;
@@ -403,21 +420,34 @@ static void append_get_values_fields(uint8_t *p, uint16_t *i,
     }
 }
 
-static void reply_get_values(uint8_t command, uint32_t mask, motor_id_t id) {
-    motor_telemetry_t t; telemetry_get(id, &t);
-    motor_telemetry_avg_t avg; telemetry_read_reset_avg(id, mask, &avg);
-    if (mask & (1UL << 2)) t.current_motor = avg.current_motor;
-    if (mask & (1UL << 3)) t.current_in = avg.current_in;
-    if (mask & (1UL << 4)) t.id_filter = avg.id;
-    if (mask & (1UL << 5)) t.iq_filter = avg.iq;
-    if (mask & (1UL << 19)) t.vd = avg.vd;
-    if (mask & (1UL << 20)) t.vq = avg.vq;
-    uint8_t *p = payload_begin(); if (p == NULL) return;
+static void reply_get_values(uint8_t command, uint32_t mask, motor_id_t requested_id) {
+    /* VESC dual-motor semantics are thread-selected. A raw UART packet is motor
+     * 1; COMM_FORWARD_CAN selects thread 2 before recursively dispatching the
+     * inner command. Derive the telemetry source from that thread context so
+     * every getter has the same identity rule as upstream commands.c. */
+    const motor_id_t id = (mc_interface_get_motor_thread() == 2) ? MOTOR_RIGHT : MOTOR_LEFT;
+    (void)requested_id;
+    g_vesc_comm_trace.last_motor_context = (id == MOTOR_RIGHT) ? 2U : 1U;
+    if (id == MOTOR_RIGHT) g_vesc_comm_trace.get_values_m2++;
+    else g_vesc_comm_trace.get_values_m1++;
+
+    telemetry_get_realtime(id, &s_get_values_telem);
+    telemetry_read_reset_avg(id, mask, &s_get_values_avg);
+    if (mask & (1UL << 2)) s_get_values_telem.current_motor = s_get_values_avg.current_motor;
+    if (mask & (1UL << 3)) s_get_values_telem.current_in = s_get_values_avg.current_in;
+    if (mask & (1UL << 4)) s_get_values_telem.id_filter = s_get_values_avg.id;
+    if (mask & (1UL << 5)) s_get_values_telem.iq_filter = s_get_values_avg.iq;
+    if (mask & (1UL << 19)) s_get_values_telem.vd = s_get_values_avg.vd;
+    if (mask & (1UL << 20)) s_get_values_telem.vq = s_get_values_avg.vq;
+
+    uint8_t *p = payload_begin();
+    if (p == NULL) return;
     uint16_t i = 0U; p[i++] = command;
     if (command == COMM_GET_VALUES_SELECTIVE) put_u32(p, &i, mask);
-    append_get_values_fields(p, &i, &t, mask, id);
+    append_get_values_fields(p, &i, &s_get_values_telem, mask, id);
     payload_end(i);
 }
+
 
 static void append_setup_fields(uint8_t *p, uint16_t *i,
                                 const motor_telemetry_t *t, const setup_values *sv, uint32_t mask,
@@ -735,6 +765,22 @@ static void reply_config_status(bool last_save_ok) {
     vesc_comm_send_payload(p, i);
 }
 
+static void reply_buzzer_status(uint8_t action, bool accepted) {
+    uint8_t *p = payload_begin();
+    if (p == NULL) return;
+    uint16_t i = 0U;
+    p[i++] = COMM_CUSTOM_APP_DATA;
+    p[i++] = CUSTOM_BUZZER_TEST;
+    p[i++] = action;
+    p[i++] = accepted ? 1U : 0U;
+    p[i++] = hw_status_tone_is_running() ? 1U : 0U;
+    p[i++] = g_vesc_startup_melody_active ? 1U : 0U;
+    p[i++] = g_vesc_startup_melody_index;
+    put_u16(p, &i, g_vesc_buzzer_hz);
+    put_u32(p, &i, g_vesc_buzzer_remaining);
+    payload_end(i);
+}
+
 static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context) {
     /* Upstream COMMANDS_APP_DATA callback semantics: `data` starts at the
      * application payload, i.e. COMM_CUSTOM_APP_DATA itself is stripped. */
@@ -761,17 +807,20 @@ static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context
              * by COMM_DETECT_ENCODER / COMM_DETECT_HALL_FOC. */
             float current = SENSOR_DETECT_CURRENT_A;
             if (len >= 7U) current = (float)get_i32_be(&data[3]) / 1000.0f;
-            blocking_job_t job = {0};
-            job.cmd = INTERNAL_CUSTOM_SENSOR_DETECT;
-            job.motor = (uint8_t)m->id;
-            job.len = 5U;
-            job.data[0] = mode;
+            /* Reuse the packet-thread-owned static submit buffer.
+             * blocking_job_t is intentionally not allocated on this task's
+             * stack because it carries a full VESC MCCONF-sized payload. */
+            memset(&s_block_submit_job, 0, sizeof(s_block_submit_job));
+            s_block_submit_job.cmd = INTERNAL_CUSTOM_SENSOR_DETECT;
+            s_block_submit_job.motor = (uint8_t)m->id;
+            s_block_submit_job.len = 5U;
+            s_block_submit_job.data[0] = mode;
             int32_t ca = scaled_i32(current, 1000.0f);
-            job.data[1] = (uint8_t)((uint32_t)ca >> 24);
-            job.data[2] = (uint8_t)((uint32_t)ca >> 16);
-            job.data[3] = (uint8_t)((uint32_t)ca >> 8);
-            job.data[4] = (uint8_t)ca;
-            if (xQueueSend(s_block_queue, &job, 0U) != pdTRUE) {
+            s_block_submit_job.data[1] = (uint8_t)((uint32_t)ca >> 24);
+            s_block_submit_job.data[2] = (uint8_t)((uint32_t)ca >> 16);
+            s_block_submit_job.data[3] = (uint8_t)((uint32_t)ca >> 8);
+            s_block_submit_job.data[4] = (uint8_t)ca;
+            if (xQueueSend(s_block_queue, &s_block_submit_job, 0U) != pdTRUE) {
                 s_diag.blocking_busy_drops++;
                 commands_send_print("VESC F103: detection worker busy.");
             }
@@ -801,6 +850,24 @@ static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context
         reply_sensor_info(explicit_id);
     } else if (sub == CUSTOM_COMM_DIAG) {
         vesc_comm_reply_diag();
+    } else if (sub == CUSTOM_BUZZER_TEST) {
+        const uint8_t action = len >= 2U ? data[1] : 0U;
+        bool accepted = true;
+        if (action == 1U || action == 2U) {
+            /* Indicator audio is diagnostic-only while both bridges are off. */
+            if (g_motor_left.pwm_enabled || g_motor_right.pwm_enabled) {
+                accepted = false;
+            } else if (action == 1U) {
+                hw_status_startup_melody_replay();
+            } else {
+                hw_status_tone_start_for(1200U, 500U);
+            }
+        } else if (action == 3U) {
+            hw_status_tone_stop();
+        } else if (action != 0U) {
+            accepted = false;
+        }
+        reply_buzzer_status(action, accepted);
     } else if (sub == CUSTOM_CONFIG_SAVE) {
         bool ok = conf_general_store_all(); reply_config_status(ok);
     } else if (sub == CUSTOM_CONFIG_STATUS) {
@@ -870,10 +937,12 @@ static bool blocking_command_length_valid(uint8_t cmd, uint16_t len) {
 static bool queue_blocking_job(const uint8_t *data, uint16_t len, motor_id_t id) {
     if (data == NULL || len == 0U || s_block_queue == NULL || len > BLOCK_DATA_MAX) return false;
     if (!blocking_command_length_valid(data[0], len)) return false;
-    blocking_job_t job;
-    memset(&job, 0, sizeof(job));
-    job.cmd = data[0]; job.motor = (uint8_t)id; job.len = len; memcpy(job.data, data, len);
-    if (xQueueSend(s_block_queue, &job, 0U) != pdTRUE) {
+    memset(&s_block_submit_job, 0, sizeof(s_block_submit_job));
+    s_block_submit_job.cmd = data[0];
+    s_block_submit_job.motor = (uint8_t)id;
+    s_block_submit_job.len = len;
+    memcpy(s_block_submit_job.data, data, len);
+    if (xQueueSend(s_block_queue, &s_block_submit_job, 0U) != pdTRUE) {
         s_diag.blocking_busy_drops++;
         return false;
     }
@@ -1236,56 +1305,56 @@ static bool battery_cut_apply_both(float start, float end, bool store) {
 
 void blocking_thread(void *argument) {
     (void)argument;
-    blocking_job_t job;
     for (;;) {
-        memset(&job, 0, sizeof(job));
-        if (xQueueReceive(s_block_queue, &job, portMAX_DELAY) != pdTRUE) continue;
-        MotorRuntime *m = motor_get(job.motor == MOTOR_RIGHT ? MOTOR_RIGHT : MOTOR_LEFT);
+        memset(&s_block_worker_job, 0, sizeof(s_block_worker_job));
+        if (xQueueReceive(s_block_queue, &s_block_worker_job, portMAX_DELAY) != pdTRUE) continue;
+        blocking_job_t *job = &s_block_worker_job;
+        MotorRuntime *m = motor_get(job->motor == MOTOR_RIGHT ? MOTOR_RIGHT : MOTOR_LEFT);
         int old_motor = mc_interface_get_motor_thread();
         mc_interface_select_motor_thread(m->id == MOTOR_RIGHT ? 2 : 1);
-        if (job.cmd == COMM_SET_MCCONF) {
-            bool ok = job.len == (1U + VESC6_MCCONF_WIRE_SIZE) &&
-                      vesc_config_set_mc_wire(m->id, &job.data[1],
-                                              (uint16_t)(job.len - 1U), true);
+        if (job->cmd == COMM_SET_MCCONF) {
+            bool ok = job->len == (1U + VESC6_MCCONF_WIRE_SIZE) &&
+                      vesc_config_set_mc_wire(m->id, &job->data[1],
+                                              (uint16_t)(job->len - 1U), true);
             if (ok) reply_ack(COMM_SET_MCCONF);
             else commands_send_print("VESC F103: MCCONF rejected; motor must be OFF and VESC6 signature/layout valid.");
-        } else if (job.cmd == COMM_SET_APPCONF || job.cmd == COMM_SET_APPCONF_NO_STORE) {
-            const bool store = job.cmd == COMM_SET_APPCONF;
+        } else if (job->cmd == COMM_SET_APPCONF || job->cmd == COMM_SET_APPCONF_NO_STORE) {
+            const bool store = job->cmd == COMM_SET_APPCONF;
             bool ok = false;
-            if (job.len == (1U + VESC6_APPCONF_WIRE_SIZE)) {
+            if (job->len == (1U + VESC6_APPCONF_WIRE_SIZE)) {
                 /* Match HW_HAS_DUAL_MOTORS upstream: APPCONF is shared. When
                    a packet is forwarded to motor-thread 2, ignore the public
                    controller-ID carried in that image and restore the local
                    primary ID before applying/storing the shared app config. */
                 if (m->id == MOTOR_RIGHT) {
-                    job.data[1U + VESC6_APP_OFF_CONTROLLER_ID] = VESC_CONTROLLER_ID_LEFT;
+                    job->data[1U + VESC6_APP_OFF_CONTROLLER_ID] = VESC_CONTROLLER_ID_LEFT;
                 }
-                ok = vesc_config_set_app_wire(&job.data[1], VESC6_APPCONF_WIRE_SIZE, store);
+                ok = vesc_config_set_app_wire(&job->data[1], VESC6_APPCONF_WIRE_SIZE, store);
             }
-            if (ok) reply_ack(job.cmd);
+            if (ok) reply_ack(job->cmd);
             else commands_send_print("VESC F103: APPCONF rejected; VESC6 signature/layout invalid.");
-        } else if (job.cmd == COMM_TERMINAL_CMD) {
-            process_terminal_text(&job.data[1], (uint16_t)(job.len > 0U ? job.len - 1U : 0U), m->id);
-        } else if (job.cmd == COMM_SET_MCCONF_TEMP || job.cmd == COMM_SET_MCCONF_TEMP_SETUP) {
-            set_mcconf_temp(&job.data[1], (uint16_t)(job.len - 1U), m->id,
-                            job.cmd == COMM_SET_MCCONF_TEMP_SETUP);
-        } else if (job.cmd == COMM_SET_BATTERY_CUT) {
-            float start = (float)get_i32_be(&job.data[1]) / 1000.0f;
-            float end = (float)get_i32_be(&job.data[5]) / 1000.0f;
-            bool store = job.data[9] != 0U;
-            bool forward_all = job.data[10] != 0U;
+        } else if (job->cmd == COMM_TERMINAL_CMD) {
+            process_terminal_text(&job->data[1], (uint16_t)(job->len > 0U ? job->len - 1U : 0U), m->id);
+        } else if (job->cmd == COMM_SET_MCCONF_TEMP || job->cmd == COMM_SET_MCCONF_TEMP_SETUP) {
+            set_mcconf_temp(&job->data[1], (uint16_t)(job->len - 1U), m->id,
+                            job->cmd == COMM_SET_MCCONF_TEMP_SETUP);
+        } else if (job->cmd == COMM_SET_BATTERY_CUT) {
+            float start = (float)get_i32_be(&job->data[1]) / 1000.0f;
+            float end = (float)get_i32_be(&job->data[5]) / 1000.0f;
+            bool store = job->data[9] != 0U;
+            bool forward_all = job->data[10] != 0U;
             bool ok = (m->id == MOTOR_LEFT && forward_all) ?
                       battery_cut_apply_both(start, end, store) :
                       battery_cut_apply_one(m->id, start, end, store);
             if (ok) reply_ack(COMM_SET_BATTERY_CUT);
             else commands_send_print("VESC F103: battery-cut update rejected or persistence failed.");
-        } else if (job.cmd == COMM_DETECT_MOTOR_PARAM) {
+        } else if (job->cmd == COMM_DETECT_MOTOR_PARAM) {
             /* Legacy six-step BLDC detector is intentionally unavailable in
              * this FOC-only build. Return the canonical unsupported payload;
              * all FOC detection commands below remain fully active. */
             reply_detect_motor_param_bldc(m, false);
-        } else if (job.cmd == COMM_DETECT_ENCODER) {
-            float current = (float)get_i32_be(&job.data[1]) / 1000.0f;
+        } else if (job->cmd == COMM_DETECT_ENCODER) {
+            float current = (float)get_i32_be(&job->data[1]) / 1000.0f;
             float off = 0.0f, rat = 0.0f;
             bool inv = false;
             bool ok = ensure_current_calibration_valid(10000U) &&
@@ -1295,31 +1364,31 @@ void blocking_thread(void *argument) {
                fails before detect_begin(), that structure may contain a
                successful result from an older transaction. */
             reply_detect_encoder_standard(off, rat, inv, ok);
-        } else if (job.cmd == COMM_DETECT_HALL_FOC) {
-            float current = (float)get_i32_be(&job.data[1]) / 1000.0f;
+        } else if (job->cmd == COMM_DETECT_HALL_FOC) {
+            float current = (float)get_i32_be(&job->data[1]) / 1000.0f;
             uint8_t hall[8]; memset(hall, 255, sizeof(hall));
             bool hall_ok = false;
             bool ok = ensure_current_calibration_valid(10000U) &&
                       mcpwm_foc_hall_detect_motor(m, fabsf(current), hall, &hall_ok) == MOTOR_FAULT_NONE &&
                       hall_ok;
             reply_detect_hall_standard(hall, ok);
-        } else if (job.cmd == COMM_DETECT_MOTOR_R_L) {
+        } else if (job->cmd == COMM_DETECT_MOTOR_R_L) {
             float r = 0.0f, l = 0.0f, ldq = 0.0f;
             bool ok = ensure_current_calibration_valid(10000U) &&
                       mcpwm_foc_measure_res_ind_motor(m, &r, &l, &ldq) == MOTOR_FAULT_NONE;
             reply_detect_rl(r, l, ldq, ok);
-        } else if (job.cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE ||
-                   job.cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP) {
+        } else if (job->cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE ||
+                   job->cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP) {
             /* VESC 6.00 standard payloads:
                normal   = current, min_erpm, duty, resistance
                openloop = current, erpm_per_sec, duty, resistance, inductance */
-            float current = (float)get_i32_be(&job.data[1]) / 1000.0f;
-            float second = (float)get_i32_be(&job.data[5]) / 1000.0f;
-            float duty = (float)get_i32_be(&job.data[9]) / 1000.0f;
-            float resistance = (float)get_i32_be(&job.data[13]) / 1000000.0f;
+            float current = (float)get_i32_be(&job->data[1]) / 1000.0f;
+            float second = (float)get_i32_be(&job->data[5]) / 1000.0f;
+            float duty = (float)get_i32_be(&job->data[9]) / 1000.0f;
+            float resistance = (float)get_i32_be(&job->data[13]) / 1000000.0f;
             float inductance = m->detect_rl_valid ? m->detect_inductance_h : m->foc_motor_l;
-            if (job.cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP) {
-                inductance = (float)get_i32_be(&job.data[17]) / 100000000.0f;
+            if (job->cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP) {
+                inductance = (float)get_i32_be(&job->data[17]) / 100000000.0f;
             }
 
             float flux = 0.0f;
@@ -1331,7 +1400,7 @@ void blocking_thread(void *argument) {
             if (params_ok && ensure_current_calibration_valid(10000U)) {
                 float target;
                 float accel;
-                if (job.cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP) {
+                if (job->cmd == COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP) {
                     target = fminf(fmaxf(fabsf(m->max_erpm), FOC_DETECT_FLUX_ERPM), 5000.0f);
                     accel = fmaxf(fabsf(second), 100.0f);
                 } else {
@@ -1341,19 +1410,19 @@ void blocking_thread(void *argument) {
                 ok = mcpwm_foc_measure_flux_linkage_motor_bounded(m, current, target, accel,
                             fabsf(duty), resistance, inductance, &flux) == MOTOR_FAULT_NONE;
             }
-            reply_detect_flux(job.cmd, flux, ok);
-        } else if (job.cmd == COMM_DETECT_APPLY_ALL_FOC) {
+            reply_detect_flux(job->cmd, flux, ok);
+        } else if (job->cmd == COMM_DETECT_APPLY_ALL_FOC) {
             /* VESC6/VESC Tool payload:
                detect_can, max_power_loss, min_input_current, max_input_current,
                openloop_erpm, sl_erpm. On this board detect_can=true means
                "include the local forwarded Motor-2", not physical CAN. */
             int16_t result = -1;
-            const bool detect_can = job.data[1] != 0U;
-            const float max_power_loss = (float)get_i32_be(&job.data[2]) / 1000.0f;
-            const float min_input_current = (float)get_i32_be(&job.data[6]) / 1000.0f;
-            const float max_input_current = (float)get_i32_be(&job.data[10]) / 1000.0f;
-            const float openloop = (float)get_i32_be(&job.data[14]) / 1000.0f;
-            const float sl = (float)get_i32_be(&job.data[18]) / 1000.0f;
+            const bool detect_can = job->data[1] != 0U;
+            const float max_power_loss = (float)get_i32_be(&job->data[2]) / 1000.0f;
+            const float min_input_current = (float)get_i32_be(&job->data[6]) / 1000.0f;
+            const float max_input_current = (float)get_i32_be(&job->data[10]) / 1000.0f;
+            const float openloop = (float)get_i32_be(&job->data[14]) / 1000.0f;
+            const float sl = (float)get_i32_be(&job->data[18]) / 1000.0f;
             const bool params_ok = isfinite(max_power_loss) && max_power_loss > 0.0f &&
                                    isfinite(min_input_current) && isfinite(max_input_current) &&
                                    min_input_current <= 0.0f && max_input_current >= 0.0f &&
@@ -1430,10 +1499,10 @@ void blocking_thread(void *argument) {
             p[i++] = COMM_DETECT_APPLY_ALL_FOC;
             put_i16(p, &i, result);
             vesc_comm_send_payload(p, i);
-        } else if (job.cmd == INTERNAL_CUSTOM_SENSOR_DETECT) {
-            uint8_t mode = job.len >= 1U ? job.data[0] : SENSOR_MODE_AUTO;
-            float current = job.len >= 5U ?
-                    (float)get_i32_be(&job.data[1]) / 1000.0f : SENSOR_DETECT_CURRENT_A;
+        } else if (job->cmd == INTERNAL_CUSTOM_SENSOR_DETECT) {
+            uint8_t mode = job->len >= 1U ? job->data[0] : SENSOR_MODE_AUTO;
+            float current = job->len >= 5U ?
+                    (float)get_i32_be(&job->data[1]) / 1000.0f : SENSOR_DETECT_CURRENT_A;
             bool applied = false;
             /* Sensor discovery/calibration has exclusive motor ownership just
                like Detect-All. This prevents APP_ADC/APP_UART from replacing
@@ -1477,7 +1546,7 @@ void blocking_thread(void *argument) {
             }
             reply_sensor_info(m->id);
         } else {
-            reply_unsupported_detect(job.cmd);
+            reply_unsupported_detect(job->cmd);
         }
         mc_interface_select_motor_thread(old_motor);
     }
@@ -1761,9 +1830,14 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
                  * this target has no CAN PHY, so they are intentionally ignored. */
                 if (target == VESC_LOCAL_MOTOR2_FORWARD_ID) {
                     s_diag.motor2_forwards++;
+                    g_vesc_comm_trace.last_forward_target = target;
+                    g_vesc_comm_trace.last_forward_inner_cmd = inner_cmd;
+                    g_vesc_comm_trace.forward_m2_count++;
+                    g_vesc_comm_trace.last_motor_context = 2U;
                     mc_interface_select_motor_thread(2);
                     process_payload_for_motor(&data[2], (uint16_t)(len - 2U), MOTOR_RIGHT);
                     mc_interface_select_motor_thread(1);
+                    g_vesc_comm_trace.last_motor_context = 1U;
                 } else {
                     s_diag.unsupported_forward_ids++;
                 }
@@ -1869,6 +1943,10 @@ static void process_payload_for_motor(const uint8_t *data, uint16_t len, motor_i
 static void process_payload(const uint8_t *data, uint16_t len) {
     if (data == NULL || len == 0U) return;
     s_diag.rx_frames_ok++;
+    g_vesc_comm_trace.last_outer_cmd = data[0];
+    g_vesc_comm_trace.last_forward_target = 0U;
+    g_vesc_comm_trace.last_forward_inner_cmd = 0U;
+    g_vesc_comm_trace.last_motor_context = 1U;
     /* A raw UART packet is always the directly-connected controller (motor 1).
      * Force that context before AND after dispatch so a forwarded command can
      * never leak motor-thread 2 into the next local VESC Tool request. */
@@ -1891,8 +1969,14 @@ bool vesc_comm_poll_once(void) {
 
 void packet_process_thread(void *argument) {
     (void)argument;
+    TickType_t last_stack_probe = 0U;
     for (;;) {
         timeout_heartbeat(TIMEOUT_HEARTBEAT_COMM);
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - last_stack_probe) >= pdMS_TO_TICKS(1000U)) {
+            g_vesc_packet_stack_free_words = (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+            last_stack_probe = now;
+        }
         /* SmartESC-compatible architecture: USART3 RX DMA writes a circular
          * buffer and this task polls the DMA write pointer (CNDTR). Packet
          * framing/CRC/dispatch is never executed from interrupt context. */
@@ -1916,7 +2000,14 @@ static bool vesc_comm_send_payload_class(const uint8_t *payload, uint16_t len, b
     bool queued = frame_len != 0U && (low_priority
         ? app_uartcomm_write_raw_low_priority(s_tx_frame, frame_len)
         : app_uartcomm_write_raw(s_tx_frame, frame_len));
-    if (queued) s_diag.tx_frames++;
+    if (queued) {
+        s_diag.tx_frames++;
+        g_vesc_comm_trace.last_reply_cmd = payload[0];
+        if (g_vesc_comm_trace.last_forward_target == VESC_LOCAL_MOTOR2_FORWARD_ID) {
+            g_vesc_comm_trace.forward_m2_reply_count++;
+        }
+    }
+    g_vesc_comm_trace.last_tx_ok = queued ? 1U : 0U;
     if (mutex_taken) (void)xSemaphoreGive(s_send_mutex);
     return queued;
 }
@@ -1939,7 +2030,7 @@ static void vesc_comm_reply_diag(void) {
     uint8_t *p = payload_begin();
     if (p == NULL) return;
     uint16_t i = 0U;
-    p[i++] = COMM_CUSTOM_APP_DATA; p[i++] = CUSTOM_COMM_DIAG; p[i++] = 15U;
+    p[i++] = COMM_CUSTOM_APP_DATA; p[i++] = CUSTOM_COMM_DIAG; p[i++] = 16U;
     put_u32(p, &i, u->rx_bytes); put_u32(p, &i, u->rx_overruns); put_u32(p, &i, s_diag.rx_frames_ok);
     put_u32(p, &i, u->tx_bytes); put_u32(p, &i, u->uart_errors); put_u32(p, &i, s_diag.tx_frames);
     put_u32(p, &i, u->tx_overruns); put_u32(p, &i, u->tx_complete_count); put_u32(p, &i, s_diag.blocking_busy_drops);
@@ -2013,6 +2104,34 @@ static void vesc_comm_reply_diag(void) {
     put_u32(p, &i, u->rx_restarts);
     put_u32(p, &i, g_vesc_boot_stage);
     put_u32(p, &i, g_vesc_boot_error);
+
+    /* Revision 16: exact VESC dual-motor command breadcrumbs plus buzzer and
+     * first current-fault capture. This makes a forwarded GET_VALUES timeout
+     * distinguishable from parser, routing, TX and FOC/current failures. */
+    p[i++] = g_vesc_comm_trace.last_outer_cmd;
+    p[i++] = g_vesc_comm_trace.last_forward_target;
+    p[i++] = g_vesc_comm_trace.last_forward_inner_cmd;
+    p[i++] = g_vesc_comm_trace.last_motor_context;
+    p[i++] = g_vesc_comm_trace.last_reply_cmd;
+    p[i++] = g_vesc_comm_trace.last_tx_ok;
+    p[i++] = hw_status_tone_is_running() ? 1U : 0U;
+    p[i++] = g_vesc_startup_melody_active ? 1U : 0U;
+    p[i++] = g_vesc_startup_melody_index;
+    p[i++] = 0U;
+    put_u32(p, &i, g_vesc_comm_trace.get_values_m1);
+    put_u32(p, &i, g_vesc_comm_trace.get_values_m2);
+    put_u32(p, &i, g_vesc_comm_trace.forward_m2_count);
+    put_u32(p, &i, g_vesc_comm_trace.forward_m2_reply_count);
+    put_u16(p, &i, g_vesc_buzzer_hz);
+    put_u32(p, &i, g_vesc_buzzer_remaining);
+    foc_fault_snapshot_t fs;
+    memset(&fs, 0, sizeof(fs));
+    foc_get_fault_snapshot(&fs);
+    p[i++] = fs.valid; p[i++] = fs.motor; p[i++] = fs.fault; p[i++] = fs.cal_stage;
+    put_u16(p, &i, fs.raw_u); put_u16(p, &i, fs.raw_v); put_u16(p, &i, fs.raw_dc);
+    put_i32(p, &i, fs.offset_u); put_i32(p, &i, fs.offset_v); put_i32(p, &i, fs.offset_dc);
+    put_i32(p, &i, fs.ia_q15); put_i32(p, &i, fs.ib_q15); put_i32(p, &i, fs.ic_q15);
+    put_i32(p, &i, fs.trip_q15); put_i32(p, &i, fs.iq_target_q15);
     payload_end(i);
 }
 
@@ -2134,6 +2253,7 @@ void vesc_comm_set_thread_ids(TaskHandle_t packet, TaskHandle_t blocking) {
 bool vesc_comm_task_init(void) {
     if (s_comm_initialized) return true;
     memset((void *)&s_diag, 0, sizeof(s_diag));
+    memset((void *)&g_vesc_comm_trace, 0, sizeof(g_vesc_comm_trace));
     memset((void *)s_display_mode, 0, sizeof(s_display_mode));
     s_display_owner = -1;
     s_motor_ready = false;

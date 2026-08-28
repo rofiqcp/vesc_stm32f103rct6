@@ -81,6 +81,9 @@ bool hw_status_init(void);
 void hw_status_tone_start(uint16_t hz);
 void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms);
 void hw_status_tone_stop(void);
+/* Replays the same non-blocking ~3.21 s TIM3 power-on melody. The command
+ * layer only exposes this while both bridges are stopped. */
+void hw_status_startup_melody_replay(void);
 bool hw_status_tone_is_running(void);
 bool hw_status_tone_level(void);
 void hw_status_power_hold(bool on);
@@ -88,3 +91,8 @@ bool hw_status_power_is_held(void);
 void hw_status_service_10ms(uint32_t now_ms);
 void hw_status_tim3_irq_handler(void);
 void hw_status_early_fatal_loop(void) __attribute__((noreturn));
+extern volatile uint8_t g_vesc_buzzer_running;
+extern volatile uint16_t g_vesc_buzzer_hz;
+extern volatile uint32_t g_vesc_buzzer_remaining;
+extern volatile uint8_t g_vesc_startup_melody_active;
+extern volatile uint8_t g_vesc_startup_melody_index;

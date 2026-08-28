@@ -156,3 +156,16 @@ is wired, flash the fixed image once with:
 ```
 
 After that, return to normal `pio run -t upload` / `run_debug.sh` operation.
+
+## Deep command/fault/buzzer diagnostics
+
+After halting the target safely:
+
+```gdb
+vesc_comm_trace
+vesc_current_fault
+vesc_buzzer
+vesc_snapshot
+```
+
+`vesc_comm_trace` shows the last root command, forwarded target/inner command, motor context and TX result. `vesc_current_fault` exposes the FOC current-fault snapshot. `vesc_buzzer` shows startup melody/tone state.

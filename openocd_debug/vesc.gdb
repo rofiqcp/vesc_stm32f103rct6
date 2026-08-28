@@ -42,7 +42,7 @@ define vesc_uart
 end
 document vesc_uart
 Show HAL UART/DMA state, USART3 registers, DMA CNDTR and firmware UART counters.
-For RX DMA size 512, CNDTR should change when bytes arrive on PB11.
+For RX DMA size 1024, CNDTR should change when bytes arrive on PB11.
 end
 
 define vesc_motor_left
@@ -122,11 +122,40 @@ define vesc_faults
   monitor vesc_fault_hw
 end
 
+
+define vesc_comm_trace
+  printf "\n=== VESC COMMAND / VIRTUAL-CAN TRACE ===\n"
+  p g_vesc_comm_trace
+  printf "packet_process stack free (words): "
+  p g_vesc_packet_stack_free_words
+end
+
+define vesc_current_fault
+  printf "\n=== CURRENT FAULT SNAPSHOT ===\n"
+  p s_fault_snapshot
+  p g_motor_left.abs_current_fault_count
+  p g_motor_right.abs_current_fault_count
+  p g_motor_left.abs_current_peak_q15
+  p g_motor_right.abs_current_peak_q15
+end
+
+define vesc_buzzer
+  printf "\n=== BUZZER / STARTUP MELODY ===\n"
+  p g_vesc_buzzer_running
+  p g_vesc_buzzer_hz
+  p g_vesc_buzzer_remaining
+  p g_vesc_startup_melody_active
+  p g_vesc_startup_melody_index
+end
+
 define vesc_snapshot
   vesc_boot
   vesc_uart
   vesc_motors
   vesc_sampling
+  vesc_comm_trace
+  vesc_current_fault
+  vesc_buzzer
   vesc_tasks
   monitor vesc_clock_hw
   monitor vesc_nvic_hw
@@ -161,4 +190,4 @@ define vesc_break_foc
   thbreak DMA1_Channel1_IRQHandler
 end
 
-printf "Loaded VESC GDB helpers: vesc_boot, vesc_uart, vesc_motors, vesc_sampling, vesc_tasks, vesc_faults, vesc_snapshot, vesc_run, vesc_break_comm, vesc_break_uart_tx, vesc_break_foc\n"
+printf "Loaded VESC GDB helpers: vesc_boot, vesc_uart, vesc_motors, vesc_sampling, vesc_comm_trace, vesc_current_fault, vesc_buzzer, vesc_tasks, vesc_faults, vesc_snapshot, vesc_run, vesc_break_comm, vesc_break_uart_tx, vesc_break_foc\n"

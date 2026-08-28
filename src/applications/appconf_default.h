@@ -113,6 +113,7 @@
  * normal PWM startup; that coupling caused a false ABS_OVER_CURRENT during
  * Hall detect before the current ramp had even begun. */
 #define PWM_STARTUP_DC_TRIP_A           17.0f
+#define PWM_STARTUP_DC_TRIP_DEBOUNCE_SAMPLES 4U /* 250 us at 16 kHz; fits inside the 8-event startup blanking window while rejecting a one-sample switching spike */
 #define PWM_ENABLE_PRELOAD_EVENTS       2U
 /* Current-offset validation policy:
  * - VESC upstream calibrates by averaging current offsets and does not reject
@@ -162,6 +163,7 @@
 #define FOC_ABS_CURRENT_TRIP_A          25.0f
 #define FOC_ABS_CURRENT_FILTER_ALPHA_Q15 4096  /* 0.125 @ 16 kHz */
 #define FOC_ABS_CURRENT_FAULT_DEBOUNCE_SAMPLES 4U
+#define FOC_HARD_CURRENT_FAULT_DEBOUNCE_SAMPLES 4U /* 250 us at 16 kHz; hardware BKIN remains immediate */
 #define FOC_MAX_VOLTAGE_MODULATION      0.80f
 #define VBUS_MIN_RUN_V                  8.0f
 #define VBUS_MAX_RUN_V                  55.0f

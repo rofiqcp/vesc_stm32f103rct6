@@ -47,3 +47,18 @@ typedef struct {
     uint32_t blocking_stack_free_bytes;
 } vesc_comm_resource_stats_t;
 void vesc_comm_get_resource_stats(vesc_comm_resource_stats_t *out);
+
+typedef struct {
+    volatile uint8_t last_outer_cmd;
+    volatile uint8_t last_forward_target;
+    volatile uint8_t last_forward_inner_cmd;
+    volatile uint8_t last_motor_context;
+    volatile uint8_t last_reply_cmd;
+    volatile uint8_t last_tx_ok;
+    volatile uint16_t reserved;
+    volatile uint32_t get_values_m1;
+    volatile uint32_t get_values_m2;
+    volatile uint32_t forward_m2_count;
+    volatile uint32_t forward_m2_reply_count;
+} vesc_comm_trace_t;
+extern vesc_comm_trace_t g_vesc_comm_trace;

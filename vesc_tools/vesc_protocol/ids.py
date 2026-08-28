@@ -186,11 +186,16 @@ class ValueMask:
     POSITION = 1 << 16
     VESC_ID = 1 << 17
     TEMP_MOS_1_2_3 = 1 << 18
-    VD_VQ = 1 << 19
-    STATUS = 1 << 20
+    VD = 1 << 19
+    VQ = 1 << 20
+    STATUS = 1 << 21
+
+    # Backward-compatible convenience alias. On the VESC wire these are two
+    # independent fields, not one grouped bit.
+    VD_VQ = VD | VQ
 
     # Semua field yang diketahui (bit 0..20).
-    ALL = (1 << 21) - 1
+    ALL = (1 << 22) - 1
 
 
 # Bit mask untuk GET_VALUES_SETUP (urutan di ``case COMM_GET_VALUES_SETUP``).

@@ -882,12 +882,22 @@ bool foc_sensorless_startup_1khz(MotorRuntime *m, uint32_t now_ms,
     m->phase_observer_override_u16 =
         (uint16_t)(m->phase_observer_override_u16 + step);
 
-    /* Upstream adds open-loop Q boost to the requested current and caps it.
-       Clamp against the board-qualified configured max_q as well. */
+    /* Upstream adds open-loop Q boost and caps it. On this hoverboard port the
+       user MCCONF/open-loop value must never bypass the currently valid motor
+       current limit. Use the direction-specific live limit (including runtime
+       derating) and the configured 15 A board envelope as an upper bound. */
     float iq_abs = fabsf(iq_hint_a) + fabsf(m->foc_sl_openloop_boost_q);
-    const float max_q = fmaxf(fabsf(m->foc_sl_openloop_max_q),
-                              fmaxf(m->cc_min_current, 0.1f));
-    iq_abs = foc_clampf(iq_abs, fminf(fabsf(m->foc_sl_openloop_boost_q), max_q), max_q);
+    const float cfg_max_q = fmaxf(fabsf(m->foc_sl_openloop_max_q),
+                                  fmaxf(m->cc_min_current, 0.1f));
+    float dir_limit = dir > 0 ? m->lo_current_max_a : -m->lo_current_min_a;
+    if (!isfinite(dir_limit) || dir_limit <= 0.0f) {
+        dir_limit = dir > 0 ? m->current_max_a : -m->current_min_a;
+    }
+    if (!isfinite(dir_limit) || dir_limit <= 0.0f) dir_limit = FOC_MAX_CURRENT_A;
+    dir_limit = fminf(dir_limit, FOC_MAX_CURRENT_A);
+    const float max_q = fmaxf(0.1f, fminf(cfg_max_q, dir_limit));
+    const float min_q = fminf(fabsf(m->foc_sl_openloop_boost_q), max_q);
+    iq_abs = foc_clampf(iq_abs, min_q, max_q);
     motor_set_foc_targets(m, 0.0f, copysignf(iq_abs, (float)dir));
 
     if (m->observer_valid && speed_abs_q16 >= handover_q16) {

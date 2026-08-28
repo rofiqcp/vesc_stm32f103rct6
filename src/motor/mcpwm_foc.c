@@ -66,6 +66,8 @@ static foc_cal_channel_diag_t s_cal_diag_channels[6];
 static volatile uint16_t s_cal_shift_warn_mask = 0U;
 static volatile foc_fault_snapshot_t s_fault_snapshot;
 static uint8_t s_overrun_consecutive[2] = {0U, 0U};
+static uint8_t s_hard_current_trip_consecutive[2] = {0U, 0U};
+static uint8_t s_startup_dc_trip_consecutive[2] = {0U, 0U};
 static int32_t s_inv_vbus_q30 = 0;
 static int32_t s_inv_vbus_last_q15 = 0;
 static uint8_t s_inv_vbus_age = 0U;
@@ -1031,6 +1033,7 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
     m->ia_q15 = ia; m->ib_q15 = ib; m->ic_q15 = ic;
     m->dc_current_raw = raw_dc; m->vbus_q15 = vbus_q15;
     m->dc_current_q15 = adc_current_to_q15(raw_dc, m->dc_current_offset_counts, m->dc_current_scale_q16);
+    const uint8_t mi = (m->id == MOTOR_RIGHT) ? 1U : 0U;
 
     /* Hall GPIO is the fast source of truth. EXTI is only an optional early
        timestamp hint; polling here ensures phase validity is not dependent on
@@ -1075,6 +1078,11 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
     if (m->pwm_enabled && m->pwm_enable_blank_cycles > 0U) {
         int32_t dc_q15 = m->dc_current_q15;
         if (iabs32(dc_q15) > s_startup_dc_trip_q15) {
+            if (s_startup_dc_trip_consecutive[mi] < 255U) s_startup_dc_trip_consecutive[mi]++;
+        } else {
+            s_startup_dc_trip_consecutive[mi] = 0U;
+        }
+        if (s_startup_dc_trip_consecutive[mi] >= PWM_STARTUP_DC_TRIP_DEBOUNCE_SAMPLES) {
             capture_current_fault_snapshot(m, MOTOR_FAULT_ABS_OVER_CURRENT,
                                            raw_u, raw_v, raw_dc, ia, ib, ic, s_startup_dc_trip_q15);
             motor_request_fault_from_isr(m, MOTOR_FAULT_ABS_OVER_CURRENT);
@@ -1088,14 +1096,24 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
         return;
     }
 
+    s_startup_dc_trip_consecutive[mi] = 0U;
+
     /* Preserve two current-protection layers. Outside startup blanking the
-       physical board ceiling is first-sample. l_slow_abs_current only changes
+       physical board ceiling remains the hard upper threshold, but it is
+       qualified for a few consecutive 16-kHz samples so a single switching
+       transient cannot latch ABS_OVER_CURRENT. l_slow_abs_current only changes
        the configurable lower threshold and can never mask the board ceiling. */
     m->abs_phase_current_filter_q15 +=
         foc_q15_mul(FOC_ABS_CURRENT_FILTER_ALPHA_Q15,
                     abs_phase - m->abs_phase_current_filter_q15);
 
     if (m->pwm_enabled && abs_phase > s_current_trip_q15) {
+        if (s_hard_current_trip_consecutive[mi] < 255U) s_hard_current_trip_consecutive[mi]++;
+    } else {
+        s_hard_current_trip_consecutive[mi] = 0U;
+    }
+    if (m->pwm_enabled &&
+        s_hard_current_trip_consecutive[mi] >= FOC_HARD_CURRENT_FAULT_DEBOUNCE_SAMPLES) {
         capture_current_fault_snapshot(m, MOTOR_FAULT_ABS_OVER_CURRENT,
                                        raw_u, raw_v, raw_dc, ia, ib, ic, s_current_trip_q15);
         motor_request_fault_from_isr(m, MOTOR_FAULT_ABS_OVER_CURRENT); return;
@@ -1108,7 +1126,7 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
         } else {
             m->abs_current_fault_count = 0U;
         }
-        uint8_t required = m->slow_abs_current ? FOC_ABS_CURRENT_FAULT_DEBOUNCE_SAMPLES : 1U;
+        uint8_t required = m->slow_abs_current ? FOC_ABS_CURRENT_FAULT_DEBOUNCE_SAMPLES : FOC_HARD_CURRENT_FAULT_DEBOUNCE_SAMPLES;
         if (m->abs_current_fault_count >= required) {
             capture_current_fault_snapshot(m, MOTOR_FAULT_ABS_OVER_CURRENT,
                                            raw_u, raw_v, raw_dc, ia, ib, ic, trip);
@@ -1116,6 +1134,8 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
         }
     } else {
         m->abs_current_fault_count = 0U;
+        s_hard_current_trip_consecutive[mi] = 0U;
+        s_startup_dc_trip_consecutive[mi] = 0U;
     }
 
     /* Configured VIN thresholds get a short consecutive-sample debounce to

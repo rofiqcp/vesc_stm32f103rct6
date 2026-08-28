@@ -15,7 +15,7 @@
  *   RX packet task polls DMA CNDTR; no duplicate software RX ring.
  *   DMA IRQ handlers delegate to STM32 HAL.
  */
-#define VESC_UART_RX_DMA_SIZE          512U
+#define VESC_UART_RX_DMA_SIZE          1024U
 #define VESC_UART_TX_FRAME_MAX         520U
 
 #if (VESC_UART_RX_DMA_SIZE & (VESC_UART_RX_DMA_SIZE - 1U)) != 0

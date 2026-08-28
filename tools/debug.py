@@ -53,6 +53,7 @@ COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
 COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP = 57
 COMM_DETECT_APPLY_ALL_FOC = 58
+COMM_GET_VALUES_SELECTIVE = 50
 COMM_PING_CAN = 62
 COMM_SET_CURRENT_REL = 84
 
@@ -74,6 +75,7 @@ CUSTOM_SENSOR_INFO = 0xA9
 CUSTOM_COMM_DIAG = 0xAA
 CUSTOM_CONFIG_SAVE = 0xAB
 CUSTOM_CONFIG_STATUS = 0xAC
+CUSTOM_BUZZER_TEST = 0xAD
 
 SENSOR_AUTO = 0
 SENSOR_HALL = 1
@@ -173,6 +175,11 @@ def be_u16(v: int) -> bytes:
 
 def be_i32(v: int) -> bytes:
     return struct.pack(">i", int(v))
+
+
+def be_u32(v: int) -> bytes:
+    """Canonical VESC big-endian uint32 encoder (buffer_append_uint32 ABI)."""
+    return struct.pack(">I", int(v) & 0xFFFFFFFF)
 
 
 class Reader:
@@ -764,6 +771,23 @@ def parse_comm_diag(p: bytes) -> dict:
                         if revision >= 15 and len(p)-r.i >= 12:
                             d['rx_restarts']=r.u32()
                             d['boot_stage']=r.u32(); d['boot_error']=r.u32()
+                        if revision >= 16 and len(p)-r.i >= 38:
+                            d['last_outer_cmd']=r.u8(); d['last_forward_target']=r.u8()
+                            d['last_forward_inner_cmd']=r.u8(); d['last_motor_context']=r.u8()
+                            d['last_reply_cmd']=r.u8(); d['last_tx_ok']=r.u8()
+                            d['buzzer_running']=bool(r.u8()); d['melody_active']=bool(r.u8())
+                            d['melody_index']=r.u8(); d['diag_reserved']=r.u8()
+                            d['get_values_m1']=r.u32(); d['get_values_m2']=r.u32()
+                            d['forward_m2_count']=r.u32(); d['forward_m2_reply_count']=r.u32()
+                            d['buzzer_hz']=r.u16(); d['buzzer_remaining']=r.u32()
+                            if len(p)-r.i >= 4:
+                                d['fault_snapshot_valid']=bool(r.u8()); d['fault_snapshot_motor']=r.u8()
+                                d['fault_snapshot_fault']=r.u8(); d['fault_snapshot_cal_stage']=r.u8()
+                            if len(p)-r.i >= 38:
+                                d['fault_raw_u']=r.u16(); d['fault_raw_v']=r.u16(); d['fault_raw_dc']=r.u16()
+                                d['fault_offset_u']=r.i32(); d['fault_offset_v']=r.i32(); d['fault_offset_dc']=r.i32()
+                                d['fault_ia_q15']=r.i32(); d['fault_ib_q15']=r.i32(); d['fault_ic_q15']=r.i32()
+                                d['fault_trip_q15']=r.i32(); d['fault_iq_target_q15']=r.i32()
     elif revision >= 5:
         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames','tx_ring_overruns','tx_complete_count','blocking_busy_drops','baud']
         for name in names: d[name]=r.u32()
@@ -779,6 +803,29 @@ def cmd_comm_diag(link: Link, _args: argparse.Namespace) -> int:
                    lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),1.0)
     d=parse_comm_diag(p)
     for k,v in d.items(): print(f"{k:22s}: {v}")
+    return 0
+
+
+def parse_buzzer_status(p: bytes) -> dict:
+    if len(p) != 13 or p[:2] != bytes((COMM_CUSTOM_APP_DATA, CUSTOM_BUZZER_TEST)):
+        raise ValueError("bukan buzzer-test reply")
+    r=Reader(p,2)
+    return {
+        "action": r.u8(), "accepted": bool(r.u8()), "running": bool(r.u8()),
+        "melody_active": bool(r.u8()), "melody_index": r.u8(),
+        "hz": r.u16(), "remaining": r.u32(),
+    }
+
+
+def cmd_buzzer_test(link: Link, args: argparse.Namespace) -> int:
+    action={"status":0,"melody":1,"beep":2,"stop":3}[args.mode]
+    p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_BUZZER_TEST,action)),
+                   lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_BUZZER_TEST)),1.0)
+    d=parse_buzzer_status(p)
+    print(d)
+    if args.mode in ("melody","beep") and not d["accepted"]:
+        print("Buzzer test ditolak karena salah satu motor sedang PWM aktif.")
+        return 3
     return 0
 
 
@@ -1625,16 +1672,21 @@ def cmd_can_scan(link: Link, _args: argparse.Namespace) -> int:
 
 def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     print("=== VESC TOOL DUAL BASIC PASSIVE CHECK ===")
+    def step(name: str):
+        print(f"[STEP] {name}", flush=True)
     # Direct/root controller.
+    step("M1 COMM_FW_VERSION")
     fw1=link.request(bytes((COMM_FW_VERSION,)), lambda x: bool(x) and x[0]==COMM_FW_VERSION, 2.0)
     i1=parse_fw_version(fw1)
     if (i1['major'],i1['minor']) != (6,0):
         raise ValueError(f"root FW ABI {i1['major']}.{i1['minor']} != 6.00")
+    step("M1 COMM_GET_VALUES (includes current_motor/current_in/Id/Iq/Vd/Vq)")
     v1=get_values(link,0)
     if v1.controller_id != 1:
         raise ValueError(f"root GET_VALUES controller_id={v1.controller_id}, expected 1")
 
     # Discovery is exactly what VESC Tool CAN Scan uses.
+    step("M1 COMM_PING_CAN")
     ping=link.request(bytes((COMM_PING_CAN,)), lambda x: bool(x) and x[0]==COMM_PING_CAN, 2.0)
     devs=parse_ping_can(ping)
     if devs != [2]:
@@ -1642,13 +1694,30 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
 
     # VESC Tool switches to the discovered node by wrapping requests in
     # COMM_FORWARD_CAN, ID 2. Replies remain normal inner replies.
+    step("M2 forwarded COMM_FW_VERSION")
     fw2=link.request_std(1,bytes((COMM_FW_VERSION,)), lambda x: bool(x) and x[0]==COMM_FW_VERSION, 2.0)
     i2=parse_fw_version(fw2)
     if (i2['major'],i2['minor']) != (6,0):
         raise ValueError(f"M2 FW ABI {i2['major']}.{i2['minor']} != 6.00")
     if i2['uuid'] == i1['uuid']:
         raise ValueError("M1/M2 UUID must differ for VESC Tool backup/identity")
-    v2=get_values(link,1)
+    step("M2 forwarded COMM_GET_VALUES")
+    try:
+        v2=get_values(link,1,2.0)
+    except TimeoutError:
+        print("[DIAG] M2 GET_VALUES timed out; requesting COMM_DIAG-v16 on local route...", flush=True)
+        try:
+            dp=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                            lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),1.0)
+            dd=parse_comm_diag(dp)
+            for k in ('revision','last_outer_cmd','last_forward_target','last_forward_inner_cmd',
+                      'last_motor_context','last_reply_cmd','last_tx_ok','get_values_m1','get_values_m2',
+                      'forward_m2_count','forward_m2_reply_count','stack_packet_free_bytes',
+                      'uart_errors','tx_ring_overruns','rx_ring_overruns'):
+                if k in dd: print(f"  {k:26s}: {dd[k]}")
+        except Exception as diag_exc:
+            print(f"[DIAG] COMM_DIAG unavailable too: {diag_exc}")
+        raise
     if v2.controller_id != 2:
         raise ValueError(f"forwarded GET_VALUES controller_id={v2.controller_id}, expected 2")
 
@@ -1656,8 +1725,9 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     # independent tail bits: 19=Vd (4 B), 20=Vq (4 B), 21=status (1 B).
     # A grouped 19=(Vd,Vq) layout can pass full GET_VALUES yet break the GUI
     # as soon as it changes the selective mask while polling a CAN-forwarded node.
+    step("M1/M2 COMM_GET_VALUES_SELECTIVE ABI")
     for motor in (0,1):
-        for bit,field_len in ((19,4),(20,4),(21,1)):
+        for bit,field_len in ((2,4),(3,4),(4,4),(5,4),(19,4),(20,4),(21,1)):
             mask=1 << bit
             req=bytes((COMM_GET_VALUES_SELECTIVE,))+be_u32(mask)
             rsp=link.request_std(motor,req,
@@ -1671,6 +1741,7 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     # Repeatedly alternate direct and forwarded FW_VERSION exactly as VESC Tool
     # does while changing selected devices. This catches leaked motor-thread 2
     # context: local must always return UUID1 and forwarded ID2 must return UUID2.
+    step("8x local <-> motor2 routing stress")
     for n in range(8):
         a=parse_fw_version(link.request(bytes((COMM_FW_VERSION,)),
                 lambda x: bool(x) and x[0]==COMM_FW_VERSION,2.0))
@@ -1682,6 +1753,7 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
             raise ValueError(f"dual route context leak on cycle {n+1}")
 
     # Both configuration read paths must be independently addressable.
+    step("M1/M2 MCCONF + APPCONF read")
     for motor,expected in ((0,1),(1,2)):
         mc_payload=link.request_std(motor,bytes((COMM_GET_MCCONF,)),lambda x: bool(x) and x[0]==COMM_GET_MCCONF,2.0)
         _validate_vesc6_wire(f"M{motor+1} MCCONF",mc_payload,COMM_GET_MCCONF,VESC6_MCCONF_WIRE_SIZE,VESC6_MCCONF_SIGNATURE)
@@ -1694,11 +1766,30 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     print(f"SCAN          : PASS  remote IDs={devs}")
     print(f"M2 FW/UUID/ID : PASS  {i2['major']}.{i2['minor']}  {i2['uuid']}  ID=2")
     print("M1/M2 VALUES  : PASS")
-    print("SELECTIVE ABI : PASS  bits 19=Vd, 20=Vq, 21=status")
+    print("SELECTIVE ABI : PASS  bits 2=I_motor, 3=I_in, 4=Id, 5=Iq, 19=Vd, 20=Vq, 21=status")
     print("ROUTE STRESS  : PASS  local/ID2 context stable")
     print("M1/M2 MCCONF  : PASS")
     print("M1/M2 APPCONF : PASS")
     print("PASS: basic VESC Tool dual-controller discovery/routing path is coherent")
+    return 0
+
+
+def cmd_rt_data_abi(link: Link, args: argparse.Namespace) -> int:
+    motors = (0, 1) if args.motor is None else (args.motor,)
+    for motor in motors:
+        print(f"=== M{motor+1} RT DATA / VESC 6.00 ABI ===")
+        v = get_values(link, motor, 2.0)
+        print(f"I_motor={v.imotor:+.3f} A  I_in={v.ibatt:+.3f} A  Id={v.id:+.3f} A  Iq={v.iq:+.3f} A")
+        print(f"Vd={v.vd:+.3f} V  Vq={v.vq:+.3f} V  ERPM={v.erpm}  duty={v.duty:+.4f}")
+        for bit,name,flen in ((2,'I_motor',4),(3,'I_in',4),(4,'Id',4),(5,'Iq',4),(19,'Vd',4),(20,'Vq',4),(21,'status',1)):
+            mask=1 << bit
+            req=bytes((COMM_GET_VALUES_SELECTIVE,))+be_u32(mask)
+            rsp=link.request_std(motor,req,lambda x: len(x)>=5 and x[0]==COMM_GET_VALUES_SELECTIVE,2.0)
+            expected=1+4+flen
+            if len(rsp)!=expected or int.from_bytes(rsp[1:5],'big')!=mask:
+                raise ValueError(f"M{motor+1} {name}: selective ABI mismatch len={len(rsp)} expected={expected}")
+            print(f"  bit{bit:02d} {name:8s}: PASS ({flen} byte field)")
+    print("PASS: VESC RT Data current_motor/current_in/Id/Iq/Vd/Vq ABI")
     return 0
 
 
@@ -1936,9 +2027,24 @@ def self_test() -> int:
     assert dd14['tx_queue_busy_drops']==4 and dd14['tx_low_priority_drops']==5
     assert dd14['rx_restarts']==6 and dd14['boot_stage']==100 and dd14['boot_error']==0
 
+    d16=bytearray(d14)
+    d16[2]=16
+    d16 += bytes((4,2,4,2,4,1,1,1,7,0))
+    d16 += struct.pack(">IIIIHI", 11,12,13,14,1976,12345)
+    d16 += bytes((1,0,6,2))
+    d16 += struct.pack(">HHHiiiiiiii", 2050,2040,1980,2000,2010,1990,100,200,-50,1600,450)
+    dd16=parse_comm_diag(bytes(d16))
+    assert dd16['last_forward_target']==2 and dd16['last_forward_inner_cmd']==4
+    assert dd16['get_values_m2']==12 and dd16['forward_m2_reply_count']==14
+    assert dd16['buzzer_hz']==1976 and dd16['fault_snapshot_fault']==6
+
+    bz=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_BUZZER_TEST,1,1,1,1,3))+struct.pack(">HI",1319,1234)
+    bzd=parse_buzzer_status(bz)
+    assert bzd['accepted'] and bzd['melody_active'] and bzd['hz']==1319 and bzd['remaining']==1234
+
     print("SELF-TEST PASS: CRC/framing, VESC-6.00 FW/config, local-ID2 forwarding, "
           "sample/ADC parser, current-cal-v17 robust/MOE ABI, EXT-v6 telemetry, "
-          "COMM_DIAG-v15 resources/boot, sensor/observer diagnostics")
+          "COMM_DIAG-v16 command/current/buzzer trace, resources/boot, sensor/observer diagnostics")
     return 0
 
 def add_live_args(p: argparse.ArgumentParser) -> None:
@@ -1964,8 +2070,11 @@ def main() -> int:
     p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=0.5); p.add_argument("--attempts",type=int,default=5)
     p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake"); p.add_argument("--bauds",default="115200,230400,250000,460800,921600"); p.add_argument("--timeout",type=float,default=0.6)
     sp("comm-diag",cmd_comm_diag,"read firmware USART3 DMA/IRQ/RTOS diagnostics")
+    p=sp("buzzer-test",cmd_buzzer_test,"status/replay the 3.21 s power-on melody or a short buzzer beep")
+    p.add_argument("--mode",choices=["status","melody","beep","stop"],default="status")
     sp("can-scan",cmd_can_scan,"VESC Tool-compatible COMM_PING_CAN scan; must discover local motor-2 ID 2")
     sp("vesc-tool-dual-basic",cmd_vesc_tool_dual_basic,"passive end-to-end VESC Tool dual-controller discovery/routing/config check")
+    p=sp("rt-data-abi",cmd_rt_data_abi,"verify VESC RT Data I_motor/I_in/Id/Iq/Vd/Vq full + selective ABI"); p.add_argument("--motor",type=int,choices=[0,1])
     sp("motor2-forward",cmd_motor2_forward,"verify local second-motor forwarding ID 2 with FW_VERSION")
     sp("config-status",cmd_config_status,"read flash-emulated persistent config status")
     sp("config-save",cmd_config_save,"save runtime Hall/encoder/PID/timeout config to flash")

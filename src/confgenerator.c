@@ -109,242 +109,8 @@ static bool runtime_mc_auto_fields_finite(const uint8_t *w) {
     return true;
 }
 
-static bool runtime_mc_supported_ranges_valid(const uint8_t *w) {
-    /* For every VESC-6.00 field that this reduced controller actually applies
-       to hardware/runtime, ACK only values that can be represented without a
-       hidden clamp. This keeps the canonical VESC Tool image and MotorRuntime
-       semantically identical. Unsupported UI/subsystem fields remain raw-wire
-       preserved and are intentionally not interpreted here. */
-    const float current_max = get_auto_at(w, VESC6_MC_OFF_L_CURRENT_MAX);
-    const float current_min = get_auto_at(w, VESC6_MC_OFF_L_CURRENT_MIN);
-    const float input_max = get_auto_at(w, VESC6_MC_OFF_L_IN_CURRENT_MAX);
-    const float input_min = get_auto_at(w, VESC6_MC_OFF_L_IN_CURRENT_MIN);
-    const float abs_current = get_auto_at(w, VESC6_MC_OFF_L_ABS_CURRENT_MAX);
-    const float min_erpm = get_auto_at(w, VESC6_MC_OFF_L_MIN_ERPM);
-    const float max_erpm = get_auto_at(w, VESC6_MC_OFF_L_MAX_ERPM);
-    const float erpm_start = get_f16_at(w, VESC6_MC_OFF_L_ERPM_START, 10000.0f);
-    const float min_vin = get_auto_at(w, VESC6_MC_OFF_L_MIN_VIN);
-    const float max_vin = get_auto_at(w, VESC6_MC_OFF_L_MAX_VIN);
-    const float min_duty = get_f16_at(w, VESC6_MC_OFF_L_MIN_DUTY, 10000.0f);
-    const float max_duty = get_f16_at(w, VESC6_MC_OFF_L_MAX_DUTY, 10000.0f);
-    const float watt_max = get_auto_at(w, VESC6_MC_OFF_L_WATT_MAX);
-    const float watt_min = get_auto_at(w, VESC6_MC_OFF_L_WATT_MIN);
-    const float cur_max_scale = get_f16_at(w, VESC6_MC_OFF_L_CURRENT_MAX_SCALE, 10000.0f);
-    const float cur_min_scale = get_f16_at(w, VESC6_MC_OFF_L_CURRENT_MIN_SCALE, 10000.0f);
-    const float duty_start = get_f16_at(w, VESC6_MC_OFF_L_DUTY_START, 10000.0f);
-    const float temp_fet_start = get_f16_at(w, VESC6_MC_OFF_L_TEMP_FET_START, 10.0f);
-    const float temp_fet_end = get_f16_at(w, VESC6_MC_OFF_L_TEMP_FET_END, 10.0f);
-    const float temp_motor_start = get_f16_at(w, VESC6_MC_OFF_L_TEMP_MOTOR_START, 10.0f);
-    const float temp_motor_end = get_f16_at(w, VESC6_MC_OFF_L_TEMP_MOTOR_END, 10.0f);
-    const float temp_accel_dec = get_f16_at(w, VESC6_MC_OFF_L_TEMP_ACCEL_DEC, 10000.0f);
-
-    if (current_max < 0.1f || current_max > FOC_MAX_CURRENT_A ||
-        current_min < -FOC_MAX_CURRENT_A || current_min > 0.0f ||
-        input_max < 0.0f || input_max > FOC_MAX_CURRENT_A ||
-        input_min < -FOC_MAX_CURRENT_A || input_min > 0.0f ||
-        abs_current < fmaxf(current_max, fabsf(current_min)) ||
-        abs_current > FOC_ABS_CURRENT_TRIP_A ||
-        min_erpm < -MOTOR_DEFAULT_MAX_ERPM || min_erpm > -1.0f ||
-        max_erpm < 1.0f || max_erpm > MOTOR_DEFAULT_MAX_ERPM || min_erpm >= max_erpm ||
-        !isfinite(erpm_start) || erpm_start < 0.0f || erpm_start > 1.0f ||
-        min_vin < VBUS_MIN_RUN_V || min_vin > (VBUS_MAX_RUN_V - 0.5f) ||
-        max_vin > VBUS_MAX_RUN_V || max_vin < (min_vin + 0.5f) ||
-        get_auto_at(w, VESC6_MC_OFF_L_BAT_CUT_END) < min_vin ||
-        get_auto_at(w, VESC6_MC_OFF_L_BAT_CUT_START) > max_vin ||
-        get_auto_at(w, VESC6_MC_OFF_L_BAT_CUT_START) <= get_auto_at(w, VESC6_MC_OFF_L_BAT_CUT_END) ||
-        min_duty < 0.0f || max_duty < 0.01f || max_duty > 0.98f ||
-        min_duty > max_duty || !isfinite(watt_max) || !isfinite(watt_min) ||
-        watt_max < 0.0f || watt_min > 0.0f || watt_min >= watt_max ||
-        cur_max_scale < 0.0f || cur_max_scale > 1.0f ||
-        cur_min_scale < 0.0f || cur_min_scale > 1.0f ||
-        duty_start < 0.0f || duty_start > 1.0f ||
-        !isfinite(temp_fet_start) || !isfinite(temp_fet_end) ||
-        temp_fet_start < HOVERBOARD_MCU_TEMP_MIN_VALID_C ||
-        temp_fet_end > HOVERBOARD_MCU_TEMP_MAX_VALID_C ||
-        temp_fet_end <= temp_fet_start + 0.5f ||
-        !isfinite(temp_motor_start) || !isfinite(temp_motor_end) ||
-        temp_motor_start < -100.0f || temp_motor_end > 250.0f ||
-        temp_motor_end <= temp_motor_start + 0.5f ||
-        !isfinite(temp_accel_dec) || temp_accel_dec < 0.0f || temp_accel_dec > 1.0f) return false;
-
-    const float current_kp = get_auto_at(w, VESC6_MC_OFF_FOC_CURRENT_KP);
-    const float current_ki = get_auto_at(w, VESC6_MC_OFF_FOC_CURRENT_KI);
-    const float pll_kp = get_auto_at(w, 153U);
-    const float pll_ki = get_auto_at(w, 157U);
-    const float motor_l = get_auto_at(w, 161U);
-    const float ld_lq = get_auto_at(w, 165U);
-    const float motor_r = get_auto_at(w, 169U);
-    const float flux = get_auto_at(w, 173U);
-    const float observer_gain = get_auto_at(w, 177U);
-    const float observer_gain_slow = get_auto_at(w, 181U);
-    const uint8_t sat_comp_mode = w[VESC6_MC_OFF_FOC_SAT_COMP_MODE];
-    const float sat_comp = get_f16_at(w, VESC6_MC_OFF_FOC_SAT_COMP, 1000.0f);
-    const uint8_t observer_type = w[VESC6_MC_OFF_FOC_OBSERVER_TYPE];
-    const bool sample_v0_v7 = w[VESC6_MC_OFF_FOC_SAMPLE_V0_V7] != 0U;
-    const bool sample_high_current = w[VESC6_MC_OFF_FOC_SAMPLE_HIGH_CURRENT] != 0U;
-    const float openloop_rpm = get_auto_at(w, 201U);
-    const float openloop_rpm_low = get_f16_at(w, 205U, 1000.0f);
-    const float sl_hyst = get_f16_at(w, 211U, 100.0f);
-    const float sl_lock = get_f16_at(w, 213U, 100.0f);
-    const float sl_ramp = get_f16_at(w, 215U, 100.0f);
-    const float sl_time = get_f16_at(w, 217U, 100.0f);
-    const float sl_boost = get_f16_at(w, 219U, 100.0f);
-    const float sl_max_q = get_f16_at(w, 221U, 100.0f);
-    const float hall_interp = get_auto_at(w, VESC6_MC_OFF_FOC_HALL_INTERP_ERPM);
-    const float sl_erpm = get_auto_at(w, VESC6_MC_OFF_FOC_SL_ERPM);
-    const float obs_offset = get_f16_at(w, VESC6_MC_OFF_FOC_OBSERVER_OFFSET, 1000.0f);
-    const float down_kp = get_auto_at(w, VESC6_MC_OFF_FOC_DUTY_DOWNRAMP_KP);
-    const float down_ki = get_auto_at(w, VESC6_MC_OFF_FOC_DUTY_DOWNRAMP_KI);
-    const float start_curr_dec = get_f16_at(w, VESC6_MC_OFF_FOC_START_CURR_DEC, 10000.0f);
-    const float start_curr_dec_rpm = get_auto_at(w, VESC6_MC_OFF_FOC_START_CURR_DEC_RPM);
-    const float current_filter = get_f16_at(w, VESC6_MC_OFF_FOC_CURRENT_FILTER_CONST, 10000.0f);
-    const uint8_t decoupling = w[VESC6_MC_OFF_FOC_CC_DECOUPLING];
-    const uint8_t mtpa_mode = w[VESC6_MC_OFF_FOC_MTPA_MODE];
-    const float fw_max = get_auto_at(w, VESC6_MC_OFF_FOC_FW_CURRENT_MAX);
-    const float fw_duty = get_f16_at(w, VESC6_MC_OFF_FOC_FW_DUTY_START, 10000.0f);
-    const float fw_ramp = get_f16_at(w, VESC6_MC_OFF_FOC_FW_RAMP_TIME, 1000.0f);
-    const float fw_q = get_f16_at(w, VESC6_MC_OFF_FOC_FW_Q_CURRENT_FACTOR, 10000.0f);
-    const uint8_t foc_speed_source = w[VESC6_MC_OFF_FOC_SPEED_SOURCE];
-    if (current_kp < 0.00001f || current_kp > 10.0f ||
-        current_ki < 0.0f || current_ki > 200000.0f ||
-        pll_kp < 0.0f || pll_kp > 100000.0f ||
-        pll_ki < 0.0f || pll_ki > 1000000.0f ||
-        motor_l < 1.0e-7f || motor_l > 0.1f ||
-        ld_lq < -0.1f || ld_lq > 0.1f ||
-        motor_r < 1.0e-5f || motor_r > 100.0f ||
-        flux < 1.0e-6f || flux > (FOC_FLUX_Q_BASE_WB * 1.90f) ||
-        observer_gain < 0.0f || observer_gain > 1000000.0f ||
-        observer_gain_slow < 0.0f || observer_gain_slow > 1.0f ||
-        sat_comp_mode > SAT_COMP_LAMBDA_AND_FACTOR ||
-        !isfinite(sat_comp) || sat_comp < 0.0f || sat_comp > 1.0f ||
-        observer_type > FOC_OBSERVER_MXV_LAMBDA_COMP_LIN ||
-        foc_speed_source > FOC_SPEED_SRC_OBSERVER ||
-        /* Shared ADC1/2 dual-motor topology has one coherent sample instant
-           per PWM period. V0/V7 alternation and high-current resampling cannot
-           be represented safely on this board and must never be ACKed. */
-        sample_v0_v7 || sample_high_current ||
-        openloop_rpm < 10.0f || openloop_rpm > MOTOR_DEFAULT_MAX_ERPM ||
-        openloop_rpm_low < 0.0f || openloop_rpm_low > MOTOR_DEFAULT_MAX_ERPM ||
-        sl_hyst < 0.0f || sl_hyst > 100.0f ||
-        sl_lock < 0.0f || sl_lock > 20.0f ||
-        sl_ramp < 0.01f || sl_ramp > 20.0f ||
-        sl_time < 0.01f || sl_time > 20.0f ||
-        sl_boost < 0.0f || sl_boost > FOC_MAX_CURRENT_A ||
-        sl_max_q < 0.1f || sl_max_q > FOC_MAX_CURRENT_A ||
-        hall_interp < 0.0f || hall_interp > MOTOR_DEFAULT_MAX_ERPM ||
-        sl_erpm < 10.0f || sl_erpm > MOTOR_DEFAULT_MAX_ERPM ||
-        !isfinite(obs_offset) || obs_offset < -10.0f || obs_offset > 10.0f ||
-        !isfinite(down_kp) || down_kp < 0.0f || down_kp > 100000.0f ||
-        !isfinite(down_ki) || down_ki < 0.0f || down_ki > 1000000.0f ||
-        !isfinite(start_curr_dec) || start_curr_dec < 0.0f || start_curr_dec > 1.0f ||
-        !isfinite(start_curr_dec_rpm) || start_curr_dec_rpm < 0.0f || start_curr_dec_rpm > MOTOR_DEFAULT_MAX_ERPM ||
-        !isfinite(current_filter) || current_filter < 0.0f || current_filter > 1.0f ||
-        decoupling > FOC_CC_DECOUPLING_CROSS_BEMF ||
-        mtpa_mode > MTPA_MODE_IQ_MEASURED ||
-        !isfinite(fw_max) || fw_max < 0.0f || fw_max > FOC_MAX_CURRENT_A ||
-        !isfinite(fw_duty) || fw_duty < 0.0f || fw_duty > 1.0f ||
-        !isfinite(fw_ramp) || fw_ramp < 0.01f || fw_ramp > 30.0f ||
-        !isfinite(fw_q) || fw_q < 0.0f || fw_q > 1.0f) return false;
-
-    const float s_kp = get_auto_at(w, VESC6_MC_OFF_S_PID_KP);
-    const float s_ki = get_auto_at(w, VESC6_MC_OFF_S_PID_KI);
-    const float s_kd = get_auto_at(w, VESC6_MC_OFF_S_PID_KD);
-    const float s_kdf = get_f16_at(w, 342U, 10000.0f);
-    const float s_min_erpm = get_auto_at(w, 344U);
-    const uint8_t s_allow_braking = w[348U];
-    const float s_ramp = get_auto_at(w, 349U);
-    const float p_kp = get_auto_at(w, VESC6_MC_OFF_P_PID_KP);
-    const float p_ki = get_auto_at(w, VESC6_MC_OFF_P_PID_KI);
-    const float p_kd = get_auto_at(w, VESC6_MC_OFF_P_PID_KD);
-    const float p_kd_proc = get_auto_at(w, 365U);
-    const float p_kdf = get_f16_at(w, 369U, 10000.0f);
-    const float p_ang_div = get_auto_at(w, 371U);
-    const float p_gain_dec = get_f16_at(w, 375U, 10.0f);
-    const float p_offset = get_auto_at(w, 377U);
-    const float cc_min_current = get_auto_at(w, 383U);
-    const float enc_off = get_auto_at(w, VESC6_MC_OFF_FOC_ENCODER_OFFSET);
-    const float enc_ratio = get_auto_at(w, VESC6_MC_OFF_FOC_ENCODER_RATIO);
-    const float gear = get_auto_at(w, VESC6_MC_OFF_SI_GEAR_RATIO);
-    const float wheel = get_auto_at(w, VESC6_MC_OFF_SI_WHEEL_DIAMETER);
-    const float batt_ah = get_auto_at(w, VESC6_MC_OFF_SI_BATTERY_AH);
-    const float nl_current = get_auto_at(w, VESC6_MC_OFF_SI_MOTOR_NL_CURRENT);
-    if (s_kp < 0.0f || s_kp > 1000.0f || s_ki < 0.0f || s_ki > 1000.0f ||
-        s_kd < 0.0f || s_kd > 1000.0f || s_kdf < 0.0f || s_kdf > 1.0f ||
-        !isfinite(s_min_erpm) || s_min_erpm < 0.0f || s_min_erpm > MOTOR_DEFAULT_MAX_ERPM ||
-        s_allow_braking > 1U || !isfinite(s_ramp) || s_ramp < 0.0f || s_ramp > 1000000.0f ||
-        p_kp < 0.0f || p_kp > 1000.0f || p_ki < 0.0f || p_ki > 1000.0f ||
-        p_kd < 0.0f || p_kd > 1000.0f || !isfinite(p_kd_proc) || p_kd_proc < 0.0f || p_kd_proc > 1000.0f ||
-        p_kdf < 0.0f || p_kdf > 1.0f || !isfinite(p_ang_div) || p_ang_div < 0.01f || p_ang_div > 1000.0f ||
-        !isfinite(p_gain_dec) || p_gain_dec < 0.0f || p_gain_dec > 3600.0f ||
-        !isfinite(p_offset) || p_offset < -36000.0f || p_offset > 36000.0f ||
-        !isfinite(cc_min_current) || cc_min_current < 0.0f || cc_min_current > FOC_MAX_CURRENT_A ||
-        enc_off < 0.0f || enc_off >= 360.0f || enc_ratio <= 0.0f || enc_ratio > 1000.0f ||
-        gear < 0.01f || gear > 1000.0f || wheel < 0.001f || wheel > 10.0f ||
-        batt_ah < 0.0f || batt_ah > 10000.0f ||
-        nl_current < 0.0f || nl_current > FOC_MAX_CURRENT_A) {
-        return false;
-    }
-    return true;
-}
-
 static bool byte_in_range(uint16_t i, uint16_t off, uint16_t len) {
     return i >= off && i < (uint16_t)(off + len);
-}
-
-static bool mc_wire_byte_runtime_mutable(uint16_t i) {
-    /* Only bytes whose VESC-6.00 fields have a real runtime backend in this
-       STM32F103 build are writable. Every other byte still participates in
-       the exact 481-byte wire image and flash CRC, but changing it is rejected
-       rather than ACKed and silently ignored. */
-    if (byte_in_range(i, VESC6_MC_OFF_L_CURRENT_MAX, 30U)) return true; /* current + ERPM + l_erpm_start */
-    if (byte_in_range(i, VESC6_MC_OFF_L_MIN_VIN, 17U)) return true;    /* VIN + battery cut + slow abs */
-    if (byte_in_range(i, VESC6_MC_OFF_L_TEMP_FET_START, 10U)) return true; /* thermal limits + accel derate */
-    if (byte_in_range(i, VESC6_MC_OFF_L_MIN_DUTY, 4U)) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_L_WATT_MAX, 14U)) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_CURRENT_KP, 8U)) return true;
-    if (i == VESC6_MC_OFF_FOC_ENCODER_INVERTED) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_ENCODER_OFFSET, 8U)) return true;
-    if (i == VESC6_MC_OFF_FOC_SENSOR_MODE) return true;
-    if (byte_in_range(i, 153U, 8U)) return true; /* fixed-point PLL Kp/Ki */
-    /* L, Ld-Lq, R and flux all have real fixed-point or slow-loop backends. */
-    if (byte_in_range(i, 161U, 8U)) return true; /* foc_motor_l + Ld-Lq (MTPA) */
-    if (byte_in_range(i, 169U, 8U)) return true; /* foc_motor_r + flux */
-    if (byte_in_range(i, 177U, 8U)) return true; /* observer gain + slow gain */
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_OBSERVER_OFFSET, 10U)) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_START_CURR_DEC, 6U)) return true;
-    if (byte_in_range(i, 201U, 6U)) return true; /* openloop rpm + low */
-    /* foc_sl_openloop_hyst (211..212) has no verified VESC-6.00 backend in
-       this reduced state machine. Keep it immutable rather than ACKing a shadow
-       value. Lock/ramp/time/boost/max-Q and Hall table are real backends. */
-    if (byte_in_range(i, 213U, 18U)) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_HALL_INTERP_ERPM, 4U)) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_SL_ERPM, 4U)) return true;
-    if (i == VESC6_MC_OFF_FOC_SAT_COMP_MODE ||
-        byte_in_range(i, VESC6_MC_OFF_FOC_SAT_COMP, 2U)) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_CURRENT_FILTER_CONST, 3U)) return true; /* filter + decoupling */
-    /* Part 2 implements the VESC-6 observer family (0..3) plus the later MXV
-       family (4..6) in the fixed-point F103 backend. The same one-byte wire
-       slot is used without changing the advertised 6.00 MCCONF size. */
-    if (i == VESC6_MC_OFF_FOC_OBSERVER_TYPE) return true;
-    if (i == VESC6_MC_OFF_FOC_MTPA_MODE) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_FOC_FW_CURRENT_MAX, 10U)) return true;
-    /* VESC 6.00 already owns byte 314 as foc_speed_soure (sic upstream). */
-    if (i == VESC6_MC_OFF_FOC_SPEED_SOURCE) return true;
-    /* VESC6 speed PID: kp/ki/kd, D-filter, min-ERPM, allow-braking, ramp. */
-    if (byte_in_range(i, VESC6_MC_OFF_S_PID_KP, 23U)) return true;
-    /* VESC6 position PID: kp/ki/kd/kd_proc/filter/ang_div/gain-dec/offset. */
-    if (byte_in_range(i, VESC6_MC_OFF_P_PID_KP, 28U)) return true;
-    /* FOC upstream consumes cc_min_current for modulation release. The other
-       three cc_* fields belong to the legacy trapezoidal BLDC current-to-duty
-       controller (motor/mcpwm.c) and are not consumed by upstream mcpwm_foc.c.
-       Preserve them byte-exact but immutable in this FOC-only firmware. */
-    if (byte_in_range(i, 383U, 4U)) return true;
-    if (byte_in_range(i, VESC6_MC_OFF_M_ENCODER_COUNTS, 4U)) return true;
-    if (i == VESC6_MC_OFF_M_SENSOR_PORT_MODE || i == VESC6_MC_OFF_M_INVERT_DIRECTION) return true;
-    /* SI motor poles/gear/wheel/battery type/cells/Ah feed setup telemetry.
-       si_motor_nl_current has no runtime consumer in this port. */
-    if (byte_in_range(i, VESC6_MC_OFF_SI_MOTOR_POLES, 15U)) return true;
-    return false;
 }
 
 static bool app_wire_byte_runtime_mutable(uint16_t i) {
@@ -356,14 +122,6 @@ static bool app_wire_byte_runtime_mutable(uint16_t i) {
     if (byte_in_range(i, VESC6_APP_OFF_ADC_CTRL_TYPE, 49U)) return true;
     if (byte_in_range(i, VESC6_APP_OFF_UART_BAUD, 4U)) return true;
     return false;
-}
-
-static bool unsupported_mc_bytes_unchanged(motor_id_t id, const uint8_t *wire) {
-    if (id != MOTOR_LEFT && id != MOTOR_RIGHT) return false;
-    for (uint16_t i = 0U; i < VESC6_MCCONF_WIRE_SIZE; i++) {
-        if (!mc_wire_byte_runtime_mutable(i) && wire[i] != s_mc_active[id][i]) return false;
-    }
-    return true;
 }
 
 static bool unsupported_app_bytes_unchanged(const uint8_t *wire) {
@@ -396,10 +154,10 @@ static void build_foc_hall(const MotorRuntime *m,uint8_t out[8]) {
     memcpy(out,m->foc_hall_table,8);
 }
 
-/* VESC 6.00 wire image. Unsupported subsystems keep conservative values.
-   Their bytes remain part of the exact 481-byte ABI and flash record, but are
-   immutable through SET_MCCONF so the firmware never ACKs a setting that has
-   no real runtime backend. */
+/* VESC 6.00 wire image. Unsupported subsystems start from conservative
+   defaults, but all 481 bytes remain part of the canonical generated ABI and
+   are preserved through SET/GET/flash exactly like upstream VESC. apply_mc()
+   only consumes the subset that has a real STM32F103 runtime backend. */
 static bool build_mc_default(uint8_t *b,motor_id_t id) {
     MotorRuntime *m=motor_get(id); bool right=id==MOTOR_RIGHT; bool mr=runtime_mc_ready(m); int32_t i=0;
     bool left_encoder = !right && ((mr && m->sensor_mode==SENSOR_MODE_ENCODER) ||
@@ -577,7 +335,17 @@ static bool apply_mc(motor_id_t id,const uint8_t *w) {
         if (w[152] != FOC_SENSOR_MODE_SENSORLESS &&
             w[152] != VESC_FOC_SENSOR_HALL) return false;
     }
-    if (!runtime_mc_auto_fields_finite(w) || !runtime_mc_supported_ranges_valid(w)) return false;
+    if (!runtime_mc_auto_fields_finite(w)) return false;
+    /* Match upstream VESC generated-MCCONF semantics: do not reject a complete
+       6.00 configuration merely because this reduced F103 backend does not
+       execute every UI field. Only enums that are dereferenced by the local
+       FOC backend are range-checked here; numeric fields used by hardware are
+       bounded below before assignment. The complete wire image is preserved. */
+    if (w[VESC6_MC_OFF_FOC_CC_DECOUPLING] > FOC_CC_DECOUPLING_CROSS_BEMF ||
+        w[VESC6_MC_OFF_FOC_SAT_COMP_MODE] > SAT_COMP_LAMBDA_AND_FACTOR ||
+        w[VESC6_MC_OFF_FOC_OBSERVER_TYPE] > FOC_OBSERVER_MXV_LAMBDA_COMP_LIN ||
+        w[VESC6_MC_OFF_FOC_MTPA_MODE] > MTPA_MODE_IQ_MEASURED ||
+        w[VESC6_MC_OFF_FOC_SPEED_SOURCE] > FOC_SPEED_SRC_OBSERVER) return false;
     m->pwm_mode=(mc_pwm_mode)w[4];
     m->comm_mode=(mc_comm_mode)w[5];
     m->motor_type=MOTOR_TYPE_FOC;
@@ -704,10 +472,9 @@ static bool apply_mc(motor_id_t id,const uint8_t *w) {
     m->foc_offsets_cal_mode=MCCONF_FOC_OFFSETS_CAL_MODE_DEFAULT;
     m->foc_openloop_rpm=clampf(get_auto_at(w,201),10.0f,MOTOR_DEFAULT_MAX_ERPM);
     {int32_t q=205;m->foc_openloop_rpm_low=clampf(vesc_buf_get_float16(w,1000.0f,&q),0.0f,MOTOR_DEFAULT_MAX_ERPM);}
-    /* foc_d_gain_scale_start/max_mod are present in the VESC-6.00 wire image,
-       but this backend does not implement that controller feature. The SET
-       ownership gate keeps those bytes immutable instead of silently ignoring
-       a user change. */
+    /* foc_d_gain_scale_start/max_mod are part of the VESC-6.00 wire image.
+       This backend preserves them byte-exact for VESC Tool compatibility even
+       though they do not have a local controller consumer. */
     {int32_t q=211;m->foc_sl_openloop_hyst=clampf(vesc_buf_get_float16(w,100.0f,&q),0.0f,100.0f);}
     {int32_t q=213;m->foc_sl_openloop_time_lock=clampf(vesc_buf_get_float16(w,100.0f,&q),0.0f,20.0f);}
     {int32_t q=215;m->foc_sl_openloop_time_ramp=clampf(vesc_buf_get_float16(w,100.0f,&q),0.01f,20.0f);}
@@ -771,7 +538,13 @@ static bool apply_mc(motor_id_t id,const uint8_t *w) {
         m->encoder.phase_per_count_q16=(uint32_t)step;
         /* VESC 6.00 wire encoder enum is 1. Map it to the internal A/B-only
            runtime strategy used by this board without changing the wire ABI. */
-        if (enc && w[VESC6_MC_OFF_M_SENSOR_PORT_MODE] != VESC_SENSOR_PORT_ABI) return false;
+        /* Upstream VESC keeps foc_sensor_mode and m_sensor_port_mode as
+           independent MCCONF fields. On this fixed hoverboard PCB the actual
+           mux is known: encoder FOC uses the LEFT ABI input, while Hall and
+           sensorless use the benign Hall GPIO input. Preserve the requested
+           m_sensor_port_mode byte for VESC Tool round-trip compatibility, but
+           derive the physical mux from foc_sensor_mode instead of rejecting a
+           perfectly valid VESC configuration image. */
         m->foc_sensor_mode = enc ? FOC_SENSOR_MODE_ENCODER_AB : (mc_foc_sensor_mode)w[VESC6_MC_OFF_FOC_SENSOR_MODE];
         m->sensor_request_mode=enc?SENSOR_MODE_ENCODER:SENSOR_MODE_HALL;
         if(enc) {
@@ -880,16 +653,28 @@ static bool apply_app(const uint8_t *w) {
     return true;
 }
 
-/* Portable range validation mirroring VESC commands_apply_mcconf_hw_limits
-   (the portion that needs no board-specific HW_LIM_* macros). This port
-   forces foc_overmod_factor and foc_sl_erpm_start to fixed defaults in
-   apply_mc(), so clamping them here is a harmless no-op; the three
-   l_*_scale / l_erpm_start fields ARE carried on the VESC-6.00 wire image
-   and are clamped into s_mc_active[] by the call site below. The hardware
-   limit clamping half of the VESC function is covered by the apply_mc()
-   preflight, which rejects anything outside the F103 envelope. */
+/* Board-side counterpart of VESC commands_apply_mcconf_hw_limits(). Keep
+   generated MCCONF semantics intact while truncating only values constrained
+   by the STM32F103 hoverboard power stage. The call site writes every such
+   truncation back to the canonical wire image before persistence/readback. */
 void vesc_config_apply_mcconf_hw_limits(mc_configuration *mcconf) {
     if (mcconf == NULL) return;
+    /* Same model as upstream commands_apply_mcconf_hw_limits(): values that
+       are genuinely constrained by this power stage are truncated before the
+       configuration is stored, so GET_MCCONF reports the value that is really
+       executed. UI-only generated fields are not modified. */
+    utils_truncate_number(&mcconf->l_current_max, 0.1f, FOC_MAX_CURRENT_A);
+    utils_truncate_number(&mcconf->l_current_min, -FOC_MAX_CURRENT_A, 0.0f);
+    utils_truncate_number(&mcconf->l_in_current_max, 0.0f, FOC_MAX_CURRENT_A);
+    utils_truncate_number(&mcconf->l_in_current_min, -FOC_MAX_CURRENT_A, 0.0f);
+    float abs_floor = fmaxf(mcconf->l_current_max, fabsf(mcconf->l_current_min));
+    utils_truncate_number(&mcconf->l_abs_current_max, abs_floor, FOC_ABS_CURRENT_TRIP_A);
+    utils_truncate_number(&mcconf->l_min_erpm, -MOTOR_DEFAULT_MAX_ERPM, -1.0f);
+    utils_truncate_number(&mcconf->l_max_erpm, 1.0f, MOTOR_DEFAULT_MAX_ERPM);
+    utils_truncate_number(&mcconf->l_min_vin, VBUS_MIN_RUN_V, VBUS_MAX_RUN_V - 0.5f);
+    utils_truncate_number(&mcconf->l_max_vin, mcconf->l_min_vin + 0.5f, VBUS_MAX_RUN_V);
+    utils_truncate_number(&mcconf->l_max_duty, 0.01f, 0.98f);
+    utils_truncate_number(&mcconf->l_min_duty, 0.0f, mcconf->l_max_duty);
     utils_truncate_number(&mcconf->l_current_max_scale, 0.0f, 1.0f);
     utils_truncate_number(&mcconf->l_current_min_scale, 0.0f, 1.0f);
     utils_truncate_number(&mcconf->l_erpm_start, 0.0f, 1.0f);
@@ -900,31 +685,46 @@ void vesc_config_apply_mcconf_hw_limits(mc_configuration *mcconf) {
 bool vesc_config_set_mc_wire(motor_id_t id,const uint8_t *wire,uint16_t len,bool store){
     vesc_config_init_defaults(); if(!wire||len!=VESC6_MCCONF_WIRE_SIZE||!sig_ok(wire,VESC6_MCCONF_SIGNATURE))return false;
     if(id!=MOTOR_LEFT && id!=MOTOR_RIGHT) return false;
-    if(!unsupported_mc_bytes_unchanged(id,wire)) return false;
+    /* VESC 6.00 stores the complete generated MCCONF image. Do the same:
+       preserve every byte that VESC Tool sends, even when this reduced F103
+       backend does not consume that particular field at run time. Runtime
+       safety is enforced by apply_mc() for the subset that affects hardware.
+       Rejecting unrelated bytes made VESC Tool re-read the old image and show
+       "Parameters truncated" for otherwise valid sensor-mode changes. */
     /* Same-value writes are idempotent. In particular, do not revoke the
        LEFT no-index encoder alignment just because VESC Tool writes back the
        configuration it has just read. */
     if(memcmp(wire,s_mc_active[id],VESC6_MCCONF_WIRE_SIZE)==0){return !store||conf_general_store_mc_wire_persistent(id,s_mc_active[id]);}
     MotorRuntime *m=motor_get(id); if(m->pwm_enabled||m->detect.busy)return false; motor_stop(m);
     memcpy(s_rollback_mc[id],s_mc_active[id],sizeof(s_rollback_mc[id]));memcpy(s_mc_active[id],wire,len);
-    /* Portable range validation (VESC commands_apply_mcconf_hw_limits, the
-       HW_LIM_*,-free part). The wire image carries l_current_max_scale /
-       l_current_min_scale / l_erpm_start as floats; decode, clamp the 5
-       fields, then write the wire-backed ones back so apply_mc() sees the
-       truncated values. foc_overmod_factor / foc_sl_erpm_start are
-       forced to defaults later in apply_mc(), so their clamp is cosmetic. */
+    /* Apply the board hardware limits before storing, like upstream VESC.
+       Every wire-backed value that is truncated here is written back to the
+       canonical image, so a VESC Tool "Parameters truncated" dialog only
+       occurs for a real hardware-limit clamp, not because unrelated MCCONF
+       fields were silently rejected. */
     {
         mc_configuration mc_trunc;
         mcconf_decode_wire(s_mc_active[id], &mc_trunc);
         vesc_config_apply_mcconf_hw_limits(&mc_trunc);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_CURRENT_MAX, mc_trunc.l_current_max);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_CURRENT_MIN, mc_trunc.l_current_min);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_IN_CURRENT_MAX, mc_trunc.l_in_current_max);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_IN_CURRENT_MIN, mc_trunc.l_in_current_min);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_ABS_CURRENT_MAX, mc_trunc.l_abs_current_max);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_MIN_ERPM, mc_trunc.l_min_erpm);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_MAX_ERPM, mc_trunc.l_max_erpm);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_MIN_VIN, mc_trunc.l_min_vin);
+        put_auto_at(s_mc_active[id], VESC6_MC_OFF_L_MAX_VIN, mc_trunc.l_max_vin);
+        put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_MIN_DUTY, mc_trunc.l_min_duty, 10000.0f);
+        put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_MAX_DUTY, mc_trunc.l_max_duty, 10000.0f);
         put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_CURRENT_MAX_SCALE, mc_trunc.l_current_max_scale, 10000.0f);
         put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_CURRENT_MIN_SCALE, mc_trunc.l_current_min_scale, 10000.0f);
         put_f16_at(s_mc_active[id], VESC6_MC_OFF_L_ERPM_START,        mc_trunc.l_erpm_start,        10000.0f);
     }
     if(!apply_mc(id,s_mc_active[id])){memcpy(s_mc_active[id],s_rollback_mc[id],sizeof(s_rollback_mc[id]));(void)apply_mc(id,s_rollback_mc[id]);return false;}
-    /* Keep the accepted VESC Tool wire image byte-exact. Preflight guarantees
-       that every writable value is executable by this backend, so GET_MCCONF
-       round-trips what SET_MCCONF ACKed without hidden runtime clamping. */
+    /* Keep the accepted/generated image as the source of truth. Hardware-limit
+       truncations above are already reflected in it; unrelated VESC fields are
+       preserved exactly, so GET_MCCONF cannot invent a second shadow config. */
     if(store&&!conf_general_store_mc_wire_persistent(id,s_mc_active[id])){memcpy(s_mc_active[id],s_rollback_mc[id],sizeof(s_rollback_mc[id]));(void)apply_mc(id,s_rollback_mc[id]);return false;} return true;
 }
 bool vesc_config_set_app_wire(const uint8_t *wire,uint16_t len,bool store){
@@ -1075,13 +875,11 @@ void vesc_config_export_wire(uint8_t l[VESC6_MCCONF_WIRE_SIZE],uint8_t r[VESC6_M
 bool vesc_config_import_wire(const uint8_t l[VESC6_MCCONF_WIRE_SIZE],const uint8_t r[VESC6_MCCONF_WIRE_SIZE],const uint8_t a[VESC6_APPCONF_WIRE_SIZE]){
     vesc_config_init_defaults();
     if(!l||!r||!a||!sig_ok(l,VESC6_MCCONF_SIGNATURE)||!sig_ok(r,VESC6_MCCONF_SIGNATURE)||!sig_ok(a,VESC6_APPCONF_SIGNATURE))return false;
-    /* Flash must not be a back door around SET ownership. A record produced by
-       an older build may contain UI-only/unsupported values that this build
-       cannot execute. Reject the whole record and keep compiled safe defaults
-       rather than loading bytes that would be displayed as active but ignored. */
-    if(!unsupported_mc_bytes_unchanged(MOTOR_LEFT,l) ||
-       !unsupported_mc_bytes_unchanged(MOTOR_RIGHT,r) ||
-       !unsupported_app_bytes_unchanged(a)) return false;
+    /* VESC 6.00 MCCONF is a complete generated wire image. UI-only fields are
+       allowed to survive flash just as they survive SET_MCCONF; apply_mc()
+       validates/bounds the subset that this F103 backend actually executes.
+       APPCONF still has a narrower runtime backend and keeps its own gate. */
+    if(!unsupported_app_bytes_unchanged(a)) return false;
     memcpy(s_rollback_mc[MOTOR_LEFT],s_mc_active[MOTOR_LEFT],sizeof(s_rollback_mc[MOTOR_LEFT]));
     memcpy(s_rollback_mc[MOTOR_RIGHT],s_mc_active[MOTOR_RIGHT],sizeof(s_rollback_mc[MOTOR_RIGHT]));
     memcpy(s_rollback_app,s_app_active,sizeof(s_rollback_app));

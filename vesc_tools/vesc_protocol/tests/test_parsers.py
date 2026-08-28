@@ -254,13 +254,28 @@ def test_parse_values_selective_mos_trio_single_bit():
     assert out["temp_mos3_c"] == pytest.approx(22.0, abs=0.05)
 
 
-def test_parse_values_selective_vd_vq_single_bit():
-    # bit 19 mencakup 2 field i32 (vd/vq).
-    mask = ValueMask.VD_VQ
+def test_parse_values_selective_vd_vq_independent_bits():
+    mask = ValueMask.VD | ValueMask.VQ
     raw = _u32(mask) + _d32(3.3, 1000) + _d32(4.4, 1000)
     out = P.parse_values_selective(bytes((Command.GET_VALUES_SELECTIVE,)) + raw)
     assert out["vd_v"] == pytest.approx(3.3, abs=1e-3)
     assert out["vq_v"] == pytest.approx(4.4, abs=1e-3)
+
+
+def test_parse_values_selective_vd_only():
+    mask = ValueMask.VD
+    raw = _u32(mask) + _d32(3.3, 1000)
+    out = P.parse_values_selective(bytes((Command.GET_VALUES_SELECTIVE,)) + raw)
+    assert out["vd_v"] == pytest.approx(3.3, abs=1e-3)
+    assert "vq_v" not in out
+
+
+def test_parse_values_selective_vq_only():
+    mask = ValueMask.VQ
+    raw = _u32(mask) + _d32(4.4, 1000)
+    out = P.parse_values_selective(bytes((Command.GET_VALUES_SELECTIVE,)) + raw)
+    assert out["vq_v"] == pytest.approx(4.4, abs=1e-3)
+    assert "vd_v" not in out
 
 
 def test_parse_values_selective_status_bit():

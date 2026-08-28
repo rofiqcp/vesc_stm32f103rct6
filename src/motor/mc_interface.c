@@ -1683,22 +1683,15 @@ static bool mc_interface_configuration_runtime_valid(const mc_configuration *c,
     if (m->id == MOTOR_LEFT) {
         if (!sensorless && !encoder_ab && c->foc_sensor_mode != FOC_SENSOR_MODE_HALL) return false;
         if (encoder_ab) {
-            if (c->m_sensor_port_mode != SENSOR_PORT_MODE_ABI ||
-                c->m_encoder_counts < 4U || c->m_encoder_counts > 65535U ||
+            if (c->m_encoder_counts < 4U || c->m_encoder_counts > 65535U ||
                 c->foc_encoder_offset < 0.0f || c->foc_encoder_offset >= 360.0f ||
                 c->foc_encoder_ratio <= 0.0f || c->foc_encoder_ratio > 1000.0f) return false;
             const uint64_t rq = (uint64_t)llrintf(c->foc_encoder_ratio * 65536.0f);
             if (rq == 0U || rq > UINT32_MAX ||
                 ((rq << 16) / c->m_encoder_counts) > UINT32_MAX) return false;
-        } else if (c->m_sensor_port_mode != SENSOR_PORT_MODE_HALL) {
-            /* Sensorless still leaves the physical sensor pins in the benign
-               Hall-input configuration; no fictitious encoder peripheral is
-               enabled while the observer is the phase source. */
-            return false;
         }
     } else {
-        if ((!sensorless && c->foc_sensor_mode != FOC_SENSOR_MODE_HALL) || encoder_ab ||
-            c->m_sensor_port_mode != SENSOR_PORT_MODE_HALL) return false;
+        if ((!sensorless && c->foc_sensor_mode != FOC_SENSOR_MODE_HALL) || encoder_ab) return false;
     }
 
     const float f[] = {

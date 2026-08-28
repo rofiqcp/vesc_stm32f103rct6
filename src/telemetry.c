@@ -29,8 +29,23 @@ bool telemetry_init(void){
 }
 
 static void accumulate_avg(unsigned idx, const MotorRuntime *m) {
-    const float v[6] = {m->motor_current, m->input_current, m->id_filter,
-                        m->iq_filter, m->vd_filter, m->vq_filter};
+    /* RT-data bits 4/5 in the VESC 6.00 ABI are Id/Iq. Read the actual fast
+       FOC fixed-point states directly instead of depending on the slower
+       floating-point mirror. This guarantees that VESC Tool receives live
+       d/q currents whenever its selective mask requests them. */
+    const float is = FOC_CURRENT_Q_BASE_A / 32768.0f;
+    const float vs = FOC_VOLTAGE_Q_BASE_V / 32768.0f;
+    const float id = (float)m->id_filter_q15 * is;
+    const float iq = (float)m->iq_filter_q15 * is;
+    const float imotor_mag = sqrtf(id * id + iq * iq);
+    const float iin = (float)m->dc_current_q15 * is;
+    /* VESC wire semantics: motor current is the magnitude sqrt(Id^2+Iq^2)
+     * signed by the DC-bus current, not by Iq (regenerative/field-weakening
+     * Iq sign is not equivalent to power flow direction). */
+    const float imotor = iin < 0.0f ? -imotor_mag : imotor_mag;
+    const float vd = (float)m->vd_q15 * vs;
+    const float vq = (float)m->vq_q15 * vs;
+    const float v[6] = {imotor, iin, id, iq, vd, vq};
     for (unsigned k = 0U; k < 6U; k++) {
         s_avg[idx].sum[k] += v[k];
         if (s_avg[idx].count[k] != UINT32_MAX) s_avg[idx].count[k]++;
@@ -107,8 +122,9 @@ static void snapshot(MotorRuntime *m,motor_telemetry_t *t){
         t->vd = (float)rt.vd_q15 * vs;
         t->vq = (float)rt.vq_q15 * vs;
         float imag = sqrtf(t->id_filter*t->id_filter + t->iq_filter*t->iq_filter);
-        t->current_motor = t->iq_filter < 0.0f ? -imag : imag;
-        t->current_in = (float)rt.dc_current_q15 * is;
+        const float rt_iin = (float)rt.dc_current_q15 * is;
+        t->current_motor = rt_iin < 0.0f ? -imag : imag;
+        t->current_in = rt_iin;
         t->erpm = (float)rt.erpm_fast_q16 / 65536.0f;
         t->mech_rpm = t->erpm / fmaxf((float)m->pole_pairs, 1.0f);
         t->vbus = (float)rt.vbus_q15 * vs;
@@ -143,12 +159,15 @@ static void snapshot(MotorRuntime *m,motor_telemetry_t *t){
 }
 
 void telemetry_stats_update_100hz(void){
-    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
+    /* The accumulator is also consumed by packet_process. Protect only the
+     * six small sum/count pairs with a short scheduler critical section; do
+     * not hold a mutex across floating-point command encoding. */
+    taskENTER_CRITICAL();
     accumulate_avg(0U,&g_motor_left);
     accumulate_avg(1U,&g_motor_right);
+    taskEXIT_CRITICAL();
     update_stats(&g_motor_left,STAT_PERIOD_MS/1000.0f);
     update_stats(&g_motor_right,STAT_PERIOD_MS/1000.0f);
-    if(locked)(void)xSemaphoreGive(s_telem_mutex);
 }
 
 void telemetry_snapshot_100hz(void){
@@ -166,34 +185,78 @@ void telemetry_update_100hz(void){
 void telemetry_get(motor_id_t id,motor_telemetry_t *out){
     if(out==NULL)return;
     uint32_t idx=(id==MOTOR_RIGHT)?1U:0U;
-    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
-    *out=s_telem[idx];
-    if(locked)(void)xSemaphoreGive(s_telem_mutex);
+    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, pdMS_TO_TICKS(5U)) == pdTRUE;
+    if (locked) {
+        *out=s_telem[idx];
+        (void)xSemaphoreGive(s_telem_mutex);
+    } else {
+        /* Never let diagnostics/GUI polling deadlock motor communication. */
+        memset(out,0,sizeof(*out));
+        snapshot(motor_get(id),out);
+    }
 }
 
+void telemetry_get_realtime(motor_id_t id, motor_telemetry_t *out) {
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    MotorRuntime *m = motor_get(id);
+    if (m != NULL) snapshot(m, out);
+}
 
 void telemetry_read_reset_avg(motor_id_t id, uint32_t mask, motor_telemetry_avg_t *out) {
     if (out == NULL) return;
     const unsigned idx = (id == MOTOR_RIGHT) ? 1U : 0U;
     memset(out, 0, sizeof(*out));
-    bool locked = s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
 
+    /* COMM_FORWARD_CAN reaches this function one call level deeper than the
+     * local GET_VALUES path. Do not put the large motor_telemetry_t aggregate
+     * on packet_process' stack here. Read only the six fallback fields from one
+     * coherent FOC seqlock frame. This keeps VESC's read-reset-average semantics
+     * while making local and virtual motor-2 use the same bounded stack depth. */
+    float fallback[6] = {0};
+    MotorRuntime *m = motor_get(id);
+    foc_rt_snapshot_t rt;
+    if (m != NULL && read_rt_snapshot(m, &rt)) {
+        const float is = FOC_CURRENT_Q_BASE_A / 32768.0f;
+        const float vs = FOC_VOLTAGE_Q_BASE_V / 32768.0f;
+        const float id_a = (float)rt.id_filter_q15 * is;
+        const float iq_a = (float)rt.iq_filter_q15 * is;
+        const float imag = sqrtf(id_a * id_a + iq_a * iq_a);
+        const float rt_iin = (float)rt.dc_current_q15 * is;
+        fallback[0] = rt_iin < 0.0f ? -imag : imag;
+        fallback[1] = rt_iin;
+        fallback[2] = id_a;
+        fallback[3] = iq_a;
+        fallback[4] = (float)rt.vd_q15 * vs;
+        fallback[5] = (float)rt.vq_q15 * vs;
+    } else if (m != NULL) {
+        const float imag = sqrtf(m->id_filter * m->id_filter + m->iq_filter * m->iq_filter);
+        fallback[0] = m->input_current < 0.0f ? -imag : imag;
+        fallback[1] = m->input_current;
+        fallback[2] = m->id_filter;
+        fallback[3] = m->iq_filter;
+        fallback[4] = m->vd_filter;
+        fallback[5] = m->vq_filter;
+    }
     const uint8_t bits[6] = {2U, 3U, 4U, 5U, 19U, 20U};
-    const float fallback[6] = {s_telem[idx].current_motor, s_telem[idx].current_in,
-                               s_telem[idx].id_filter, s_telem[idx].iq_filter,
-                               s_telem[idx].vd, s_telem[idx].vq};
-    float value[6];
+    float sum[6] = {0};
+    uint32_t count[6] = {0};
+
+    taskENTER_CRITICAL();
     for (unsigned k = 0U; k < 6U; k++) {
         if ((mask & (1UL << bits[k])) != 0U) {
-            value[k] = s_avg[idx].count[k] ?
-                       (s_avg[idx].sum[k] / (float)s_avg[idx].count[k]) : fallback[k];
+            sum[k] = s_avg[idx].sum[k];
+            count[k] = s_avg[idx].count[k];
             s_avg[idx].sum[k] = 0.0f;
             s_avg[idx].count[k] = 0U;
-        } else {
-            value[k] = fallback[k];
         }
+    }
+    taskEXIT_CRITICAL();
+
+    float value[6];
+    for (unsigned k = 0U; k < 6U; k++) {
+        value[k] = count[k] ? (sum[k] / (float)count[k]) : fallback[k];
     }
     out->current_motor = value[0]; out->current_in = value[1];
     out->id = value[2]; out->iq = value[3]; out->vd = value[4]; out->vq = value[5];
-    if (locked) (void)xSemaphoreGive(s_telem_mutex);
 }

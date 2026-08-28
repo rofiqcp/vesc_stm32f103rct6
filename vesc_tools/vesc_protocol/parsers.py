@@ -170,7 +170,7 @@ def parse_values(reply: bytes) -> dict:
         result["temp_mos1_c"] = r.scaled16(10.0)
         result["temp_mos2_c"] = r.scaled16(10.0)
         result["temp_mos3_c"] = r.scaled16(10.0)
-    # Bit 19 (VD_VQ): 2 field i32, hanya bila >= 8 byte.
+    # Full GET_VALUES appends both bit-19 Vd and bit-20 Vq in order.
     if r.remaining >= 8:
         result["vd_v"] = r.scaled32(1000.0)
         result["vq_v"] = r.scaled32(1000.0)
@@ -223,10 +223,13 @@ def parse_values_selective(reply: bytes) -> dict:
         result["temp_mos1_c"] = r.scaled16(10.0)
         result["temp_mos2_c"] = r.scaled16(10.0)
         result["temp_mos3_c"] = r.scaled16(10.0)
-    if mask & ValueMask.VD_VQ:
-        if r.remaining < 8:
-            raise BufferUnderflow("vd/vq terpotong")
+    if mask & ValueMask.VD:
+        if r.remaining < 4:
+            raise BufferUnderflow("vd terpotong")
         result["vd_v"] = r.scaled32(1000.0)
+    if mask & ValueMask.VQ:
+        if r.remaining < 4:
+            raise BufferUnderflow("vq terpotong")
         result["vq_v"] = r.scaled32(1000.0)
     if mask & ValueMask.STATUS:
         if r.remaining < 1:
