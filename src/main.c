@@ -48,7 +48,10 @@ static bool create_vesc_tasks(void) {
     if (xTaskCreate(fault_stop_thread, "fault_stop", 192U, NULL, VESC_PRIO_SAFETY, &g_task_fault_stop) != pdPASS) return false;
     if (xTaskCreate(timer_thread, "timer", 256U, NULL, VESC_PRIO_NORMAL, &g_task_timer) != pdPASS) return false;
     if (xTaskCreate(packet_process_thread, "packet_process", 512U, NULL, VESC_PRIO_NORMAL, &g_task_packet_process) != pdPASS) return false;
-    if (xTaskCreate(blocking_thread, "blocking", 768U, NULL, VESC_PRIO_NORMAL, &g_task_blocking) != pdPASS) return false;
+    /* Sensor/R-L/flux detect transactions are the deepest synchronous call path.
+     * 768 words was too tight: stack-overflow hook disables IRQs forever, which
+     * presents as UART comm wedge after sensor-detect. */
+    if (xTaskCreate(blocking_thread, "blocking", 1024U, NULL, VESC_PRIO_NORMAL, &g_task_blocking) != pdPASS) return false;
     if (xTaskCreate(sample_send_thread, "sample_send", 192U, NULL, VESC_PRIO_LOW, &g_task_sample_send) != pdPASS) return false;
 
     vesc_comm_set_thread_ids(g_task_packet_process, g_task_blocking);

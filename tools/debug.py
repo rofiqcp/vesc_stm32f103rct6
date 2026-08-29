@@ -76,6 +76,7 @@ CUSTOM_COMM_DIAG = 0xAA
 CUSTOM_CONFIG_SAVE = 0xAB
 CUSTOM_CONFIG_STATUS = 0xAC
 CUSTOM_BUZZER_TEST = 0xAD
+CUSTOM_OPENLOOP_PHASE = 0xF1
 
 SENSOR_AUTO = 0
 SENSOR_HALL = 1
@@ -1114,6 +1115,30 @@ def _cmd_sensor_detect_body(link: Link,args: argparse.Namespace)->int:
     raise TimeoutError("sensor detect timeout")
 
 
+def cmd_openloop_phase(link: Link,args: argparse.Namespace)->int:
+    require_yes(args, "Diagnostik SVPWM open-loop fixed-phase (tanpa current PI)")
+    if not -0.02 <= args.duty <= 0.02:
+        raise ValueError("--duty harus -0.02..0.02")
+    if args.ms > 500: args.ms = 500
+    # Custom command 0xF1: [motor][duty_milli i32][phase_mdeg i32][duration_ms u16]
+    duty_milli = int(round(args.duty * 1000.0))
+    phase_milli = int(round(args.phase * 1000.0))
+    for i in range(max(1, args.repeat)):
+        payload = (bytes((COMM_CUSTOM_APP_DATA, CUSTOM_OPENLOOP_PHASE, args.motor))
+                   + be_i32(duty_milli) + be_i32(phase_milli) + be_u16(args.ms))
+        try:
+            link.send(payload)
+        except Exception as exc:
+            print("send error:", exc); return 1
+        time.sleep(args.ms / 1000.0 + 0.3)
+        try:
+            print(f"--- openloop phase={args.phase:.1f} duty={args.duty:.3f} ms={args.ms} ---")
+            print("EXT:", get_extended(link, args.motor))
+        except Exception as exc:
+            print("EXT error:", exc)
+    return 0
+
+
 def cmd_sensor_detect(link: Link,args: argparse.Namespace)->int:
     path=Path(getattr(args,"out",None) or _default_txt("vesc_f103_sensor_detect"))
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -2103,6 +2128,7 @@ def main() -> int:
     p.add_argument("--yes",action="store_true")
     p.add_argument("--force",action="store_true")
     p=sp("test-all",cmd_test_all,"passive end-to-end firmware/telemetry test"); p.add_argument("--zero-limit",type=float,default=0.30)
+    p=sp("openloop-phase",cmd_openloop_phase,"DIAGNOSTIC SVPWM open-loop fixed phase without current PI (duty clamped <=2%)"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--duty",type=float,default=0.01,help="modulation 0..0.02"); p.add_argument("--phase",type=float,default=0.0,help="electrical phase deg"); p.add_argument("--ms",type=int,default=200,help="hold ms (<=500)"); p.add_argument("--repeat",type=int,default=1); p.add_argument("--yes",action="store_true")
     p=sp("full-test",cmd_full_test,"ACTIVE commissioning: calibration, auto-detect, samples, current +/- and optional RPM/position"); p.add_argument("--yes",action="store_true"); p.add_argument("--current",type=float,default=0.5); p.add_argument("--erpm",type=float,default=300.0); p.add_argument("--stage-seconds",type=float,default=1.0); p.add_argument("--cal-timeout",type=float,default=5.0); p.add_argument("--detect-timeout",type=float,default=15.0); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--sample-decimation",type=int,default=8); p.add_argument("--skip-rpm",action="store_true"); p.add_argument("--position-step",type=float,default=5.0)
 
     args=ap.parse_args()

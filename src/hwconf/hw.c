@@ -31,6 +31,16 @@ volatile uint16_t g_adc3_vbus_dma[2] __attribute__((aligned(4)));
 static volatile uint32_t s_app_adc_word = 0U;
 static volatile uint32_t s_app_adc_seq = 0U;
 static volatile uint8_t s_app_adc_ht_seen = 0U;
+/* Runtime-tunable TIM8/ADC phase offset for shunt sampling validation. */
+static volatile uint16_t s_adc_phase_offset_ticks = (uint16_t)ADC_MOTOR_PHASE_OFFSET_TICKS;
+
+void motor_hw_set_adc_phase_offset_ticks(uint16_t ticks) {
+    s_adc_phase_offset_ticks = ticks;
+}
+
+uint16_t motor_hw_get_adc_phase_offset_ticks(void) {
+    return s_adc_phase_offset_ticks;
+}
 
 /* Power-stage faults are deliberately reset-latched. A software motor fault
  * may be cleared after its normal recovery policy, but PVD/BKIN events keep
@@ -498,7 +508,7 @@ void motor_hw_start_sampling(void) {
     TIM1->BDTR &= ~TIM_BDTR_MOE;
     TIM8->BDTR &= ~TIM_BDTR_MOE;
     TIM1->CNT = 0U;
-    TIM8->CNT = (uint16_t)ADC_MOTOR_PHASE_OFFSET_TICKS;
+    TIM8->CNT = s_adc_phase_offset_ticks;
     TIM8->RCR = 1U;
     TIM1->SR = 0U;
     TIM8->SR = 0U;

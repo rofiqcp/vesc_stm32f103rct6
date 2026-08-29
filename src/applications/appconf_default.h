@@ -180,9 +180,13 @@
  */
 #define SENSOR_DETECT_CURRENT_A         1.5f
 #define SENSOR_DETECT_MAX_CURRENT_A     2.0f
-/* Current VESC mcpwm_foc_hall_detect semantics: ramp Id 0->request over
- * 1000 x 1 ms, then 3 forward + 3 reverse electrical sweeps at 1 degree
- * per 5 ms. The F103 port implements the same sequence in its 1-kHz task. */
+/* Hall detect uses OPEN-LOOP SVPWM (no current PI) with a tiny fixed duty.
+ * The closed-loop current PI on this F103 port is not yet trustworthy for
+ * sub-2A excitation: a 0.1-0.5 A request drives Id/Iq to several amps and
+ * trips ABS_OVER_CURRENT. A 1.5% modulation at ~44 V bus yields a small, safe
+ * phase field that is more than enough to sample the Hall states during the
+ * electrical sweep. This matches the "try open-loop SVPWM first" request. */
+#define SENSOR_DETECT_DUTY              0.015f
 #define SENSOR_DETECT_CURRENT_RAMP_MS   1000U
 #define SENSOR_DETECT_STEP_MS           5U
 #define SENSOR_DETECT_SWEEPS            3U

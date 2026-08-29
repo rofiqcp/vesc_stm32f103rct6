@@ -67,6 +67,8 @@ uint8_t motor_hw_read_hall_raw(motor_id_t id);
 uint16_t motor_hw_encoder_cnt(void);
 bool motor_hw_board_temperature_c(float *temp_c);
 void motor_hw_capture_app_adc_from_isr(void);
+void motor_hw_set_adc_phase_offset_ticks(uint16_t ticks);
+uint16_t motor_hw_get_adc_phase_offset_ticks(void);
 bool motor_hw_get_app_adc_raw(uint16_t *pa2_raw, uint16_t *pa3_raw);
 void motor_hw_encoder_set_count(MotorRuntime *m, uint16_t count);
 void motor_hw_configure_sensor(MotorRuntime *m, uint8_t mode);

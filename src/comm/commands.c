@@ -58,7 +58,12 @@ enum {
     CUSTOM_CONFIG_SAVE = 0xAB,
     CUSTOM_CONFIG_STATUS = 0xAC,
     CUSTOM_BUZZER_TEST = 0xAD,
-    INTERNAL_CUSTOM_SENSOR_DETECT = 0xF0
+    INTERNAL_CUSTOM_SENSOR_DETECT = 0xF0,
+    /* Diagnostik SVPWM open-loop fixed-phase TANPA current PI. Digunakan untuk
+     * menguji apakah sampling arus phase benar terhadap sudut tegangan tanpa
+     * melibatkan observer/PI/forced-angle detect. Aman: duty dibatasi kecil. */
+    CUSTOM_OPENLOOP_PHASE = 0xF1,
+    CUSTOM_ADC_PHASE_OFFSET = 0xF2
 };
 
 typedef struct {
@@ -868,6 +873,42 @@ static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context
             accepted = false;
         }
         reply_buzzer_status(action, accepted);
+    } else if (sub == CUSTOM_OPENLOOP_PHASE && len >= 12U) {
+        /* Wire: [F1][motor][duty_milli i32][phase_mdeg i32][duration_ms u16].
+         * Bench diagnostic only. Bypasses current PI via
+         * MOTOR_CTRL_OPENLOOP_DUTY_PHASE, clamps modulation to <=2%, and stops
+         * automatically after a short hold. Used to verify phase-current raw
+         * tracks the applied voltage angle without PI/observer/detect. */
+        MotorRuntime *m = motor_get(explicit_id);
+        float duty = (float)get_i32_be(&data[2]) / 1000.0f;
+        float phase = (float)get_i32_be(&data[6]) / 1000.0f;
+        uint16_t duration_ms = get_u16_be(&data[10]);
+        if (duty < -0.02f) duty = -0.02f;
+        if (duty >  0.02f) duty =  0.02f;
+        if (duration_ms > 500U) duration_ms = 500U;
+        if (duration_ms == 0U) duration_ms = 50U;
+        mc_interface_ignore_input_both((uint32_t)duration_ms + 250U);
+        motor_clear_fault(m);
+        mcpwm_foc_set_openloop_duty_phase_motor(m, duty, phase);
+        vTaskDelay(pdMS_TO_TICKS(duration_ms));
+        mcpwm_foc_release_motor_motor(m);
+        mc_interface_ignore_input_both(0U);
+        reply_extended(explicit_id);
+    } else if (sub == CUSTOM_ADC_PHASE_OFFSET && len >= 3U) {
+        /* Runtime tuning of TIM8/ADC phase offset (CPU timer ticks). Lets us
+         * sweep the shunt current sampling point to find the low-side
+         * conduction window without recompiling. Echoes back the applied value. */
+        uint16_t ticks = (uint16_t)(data[1] | ((uint16_t)data[2] << 8));
+        motor_hw_set_adc_phase_offset_ticks(ticks);
+        uint8_t *p = payload_begin();
+        if (p != NULL) {
+            uint16_t i = 0U;
+            p[i++] = COMM_CUSTOM_APP_DATA;
+            p[i++] = CUSTOM_ADC_PHASE_OFFSET;
+            p[i++] = (uint8_t)(ticks & 0xFFU);
+            p[i++] = (uint8_t)((ticks >> 8) & 0xFFU);
+            payload_end(i);
+        }
     } else if (sub == CUSTOM_CONFIG_SAVE) {
         bool ok = conf_general_store_all(); reply_config_status(ok);
     } else if (sub == CUSTOM_CONFIG_STATUS) {

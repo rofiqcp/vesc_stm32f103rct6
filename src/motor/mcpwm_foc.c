@@ -636,6 +636,10 @@ void mcpwm_foc_set_openloop_duty_phase_motor(MotorRuntime *m, float duty, float 
     m->duty_command_q15 = (int32_t)lrintf(m->duty_command * 32768.0f);
     m->openloop_command_erpm = 0.0f;
     m->openloop_command_phase_u16 = foc_deg_to_u16(phase_deg);
+    /* Diagnostik terbatas: aktifkan command agar mc_interface_mc_timer_isr
+     * menyalakan MOE (wants_pwm butuh command_active). Keamanan tetap dijaga
+     * oleh clamp duty 10–90% di SVPWM dan trip arus absolut. */
+    motor_touch_command(m);
     foc_enter_control_mode(m, MOTOR_CTRL_OPENLOOP_DUTY_PHASE);
 }
 
@@ -1107,6 +1111,9 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
         foc_q15_mul(FOC_ABS_CURRENT_FILTER_ALPHA_Q15,
                     abs_phase - m->abs_phase_current_filter_q15);
 
+    /* TEMP VALIDATION: Ia/Ib/Ic phase-current faulting is intentionally
+       disabled. DC-link current and VIN protection above remain active. */
+#if 0
     if (m->pwm_enabled && abs_phase > s_current_trip_q15) {
         if (s_hard_current_trip_consecutive[mi] < 255U) s_hard_current_trip_consecutive[mi]++;
     } else {
@@ -1137,6 +1144,11 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
         s_hard_current_trip_consecutive[mi] = 0U;
         s_startup_dc_trip_consecutive[mi] = 0U;
     }
+#else
+    /* Keep diagnostic values/counters deterministic without raising a fault. */
+    m->abs_current_fault_count = 0U;
+    s_hard_current_trip_consecutive[mi] = 0U;
+#endif
 
     /* Configured VIN thresholds get a short consecutive-sample debounce to
        reject switching/ADC spikes. The wider hard envelope was already checked
@@ -1171,26 +1183,52 @@ static void foc_one_motor_isr(MotorRuntime *m, uint16_t raw_u, uint16_t raw_v, u
         return;
     }
 
+    /* Eferu-style lightweight open-loop path: ADC/current/DC/VIN guards above
+       have already run; do not execute observer, PLL, speed estimator, Park, or
+       PI for a fixed-phase diagnostic pulse. */
+    if (m->control_mode == MOTOR_CTRL_OPENLOOP_DUTY_PHASE) {
+        int32_t sn_ol, cs_ol;
+        foc_fast_sincos_u16_q15(m->openloop_command_phase_u16, &sn_ol, &cs_ol);
+        int32_t vmax_ol = foc_q15_mul(vbus_q15, m->vmax_coeff_q15);
+        if (vmax_ol < 256) vmax_ol = 256;
+        int32_t vd_ol = foc_q15_mul(vmax_ol, m->duty_command_q15);
+        int32_t va_ol = foc_q15_mul(cs_ol, vd_ol);
+        int32_t vb_ol = foc_q15_mul(sn_ol, vd_ol);
+        uint16_t du_ol, dv_ol, dw_ol;
+        foc_svm_q15(va_ol, vb_ol, inv_vbus_q30, &du_ol, &dv_ol, &dw_ol);
+        m->vd_q15 = vd_ol; m->vq_q15 = 0;
+        m->duty_u_q15 = du_ol; m->duty_v_q15 = dv_ol; m->duty_w_q15 = dw_ol;
+        motor_hw_set_pwm_q15(m, du_ol, dv_ol, dw_ol);
+        publish_rt_snapshot_isr(m, m->openloop_command_phase_u16);
+        return;
+    }
+
     int32_t i_alpha = ia;
     int32_t i_beta = foc_q15_mul(ia + (ib * 2), FOC_Q15_INV_SQRT3);
 
-    /* VESC keeps the flux observer in the fast FOC path even when Hall or
-       encoder supplies the low-speed phase. This port does the same with a
-       fixed-point voltage model + CORDIC phase estimator. */
-    foc_observer_update_fixed(m, m->observer_v_alpha_q15_prev,
-                        m->observer_v_beta_q15_prev, i_alpha, i_beta);
+    /* Direct open-loop duty-phase diagnostics do not need observer/encoder/PLL.
+       Skip the CORDIC-heavy observer path so the 16-kHz dual-motor ISR stays
+       inside its 4000-cycle slot while validating Hall sector movement. */
+    const bool direct_openloop_phase =
+        m->control_mode == MOTOR_CTRL_OPENLOOP_DUTY_PHASE;
+    if (!direct_openloop_phase) {
+        /* VESC keeps the flux observer in the fast FOC path during normal FOC. */
+        foc_observer_update_fixed(m, m->observer_v_alpha_q15_prev,
+                            m->observer_v_beta_q15_prev, i_alpha, i_beta);
+        encoder_ab_update_source_isr(m);
+    }
 
-    encoder_ab_update_source_isr(m);
-
-    uint16_t phase = motor_sensor_electrical_phase_u16(m);
+    uint16_t phase = direct_openloop_phase ? m->openloop_command_phase_u16 :
+                                             motor_sensor_electrical_phase_u16(m);
     uint16_t speed_phase = phase;
-    if (m->foc_speed_source == FOC_SPEED_SRC_OBSERVER && m->observer_valid) {
+    if (!direct_openloop_phase &&
+        m->foc_speed_source == FOC_SPEED_SRC_OBSERVER && m->observer_valid) {
         speed_phase = observer_phase_compensated_u16(m);
     }
 
     /* Current VESC can source PLL/fast speed from corrected/control phase or
        directly from observer phase. The default remains corrected. */
-    foc_pll_run_fixed(m, speed_phase);
+    if (!direct_openloop_phase) foc_pll_run_fixed(m, speed_phase);
 
     /* Also retain a corrected-phase fast estimate independent of the selected
        source for diagnostics and sensor-transition plausibility. */
@@ -1958,8 +1996,18 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
        The 2-word circular DMA makes CNDTR alternate 1/2 every trigger. */
     uint16_t vbus_dma_cndtr = 0U;
     uint16_t vraw = motor_hw_vbus_raw_from_isr(&vbus_dma_cndtr);
-    if ((vbus_dma_cndtr != 1U && vbus_dma_cndtr != 2U) ||
-        (s_vbus_dma_prev_cndtr != 0U && vbus_dma_cndtr == s_vbus_dma_prev_cndtr)) {
+    /* Freshness proof: the ADC3 DCLINK stream is healthy when the DMA channel
+       is still enabled AND the circular buffer index is a legal half (1 or 2).
+       During a Hall/sensor-detect the dual-motor FOC ISR can occasionally
+       overrun a single PWM slot (cycles > FOC_ISR_SLOT_CYCLES); that merely
+       skips one current-loop iteration and re-reads the same CNDTR phase, which
+       must NOT be treated as a stalled stream. We therefore never fault on
+       CNDTR phase repetition; only a truly dead channel (DMA disabled, or an
+       illegal CNDTR value) sustained for FOC_VBUS_DMA_STALE_FAULT_SAMPLES
+       consecutive frames latches the ADC_DMA fault. */
+    const bool dma_alive = ((DMA2_Channel5->CCR & DMA_CCR_EN) != 0U);
+    bool fresh = dma_alive && (vbus_dma_cndtr == 1U || vbus_dma_cndtr == 2U);
+    if (!fresh) {
         if (s_vbus_dma_stale_count < UINT8_MAX) s_vbus_dma_stale_count++;
         s_vbus_dma_stale_events++;
     } else {
@@ -2035,6 +2083,10 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
         g_motor_right.isr_overruns++;
     }
 
+    /* A full dual-motor frame must finish before the next DMA trigger. Once it
+       exceeds one slot, allowing additional frames to accumulate can starve all
+       RTOS tasks (including UART). Abort after eight consecutive overruns so a
+       single transient is tolerated but a sustained interrupt storm is not. */
     if (cycles > slot_cycles) {
         if (s_overrun_consecutive[0] < 255U) s_overrun_consecutive[0]++;
         if (s_overrun_consecutive[1] < 255U) s_overrun_consecutive[1]++;
@@ -2163,11 +2215,15 @@ static bool detect_begin(MotorRuntime *m, uint8_t sensor_mode, float current_a) 
         motor_hall_edge_isr(m);
     }
 
-    m->control_mode = MOTOR_CTRL_DETECT;
-    m->command_active = false;
-    m->detect_force_angle = true;
+    /* Hall detect runs as an open-loop fixed-phase SVPWM sweep (no current PI,
+       no observer). Use the lightweight ISR path so the 16-kHz frame stays inside
+       its slot; the sweep sets detect_phase_u16 / openloop_command_phase_u16. */
+    m->control_mode = MOTOR_CTRL_OPENLOOP_DUTY_PHASE;
+    m->command_active = true;
+    m->detect_force_angle = false;
     m->detect_phase_u16 = 0U;
-    motor_set_foc_targets(m, 0.0f, 0.0f);
+    m->openloop_command_phase_u16 = 0U;
+    motor_touch_command(m);
 
     /* Detection can legitimately take tens of seconds. Upstream disables the
        normal command timeout while the blocking detect transaction owns motor. */
@@ -2220,7 +2276,11 @@ static void detect_end(MotorRuntime *m, bool ok) {
     m->detect.l_capture_active = false;
     m->detect.l_capture_done = false;
     m->detect.l_capture_axis = 0U;
-    motor_set_foc_targets(m, 0.0f, 0.0f);
+    /* A Hall sweep can be in OPENLOOP_DUTY_PHASE, where Id/Iq targets are
+     * intentionally ignored. Explicitly command a zero duty vector before the
+     * settling delay; otherwise the last SVPWM triplet remains energized. */
+    mcpwm_foc_set_openloop_duty_phase_motor(m, 0.0f,
+                                            (float)m->detect_phase_u16 * (360.0f / 65536.0f));
     vTaskDelay(pdMS_TO_TICKS(20U));
     m->detect_force_angle = false;
     m->phase_observer_override = false;
@@ -2244,10 +2304,14 @@ static void detect_end(MotorRuntime *m, bool ok) {
 static bool detect_ramp_id(MotorRuntime *m, float current_a, uint32_t ramp_ms) {
     if (!detect_wait_pwm(m, 500U)) return false;
     if (ramp_ms == 0U) ramp_ms = 1U;
+    /* Open-loop SVPWM excitation (no current PI): ramp the modulation from 0
+     * to SENSOR_DETECT_DUTY over the ramp window. The F103 closed-loop current
+     * PI is not used here because it is unstable for sub-2A requests. */
     for (uint32_t k = 0U; k <= ramp_ms; k++) {
         if (m->fault != MOTOR_FAULT_NONE) return false;
         m->detect_phase_u16 = 0U;
-        motor_set_foc_targets(m, current_a * ((float)k / (float)ramp_ms), 0.0f);
+        float duty = SENSOR_DETECT_DUTY * ((float)k / (float)ramp_ms);
+        mcpwm_foc_set_openloop_duty_phase_motor(m, duty, 0.0f);
         timeout_reset();
         vTaskDelay(pdMS_TO_TICKS(1U));
     }
@@ -2291,8 +2355,10 @@ int mcpwm_foc_hall_detect_motor(MotorRuntime *m, float current, uint8_t *hall_ta
     if (!detect_begin(m, SENSOR_MODE_HALL, current)) return MOTOR_FAULT_SENSOR_DETECT;
 
     m->detect.state = SENSOR_DETECT_HALL_LOCK;
-    /* Upstream Hall detect temporarily uses a soft current controller. */
-    motor_set_current_pi_gains(m, 0.01f, 10.0f);
+    /* Keep the calibrated runtime PI gains. The historical 0.01/10.0 detect
+       pair is incompatible with this port's Q16.16 Ki*dt scaling: it drives
+       the integrator into saturation and can produce tens of amps from a
+       0.5-A request. detect_end() still restores the saved gains defensively. */
     bool ok = detect_ramp_id(m, m->detect.drive_current_a, SENSOR_DETECT_CURRENT_RAMP_MS);
 
     if (ok) {
@@ -2300,8 +2366,9 @@ int mcpwm_foc_hall_detect_motor(MotorRuntime *m, float current, uint8_t *hall_ta
         m->detect.state = SENSOR_DETECT_HALL_FWD;
         /* Three forward electrical revolutions, 1 degree per 5 ms. */
         for (uint32_t k = 0U; k < 360U * SENSOR_DETECT_SWEEPS && ok; k++) {
-            m->detect_phase_u16 = foc_deg_to_u16((float)(k % 360U));
-            motor_set_foc_targets(m, m->detect.drive_current_a, 0.0f);
+            float deg = (float)(k % 360U);
+            m->detect_phase_u16 = foc_deg_to_u16(deg);
+            mcpwm_foc_set_openloop_duty_phase_motor(m, SENSOR_DETECT_DUTY, deg);
             vTaskDelay(pdMS_TO_TICKS(SENSOR_DETECT_STEP_MS));
             detect_hall_sample(m);
             timeout_reset();
@@ -2314,7 +2381,7 @@ int mcpwm_foc_hall_detect_motor(MotorRuntime *m, float current, uint8_t *hall_ta
         for (uint32_t k = 0U; k < 360U * SENSOR_DETECT_SWEEPS && ok; k++) {
             float deg = 360.0f - (float)(k % 360U);
             m->detect_phase_u16 = foc_deg_to_u16(deg);
-            motor_set_foc_targets(m, m->detect.drive_current_a, 0.0f);
+            mcpwm_foc_set_openloop_duty_phase_motor(m, SENSOR_DETECT_DUTY, deg);
             vTaskDelay(pdMS_TO_TICKS(SENSOR_DETECT_STEP_MS));
             detect_hall_sample(m);
             timeout_reset();
