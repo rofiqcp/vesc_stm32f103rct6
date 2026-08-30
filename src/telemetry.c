@@ -19,6 +19,8 @@ typedef struct {
 static telemetry_avg_acc_t s_avg[2];
 static SemaphoreHandle_t s_telem_mutex = NULL;
 
+static bool read_rt_snapshot(const MotorRuntime *m, foc_rt_snapshot_t *out);
+
 bool telemetry_init(void){
     memset(s_telem,0,sizeof(s_telem));
     memset(s_avg,0,sizeof(s_avg));
@@ -29,22 +31,20 @@ bool telemetry_init(void){
 }
 
 static void accumulate_avg(unsigned idx, const MotorRuntime *m) {
-    /* RT-data bits 4/5 in the VESC 6.00 ABI are Id/Iq. Read the actual fast
-       FOC fixed-point states directly instead of depending on the slower
-       floating-point mirror. This guarantees that VESC Tool receives live
-       d/q currents whenever its selective mask requests them. */
+    /* Ambil semua komponen arus/tegangan dari satu snapshot FOC yang koheren.
+     * Ini mencegah Id/Iq/Vd/Vq/Iin tercampur dari dua frame ADC berbeda. */
+    foc_rt_snapshot_t rt;
+    if (!read_rt_snapshot(m, &rt)) return;
+
     const float is = FOC_CURRENT_Q_BASE_A / 32768.0f;
     const float vs = FOC_VOLTAGE_Q_BASE_V / 32768.0f;
-    const float id = (float)m->id_filter_q15 * is;
-    const float iq = (float)m->iq_filter_q15 * is;
+    const float id = (float)rt.id_filter_q15 * is;
+    const float iq = (float)rt.iq_filter_q15 * is;
     const float imotor_mag = sqrtf(id * id + iq * iq);
-    const float iin = (float)m->dc_current_q15 * is;
-    /* VESC wire semantics: motor current is the magnitude sqrt(Id^2+Iq^2)
-     * signed by the DC-bus current, not by Iq (regenerative/field-weakening
-     * Iq sign is not equivalent to power flow direction). */
+    const float iin = (float)rt.dc_current_q15 * is;
     const float imotor = iin < 0.0f ? -imotor_mag : imotor_mag;
-    const float vd = (float)m->vd_q15 * vs;
-    const float vq = (float)m->vq_q15 * vs;
+    const float vd = (float)rt.vd_q15 * vs;
+    const float vq = (float)rt.vq_q15 * vs;
     const float v[6] = {imotor, iin, id, iq, vd, vq};
     for (unsigned k = 0U; k < 6U; k++) {
         s_avg[idx].sum[k] += v[k];

@@ -109,27 +109,10 @@ static bool runtime_mc_auto_fields_finite(const uint8_t *w) {
     return true;
 }
 
-static bool byte_in_range(uint16_t i, uint16_t off, uint16_t len) {
-    return i >= off && i < (uint16_t)(off + len);
-}
-
-static bool app_wire_byte_runtime_mutable(uint16_t i) {
-    /* Controller ID is normalized by commands.c for the local motor-2 view.
-       APP ADC owns the canonical VESC-6 adc_config bytes 90..138 and USART3
-       owns the canonical baud field. PPM/NRF/PAS/etc remain immutable. */
-    if (byte_in_range(i, VESC6_APP_OFF_TIMEOUT_MSEC, 8U)) return true;
-    if (i == VESC6_APP_OFF_APP_TO_USE) return true;
-    if (byte_in_range(i, VESC6_APP_OFF_ADC_CTRL_TYPE, 49U)) return true;
-    if (byte_in_range(i, VESC6_APP_OFF_UART_BAUD, 4U)) return true;
-    return false;
-}
-
-static bool unsupported_app_bytes_unchanged(const uint8_t *wire) {
-    for (uint16_t i = 0U; i < VESC6_APPCONF_WIRE_SIZE; i++) {
-        if (!app_wire_byte_runtime_mutable(i) && wire[i] != s_app_active[i]) return false;
-    }
-    return true;
-}
+/* APPCONF VESC disimpan sebagai wire image lengkap. Field yang belum punya
+ * backend runtime tetap dipertahankan byte-for-byte agar SET/GET/default dan
+ * persistence tidak memunculkan false "Parameters truncated". Validasi runtime
+ * tetap dilakukan oleh apply_app() hanya untuk subset yang dipakai hardware. */
 
 static bool runtime_mc_ready(const MotorRuntime *m) {
     if (m == NULL) return false;
@@ -729,7 +712,6 @@ bool vesc_config_set_mc_wire(motor_id_t id,const uint8_t *wire,uint16_t len,bool
 }
 bool vesc_config_set_app_wire(const uint8_t *wire,uint16_t len,bool store){
     vesc_config_init_defaults();if(!wire||len!=VESC6_APPCONF_WIRE_SIZE||!sig_ok(wire,VESC6_APPCONF_SIGNATURE))return false;
-    if(!unsupported_app_bytes_unchanged(wire)) return false;
     if(memcmp(wire,s_app_active,VESC6_APPCONF_WIRE_SIZE)==0){return !store||conf_general_store_app_wire_persistent(s_app_active);}
     /* Changing throttle calibration/control type while either bridge is live can
        create an instantaneous command discontinuity. Require both local motors
@@ -878,8 +860,8 @@ bool vesc_config_import_wire(const uint8_t l[VESC6_MCCONF_WIRE_SIZE],const uint8
     /* VESC 6.00 MCCONF is a complete generated wire image. UI-only fields are
        allowed to survive flash just as they survive SET_MCCONF; apply_mc()
        validates/bounds the subset that this F103 backend actually executes.
-       APPCONF still has a narrower runtime backend and keeps its own gate. */
-    if(!unsupported_app_bytes_unchanged(a)) return false;
+       APPCONF juga dipertahankan sebagai image lengkap; apply_app() hanya
+       mengeksekusi subset yang memang didukung board ini. */
     memcpy(s_rollback_mc[MOTOR_LEFT],s_mc_active[MOTOR_LEFT],sizeof(s_rollback_mc[MOTOR_LEFT]));
     memcpy(s_rollback_mc[MOTOR_RIGHT],s_mc_active[MOTOR_RIGHT],sizeof(s_rollback_mc[MOTOR_RIGHT]));
     memcpy(s_rollback_app,s_app_active,sizeof(s_rollback_app));

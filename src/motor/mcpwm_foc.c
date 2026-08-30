@@ -84,7 +84,7 @@ static uint32_t s_isr_last_entry_cycle = 0U;
  * mc_interface_get_last_inj_adc_isr_duration() telemetry getter. This F103
  * target uses the DMA ADC path, not the upstream injected-ADC ISR, but the
  * same DWT cycle-count instrumentation is the honest source for this value. */
-static float s_isr_last_duration_s = 0.0f;
+static volatile uint32_t s_isr_last_cycles = 0U;
 static uint16_t s_vbus_dma_prev_cndtr = 0U;
 static uint8_t s_vbus_dma_stale_count = 0U;
 static volatile uint32_t s_vbus_dma_stale_events = 0U;
@@ -395,7 +395,9 @@ foc_cal_stage_t foc_calibration_stage(void) { return s_cal_stage; }
 
 uint32_t foc_adc_isr_count(void) { return s_adc_isr_count; }
 uint32_t foc_isr_total_max_cycles(void) { return s_isr_total_max_cycles; }
-float foc_last_isr_duration_s(void) { return s_isr_last_duration_s; }
+/* Mengubah jumlah cycle ISR terakhir menjadi detik di konteks task/getter.
+ * ISR 16 kHz hanya menyimpan cycle mentah agar tidak melakukan pembagian float. */
+float foc_last_isr_duration_s(void) { return (float)s_isr_last_cycles / (float)CPU_CLOCK_HZ; }
 uint32_t foc_isr_near_deadline_count(void) { return s_isr_near_deadline_count; }
 uint32_t foc_isr_period_min_cycles(void) {
     return s_isr_period_min_cycles == UINT32_MAX ? 0U : s_isr_period_min_cycles;
@@ -2079,6 +2081,10 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
     if (cycles > s_isr_total_max_cycles) s_isr_total_max_cycles = cycles;
     if (cycles > (slot_cycles * 85U) / 100U) {
         s_isr_near_deadline_count++;
+    }
+    /* Counter overrun hanya bertambah jika satu frame benar-benar melewati
+     * slot FOC. Ambang 85% hanya peringatan dini, bukan overrun. */
+    if (cycles > slot_cycles) {
         g_motor_left.isr_overruns++;
         g_motor_right.isr_overruns++;
     }
@@ -2097,10 +2103,9 @@ void mcpwm_foc_adc_words_isr(const volatile uint32_t adc_words[6]) {
         s_overrun_consecutive[1] = 0U;
     }
 
-    /* Publish the complete dual-motor ISR duration for the VESC-compatible
-     * telemetry getter. DWT is CPU_CLOCK_HZ; the conversion is a single integer
-     * divide, safe on Cortex-M3. */
-    s_isr_last_duration_s = (float)cycles / (float)CPU_CLOCK_HZ;
+    /* Simpan cycle mentah saja. Konversi ke detik dilakukan oleh getter di
+     * luar ISR supaya jalur FOC 16 kHz tetap sesingkat mungkin. */
+    s_isr_last_cycles = cycles;
     s_isr_motor = 0;
 }
 

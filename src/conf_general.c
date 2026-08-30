@@ -154,6 +154,18 @@ static bool store_stage(void){
         s_odo_last_persist[0]=mc_interface_get_odometer_motor(MOTOR_LEFT);s_odo_last_persist[1]=mc_interface_get_odometer_motor(MOTOR_RIGHT);
         return true;
     }
+
+    /* Jika erase/program/verify record baru gagal, record committed lama masih
+     * menjadi fallback. Jangan menandai FLASH_CONFIG corrupt selama masih ada
+     * page lama yang valid; caller tetap menerima false agar write dianggap gagal. */
+    s_integrity_failures++;
+    int fallback=best_page();
+    if(fallback>=0){
+        s_valid=true;s_boot_status=CONF_BOOT_VALID;s_integrity_fault=false;
+        s_save_count=page_hdr((uint32_t)fallback)->sequence;
+        return false;
+    }
+    s_valid=false;s_boot_status=CONF_BOOT_CORRUPT;s_integrity_fault=true;
     return false;
 }
 
