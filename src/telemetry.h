@@ -8,8 +8,8 @@ void telemetry_update_100hz(void);
 void telemetry_stats_update_100hz(void);
 void telemetry_snapshot_100hz(void);
 void telemetry_get(motor_id_t id,motor_telemetry_t *out);
-/* Lock-free task-side snapshot for VESC command replies. Uses the ISR seqlock
- * snapshot so forwarded GET_VALUES cannot block behind the 100-Hz telemetry mutex. */
+/* Lock-free task-side snapshot for VESC command replies. Uses the ISR/cache
+ * seqlock so forwarded GET_VALUES tidak pernah menunggu mutex telemetry. */
 void telemetry_get_realtime(motor_id_t id, motor_telemetry_t *out);
 
 /* VESC COMM_GET_VALUES uses read-reset averages for these six quantities.

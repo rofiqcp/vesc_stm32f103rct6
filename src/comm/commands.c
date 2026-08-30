@@ -95,12 +95,13 @@ static uint8_t s_tx_frame[VESC_PACKET_BUFFER_SIZE];
    of MCCONF rollback/work images on the 3-KiB RTOS worker stack. */
 static uint8_t s_mc_backup[2][VESC6_MCCONF_WIRE_SIZE];
 static uint8_t s_mc_work[VESC6_MCCONF_WIRE_SIZE];
-/* A blocking_job_t is >500 bytes because SET_MCCONF carries the complete
- * VESC packet payload. Keep submit/worker copies in BSS rather than consuming
- * a large fraction of the packet-process and blocking-task stacks. The submit
- * object is only touched by packet_process; xQueueSend copies it atomically. */
-static blocking_job_t s_block_submit_job;
-static blocking_job_t s_block_worker_job;
+/* Satu job blocking bersama cukup karena hanya packet_process yang menjadi
+ * producer dan worker memproses satu transaksi pada satu waktu. Queue hanya
+ * membawa token 1 byte; ini menghindari dua copy BSS + satu copy queue >500 B
+ * tanpa menambah stack task. s_block_busy menjaga buffer tidak ditimpa selama
+ * worker melakukan detect/config flash yang dapat berlangsung lama. */
+static blocking_job_t s_block_job;
+static volatile bool s_block_busy = false;
 /* GET_VALUES is also reached through one-level COMM_FORWARD_CAN recursion.
  * Keep the comparatively large telemetry/average snapshots in BSS rather than
  * on packet_process' stack. This mirrors upstream's packet-buffer/mempool idea
@@ -123,6 +124,7 @@ void blocking_thread(void *argument);
 static void vesc_comm_reply_diag(void);
 static void vesc_comm_send_payload_low_priority(const uint8_t *payload, uint16_t len);
 static void process_terminal_text(const uint8_t *data, uint16_t len, motor_id_t id);
+static bool queue_blocking_raw(uint8_t cmd, motor_id_t id, const uint8_t *data, uint16_t len);
 static void reply_stats(const uint8_t *data, uint16_t len, motor_id_t id);
 static void reply_mcconf_temp(motor_id_t id);
 static void set_mcconf_temp(const uint8_t *data, uint16_t len, motor_id_t id, bool setup);
@@ -786,6 +788,8 @@ static void reply_buzzer_status(uint8_t action, bool accepted) {
     payload_end(i);
 }
 
+/* Proses command diagnostik/custom VESC. Operasi yang dapat memblokir seperti
+ * sensor detect selalu dialihkan ke worker agar parser USART tetap responsif. */
 static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context) {
     /* Upstream COMMANDS_APP_DATA callback semantics: `data` starts at the
      * application payload, i.e. COMM_CUSTOM_APP_DATA itself is stripped. */
@@ -812,20 +816,17 @@ static void process_custom(const uint8_t *data, uint16_t len, motor_id_t context
              * by COMM_DETECT_ENCODER / COMM_DETECT_HALL_FOC. */
             float current = SENSOR_DETECT_CURRENT_A;
             if (len >= 7U) current = (float)get_i32_be(&data[3]) / 1000.0f;
-            /* Reuse the packet-thread-owned static submit buffer.
-             * blocking_job_t is intentionally not allocated on this task's
-             * stack because it carries a full VESC MCCONF-sized payload. */
-            memset(&s_block_submit_job, 0, sizeof(s_block_submit_job));
-            s_block_submit_job.cmd = INTERNAL_CUSTOM_SENSOR_DETECT;
-            s_block_submit_job.motor = (uint8_t)m->id;
-            s_block_submit_job.len = 5U;
-            s_block_submit_job.data[0] = mode;
+            /* Job detect custom tetap masuk worker blocking. Parameternya hanya
+             * 5 byte, jadi aman dibentuk di stack lalu disalin ke single-job
+             * buffer melalui helper reservasi di bawah. */
+            uint8_t params[5];
+            params[0] = mode;
             int32_t ca = scaled_i32(current, 1000.0f);
-            s_block_submit_job.data[1] = (uint8_t)((uint32_t)ca >> 24);
-            s_block_submit_job.data[2] = (uint8_t)((uint32_t)ca >> 16);
-            s_block_submit_job.data[3] = (uint8_t)((uint32_t)ca >> 8);
-            s_block_submit_job.data[4] = (uint8_t)ca;
-            if (xQueueSend(s_block_queue, &s_block_submit_job, 0U) != pdTRUE) {
+            params[1] = (uint8_t)((uint32_t)ca >> 24);
+            params[2] = (uint8_t)((uint32_t)ca >> 16);
+            params[3] = (uint8_t)((uint32_t)ca >> 8);
+            params[4] = (uint8_t)ca;
+            if (!queue_blocking_raw(INTERNAL_CUSTOM_SENSOR_DETECT, m->id, params, sizeof(params))) {
                 s_diag.blocking_busy_drops++;
                 commands_send_print("VESC F103: detection worker busy.");
             }
@@ -975,15 +976,44 @@ static bool blocking_command_length_valid(uint8_t cmd, uint16_t len) {
     }
 }
 
+/* Reservasi single blocking-job. Critical section hanya check/set satu flag;
+ * copy payload dilakukan sesudahnya dan worker belum dapat berjalan sebelum
+ * token dikirim. Selama s_block_busy=true producer berikutnya ditolak agar
+ * worker tidak pernah membaca job yang sedang ditimpa. */
+static bool queue_blocking_raw(uint8_t cmd, motor_id_t id,
+                               const uint8_t *data, uint16_t len) {
+    if (s_block_queue == NULL || len > BLOCK_DATA_MAX || (len > 0U && data == NULL)) return false;
+
+    taskENTER_CRITICAL();
+    if (s_block_busy) {
+        taskEXIT_CRITICAL();
+        return false;
+    }
+    s_block_busy = true;
+    taskEXIT_CRITICAL();
+
+    memset(&s_block_job, 0, sizeof(s_block_job));
+    s_block_job.cmd = cmd;
+    s_block_job.motor = (uint8_t)id;
+    s_block_job.len = len;
+    if (len > 0U) memcpy(s_block_job.data, data, len);
+    __DMB();
+
+    const uint8_t token = 1U;
+    if (xQueueSend(s_block_queue, &token, 0U) != pdTRUE) {
+        taskENTER_CRITICAL();
+        s_block_busy = false;
+        taskEXIT_CRITICAL();
+        return false;
+    }
+    return true;
+}
+
+/* Validasi payload command standar sebelum memindahkannya ke worker blocking. */
 static bool queue_blocking_job(const uint8_t *data, uint16_t len, motor_id_t id) {
-    if (data == NULL || len == 0U || s_block_queue == NULL || len > BLOCK_DATA_MAX) return false;
+    if (data == NULL || len == 0U || len > BLOCK_DATA_MAX) return false;
     if (!blocking_command_length_valid(data[0], len)) return false;
-    memset(&s_block_submit_job, 0, sizeof(s_block_submit_job));
-    s_block_submit_job.cmd = data[0];
-    s_block_submit_job.motor = (uint8_t)id;
-    s_block_submit_job.len = len;
-    memcpy(s_block_submit_job.data, data, len);
-    if (xQueueSend(s_block_queue, &s_block_submit_job, 0U) != pdTRUE) {
+    if (!queue_blocking_raw(data[0], id, data, len)) {
         s_diag.blocking_busy_drops++;
         return false;
     }
@@ -1344,12 +1374,16 @@ static bool battery_cut_apply_both(float start, float end, bool store) {
     return true;
 }
 
+/* Worker tunggal untuk detect dan penulisan konfigurasi yang dapat memblokir.
+ * Single-job buffer dijaga busy flag sehingga payload tidak dapat ditimpa. */
 void blocking_thread(void *argument) {
     (void)argument;
     for (;;) {
-        memset(&s_block_worker_job, 0, sizeof(s_block_worker_job));
-        if (xQueueReceive(s_block_queue, &s_block_worker_job, portMAX_DELAY) != pdTRUE) continue;
-        blocking_job_t *job = &s_block_worker_job;
+        uint8_t token = 0U;
+        if (xQueueReceive(s_block_queue, &token, portMAX_DELAY) != pdTRUE) continue;
+        (void)token;
+        __DMB();
+        blocking_job_t *job = &s_block_job;
         MotorRuntime *m = motor_get(job->motor == MOTOR_RIGHT ? MOTOR_RIGHT : MOTOR_LEFT);
         int old_motor = mc_interface_get_motor_thread();
         mc_interface_select_motor_thread(m->id == MOTOR_RIGHT ? 2 : 1);
@@ -1590,6 +1624,11 @@ void blocking_thread(void *argument) {
             reply_unsupported_detect(job->cmd);
         }
         mc_interface_select_motor_thread(old_motor);
+        /* Lepaskan single-job buffer hanya setelah seluruh reply/rollback selesai. */
+        __DMB();
+        taskENTER_CRITICAL();
+        s_block_busy = false;
+        taskEXIT_CRITICAL();
     }
 }
 
@@ -2029,12 +2068,19 @@ void packet_process_thread(void *argument) {
     }
 }
 
+/* Kirim satu payload VESC dengan kelas prioritas. Reply standar boleh menunggu
+ * UART, sedangkan paket periodik low-priority tidak boleh memblokir timer. */
 static bool vesc_comm_send_payload_class(const uint8_t *payload, uint16_t len, bool low_priority) {
     if (payload == NULL || len == 0U || len > VESC_PACKET_MAX_PAYLOAD) return false;
     const bool running = comm_scheduler_running();
     bool mutex_taken = false;
     if (running && s_send_mutex != NULL) {
-        if (xSemaphoreTake(s_send_mutex, portMAX_DELAY) != pdTRUE) return false;
+        /* Paket low-priority (rotor-position/diagnostik periodik) tidak boleh
+         * menahan timer task di belakang reply VESC Tool. Jika UART sedang
+         * sibuk, drop paket periodik ini dan biarkan slot berikutnya mencoba
+         * lagi; reply request/response standar tetap menunggu sampai terkirim. */
+        const TickType_t wait = low_priority ? 0U : portMAX_DELAY;
+        if (xSemaphoreTake(s_send_mutex, wait) != pdTRUE) return false;
         mutex_taken = true;
     }
     uint16_t frame_len = vesc_packet_encode(payload, len, s_tx_frame, sizeof(s_tx_frame));
@@ -2291,6 +2337,8 @@ void vesc_comm_set_thread_ids(TaskHandle_t packet, TaskHandle_t blocking) {
     s_blocking_tp = blocking;
 }
 
+/* Inisialisasi resource komunikasi VESC. Queue blocking hanya membawa token
+ * 1 byte karena payload tersimpan pada single-job buffer statik yang aman. */
 bool vesc_comm_task_init(void) {
     if (s_comm_initialized) return true;
     memset((void *)&s_diag, 0, sizeof(s_diag));
@@ -2299,11 +2347,12 @@ bool vesc_comm_task_init(void) {
     s_display_owner = -1;
     s_motor_ready = false;
     s_config_ready = false;
+    s_block_busy = false;
     vesc_packet_parser_init(&s_parser);
 
     s_payload_mutex = xSemaphoreCreateMutex();
     s_send_mutex = xSemaphoreCreateMutex();
-    s_block_queue = xQueueCreate(BLOCK_QUEUE_DEPTH, sizeof(blocking_job_t));
+    s_block_queue = xQueueCreate(BLOCK_QUEUE_DEPTH, sizeof(uint8_t));
 
     if (s_payload_mutex == NULL || s_send_mutex == NULL || s_block_queue == NULL) {
         return false;

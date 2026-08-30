@@ -58,6 +58,8 @@ static uint64_t s_odo_last_persist[2]={0U,0U};
 static volatile bool s_integrity_fault=false;
 static uint32_t s_integrity_checks=0U, s_integrity_failures=0U;
 static uint8_t s_integrity_div=0U;
+static volatile bool s_store_busy=false;
+static uint8_t s_aux_retry_div=0U;
 /* Large (~1.5 KiB) flash staging record is static, never placed on a small RTOS thread stack. */
 static config_record_t s_stage;
 static uint32_t crc32_ieee(const uint8_t *p,uint32_t n){
@@ -78,6 +80,24 @@ static bool config_region_blank(void){
     return true;
 }
 static int best_page(void){int best=-1;uint32_t seq=0;for(uint32_t p=0;p<CFG_PAGE_COUNT;p++){const config_record_header_t*h=page_hdr(p);if(rec_valid_page(p)&&(best<0||h->sequence>seq)){best=(int)p;seq=h->sequence;}}return best;}
+
+/* Serialisasi semua transaksi flash config. Blocking worker dan timer 100 Hz
+ * sama-sama dapat meminta penyimpanan; tanpa guard ini keduanya bisa menimpa
+ * s_stage dan mengakses erase/program flash secara bersamaan. Critical section
+ * hanya melindungi flag, bukan operasi flash yang panjang. */
+static bool store_lock_try(void){
+    bool ok=false;
+    taskENTER_CRITICAL();
+    if(!s_store_busy){s_store_busy=true;ok=true;}
+    taskEXIT_CRITICAL();
+    return ok;
+}
+static void store_unlock(void){
+    taskENTER_CRITICAL();
+    s_store_busy=false;
+    taskEXIT_CRITICAL();
+}
+
 static uint64_t get_u64_be8(const uint8_t b[8]){uint64_t v=0U;for(unsigned i=0;i<8U;i++)v=(v<<8)|b[i];return v;}
 static void put_u64_be8(uint8_t b[8],uint64_t v){for(int i=7;i>=0;i--){b[i]=(uint8_t)v;v>>=8;}}
 
@@ -188,28 +208,40 @@ static void stage_persistent_base(void){
 }
 
 bool conf_general_store_all(void){
+    if(!store_lock_try())return false;
     memset(&s_stage,0,sizeof(s_stage));
     vesc_config_export_wire(s_stage.payload.mc_left,s_stage.payload.mc_right,s_stage.payload.app);
-    return store_stage();
+    bool ok=store_stage();
+    store_unlock();
+    return ok;
 }
 
 bool conf_general_store_mc_wire_persistent(motor_id_t id,const uint8_t *wire){
     if(!wire||(id!=MOTOR_LEFT&&id!=MOTOR_RIGHT))return false;
+    if(!store_lock_try())return false;
     memset(&s_stage,0,sizeof(s_stage));stage_persistent_base();
     memcpy(id==MOTOR_RIGHT?s_stage.payload.mc_right:s_stage.payload.mc_left,wire,VESC6_MCCONF_WIRE_SIZE);
-    return store_stage();
+    bool ok=store_stage();
+    store_unlock();
+    return ok;
 }
 
 bool conf_general_store_app_wire_persistent(const uint8_t *wire){
     if(!wire)return false;
+    if(!store_lock_try())return false;
     memset(&s_stage,0,sizeof(s_stage));stage_persistent_base();
     memcpy(s_stage.payload.app,wire,VESC6_APPCONF_WIRE_SIZE);
-    return store_stage();
+    bool ok=store_stage();
+    store_unlock();
+    return ok;
 }
 
 static bool conf_general_store_aux_only(void){
+    if(!store_lock_try())return false;
     memset(&s_stage,0,sizeof(s_stage));stage_persistent_base();
-    return store_stage();
+    bool ok=store_stage();
+    store_unlock();
+    return ok;
 }
 bool conf_general_is_valid(void){return s_valid && !s_integrity_fault;}
 conf_boot_status_t conf_general_boot_status(void){return s_boot_status;}
@@ -248,7 +280,12 @@ void conf_general_service_100hz(void){
     if(dl>=1000U||dr>=1000U)s_aux_store_pending=true;
     if(!s_aux_store_pending)return;
     if(g_motor_left.pwm_enabled||g_motor_right.pwm_enabled||g_motor_left.command_active||g_motor_right.command_active)return;
-    if(conf_general_store_aux_only())s_aux_store_pending=false;
+    /* Auto-save tidak boleh mencoba erase/program setiap 10 ms ketika flash
+     * sedang dipakai task lain atau transaksi sebelumnya gagal. Retry maksimum
+     * sekitar 1 Hz; explicit MCCONF/APPCONF write tetap mencoba langsung. */
+    if(s_aux_retry_div>0U){s_aux_retry_div--;return;}
+    if(conf_general_store_aux_only()){s_aux_store_pending=false;s_aux_retry_div=0U;}
+    else{s_aux_retry_div=100U;}
 }
 
 /* ==================== Canonical VESC configuration API ==================== */

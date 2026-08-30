@@ -5,7 +5,6 @@
 #include "motor/foc_math.h"
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h"
 #include <string.h>
 #include <math.h>
 
@@ -17,24 +16,29 @@ typedef struct {
 } telemetry_avg_acc_t;
 
 static telemetry_avg_acc_t s_avg[2];
-static SemaphoreHandle_t s_telem_mutex = NULL;
+/* Seqlock ringan untuk cache telemetry task-side. Writer hanya 100 Hz dan
+ * reader tidak pernah menunggu mutex, sehingga polling VESC Tool tidak dapat
+ * menahan timer task atau jalur kontrol motor. */
+static volatile uint32_t s_telem_seq[2];
 
 static bool read_rt_snapshot(const MotorRuntime *m, foc_rt_snapshot_t *out);
 
+/* Inisialisasi cache telemetry tanpa alokasi heap.
+ * Tidak ada mutex yang dapat memblokir task timer maupun packet-process. */
 bool telemetry_init(void){
     memset(s_telem,0,sizeof(s_telem));
     memset(s_avg,0,sizeof(s_avg));
-    if (s_telem_mutex == NULL) {
-        s_telem_mutex = xSemaphoreCreateMutex();
-    }
-    return s_telem_mutex != NULL;
+    s_telem_seq[0]=0U;
+    s_telem_seq[1]=0U;
+    return true;
 }
 
-static void accumulate_avg(unsigned idx, const MotorRuntime *m) {
-    /* Ambil semua komponen arus/tegangan dari satu snapshot FOC yang koheren.
-     * Ini mencegah Id/Iq/Vd/Vq/Iin tercampur dari dua frame ADC berbeda. */
+/* Bangun enam nilai average dari SATU frame FOC koheren. Semua operasi float
+ * termasuk sqrtf dilakukan di luar critical section agar ADC/FOC ISR 16 kHz
+ * tidak tertunda oleh pekerjaan telemetry 100 Hz. */
+static bool build_avg_values(const MotorRuntime *m, float v[6]) {
     foc_rt_snapshot_t rt;
-    if (!read_rt_snapshot(m, &rt)) return;
+    if (m == NULL || v == NULL || !read_rt_snapshot(m, &rt)) return false;
 
     const float is = FOC_CURRENT_Q_BASE_A / 32768.0f;
     const float vs = FOC_VOLTAGE_Q_BASE_V / 32768.0f;
@@ -42,10 +46,20 @@ static void accumulate_avg(unsigned idx, const MotorRuntime *m) {
     const float iq = (float)rt.iq_filter_q15 * is;
     const float imotor_mag = sqrtf(id * id + iq * iq);
     const float iin = (float)rt.dc_current_q15 * is;
-    const float imotor = iin < 0.0f ? -imotor_mag : imotor_mag;
-    const float vd = (float)rt.vd_q15 * vs;
-    const float vq = (float)rt.vq_q15 * vs;
-    const float v[6] = {imotor, iin, id, iq, vd, vq};
+    v[0] = iin < 0.0f ? -imotor_mag : imotor_mag;
+    v[1] = iin;
+    v[2] = id;
+    v[3] = iq;
+    v[4] = (float)rt.vd_q15 * vs;
+    v[5] = (float)rt.vq_q15 * vs;
+    return true;
+}
+
+/* Tambahkan hasil average ke accumulator. Fungsi ini dipanggil saat scheduler
+ * disuspend (IRQ tetap aktif): maksimal 12 penjumlahan/counter untuk dua motor,
+ * tanpa sqrtf dan tanpa snapshot copy. */
+static void accumulate_avg_values(unsigned idx, const float v[6]) {
+    if (idx >= 2U || v == NULL) return;
     for (unsigned k = 0U; k < 6U; k++) {
         s_avg[idx].sum[k] += v[k];
         if (s_avg[idx].count[k] != UINT32_MAX) s_avg[idx].count[k]++;
@@ -158,23 +172,45 @@ static void snapshot(MotorRuntime *m,motor_telemetry_t *t){
     t->under_voltage_fault_count=m->under_voltage_fault_count;
 }
 
+/* Update statistik dan average 100 Hz. Matematika FOC selesai sebelum scheduler
+ * disuspend; interrupt prioritas tinggi termasuk ADC/DMA tetap dapat berjalan. */
 void telemetry_stats_update_100hz(void){
-    /* The accumulator is also consumed by packet_process. Protect only the
-     * six small sum/count pairs with a short scheduler critical section; do
-     * not hold a mutex across floating-point command encoding. */
-    taskENTER_CRITICAL();
-    accumulate_avg(0U,&g_motor_left);
-    accumulate_avg(1U,&g_motor_right);
-    taskEXIT_CRITICAL();
+    float left_v[6];
+    float right_v[6];
+    const bool have_left = build_avg_values(&g_motor_left,left_v);
+    const bool have_right = build_avg_values(&g_motor_right,right_v);
+
+    /* Hanya task yang mengakses accumulator. Suspend scheduler menjaga
+     * read-reset atomik TANPA mematikan ADC/DMA interrupt prioritas tinggi. */
+    vTaskSuspendAll();
+    if (have_left) accumulate_avg_values(0U,left_v);
+    if (have_right) accumulate_avg_values(1U,right_v);
+    (void)xTaskResumeAll();
+
     update_stats(&g_motor_left,STAT_PERIOD_MS/1000.0f);
     update_stats(&g_motor_right,STAT_PERIOD_MS/1000.0f);
 }
 
+/* Tulis cache telemetry langsung di bawah seqlock. Tidak memakai temporary
+ * motor_telemetry_t di stack timer 1 KiB dan tidak memakai mutex/heap. Pada
+ * single-core F103 packet task tidak dapat berjalan bersamaan dengan writer;
+ * sequence tetap melindungi pembacaan jika ada perubahan scheduling kelak. */
+static void update_cached_snapshot(unsigned idx, MotorRuntime *m) {
+    if (idx >= 2U || m == NULL) return;
+    uint32_t seq = s_telem_seq[idx];
+    s_telem_seq[idx] = seq + 1U;
+    __DMB();
+    memset(&s_telem[idx],0,sizeof(s_telem[idx]));
+    snapshot(m,&s_telem[idx]);
+    __DMB();
+    s_telem_seq[idx] = seq + 2U;
+}
+
+/* Ambil snapshot 100 Hz tanpa mutex/heap dan tanpa menambah stack besar pada
+ * timer_thread. */
 void telemetry_snapshot_100hz(void){
-    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, portMAX_DELAY) == pdTRUE;
-    snapshot(&g_motor_left,&s_telem[0]);
-    snapshot(&g_motor_right,&s_telem[1]);
-    if(locked)(void)xSemaphoreGive(s_telem_mutex);
+    update_cached_snapshot(0U,&g_motor_left);
+    update_cached_snapshot(1U,&g_motor_right);
 }
 
 void telemetry_update_100hz(void){
@@ -182,18 +218,23 @@ void telemetry_update_100hz(void){
     telemetry_snapshot_100hz();
 }
 
+/* Baca cache telemetry secara lock-free. Jika writer bertepatan terus dengan
+ * pembacaan, fallback ke snapshot realtime agar komunikasi tidak pernah macet. */
 void telemetry_get(motor_id_t id,motor_telemetry_t *out){
     if(out==NULL)return;
-    uint32_t idx=(id==MOTOR_RIGHT)?1U:0U;
-    bool locked=s_telem_mutex != NULL && xSemaphoreTake(s_telem_mutex, pdMS_TO_TICKS(5U)) == pdTRUE;
-    if (locked) {
+    const uint32_t idx=(id==MOTOR_RIGHT)?1U:0U;
+    for (unsigned retry=0U; retry<8U; retry++) {
+        const uint32_t s1=s_telem_seq[idx];
+        if ((s1 & 1U) != 0U) continue;
+        __DMB();
         *out=s_telem[idx];
-        (void)xSemaphoreGive(s_telem_mutex);
-    } else {
-        /* Never let diagnostics/GUI polling deadlock motor communication. */
-        memset(out,0,sizeof(*out));
-        snapshot(motor_get(id),out);
+        __DMB();
+        const uint32_t s2=s_telem_seq[idx];
+        if (s1==s2 && (s2 & 1U)==0U) return;
     }
+
+    memset(out,0,sizeof(*out));
+    snapshot(motor_get(id),out);
 }
 
 void telemetry_get_realtime(motor_id_t id, motor_telemetry_t *out) {
@@ -203,6 +244,8 @@ void telemetry_get_realtime(motor_id_t id, motor_telemetry_t *out) {
     if (m != NULL) snapshot(m, out);
 }
 
+/* Baca lalu reset average VESC untuk I_motor/I_in/Id/Iq/Vd/Vq. Scheduler
+ * disuspend sebentar agar transaksi atomik, sementara ADC/FOC IRQ tetap aktif. */
 void telemetry_read_reset_avg(motor_id_t id, uint32_t mask, motor_telemetry_avg_t *out) {
     if (out == NULL) return;
     const unsigned idx = (id == MOTOR_RIGHT) ? 1U : 0U;
@@ -242,7 +285,9 @@ void telemetry_read_reset_avg(motor_id_t id, uint32_t mask, motor_telemetry_avg_
     float sum[6] = {0};
     uint32_t count[6] = {0};
 
-    taskENTER_CRITICAL();
+    /* Packet task dan timer task diserialisasi oleh scheduler, bukan global
+     * IRQ mask. ADC/FOC ISR tetap dapat preempt selama copy/reset ini. */
+    vTaskSuspendAll();
     for (unsigned k = 0U; k < 6U; k++) {
         if ((mask & (1UL << bits[k])) != 0U) {
             sum[k] = s_avg[idx].sum[k];
@@ -251,7 +296,7 @@ void telemetry_read_reset_avg(motor_id_t id, uint32_t mask, motor_telemetry_avg_
             s_avg[idx].count[k] = 0U;
         }
     }
-    taskEXIT_CRITICAL();
+    (void)xTaskResumeAll();
 
     float value[6];
     for (unsigned k = 0U; k < 6U; k++) {
