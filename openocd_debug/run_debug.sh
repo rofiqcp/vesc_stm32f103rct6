@@ -21,6 +21,7 @@ STARTED_OPENOCD=0
 OPENOCD_PID=""
 GDB_CMDS=""
 
+# Fungsi usage: menjalankan operasi usage sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 usage() {
   cat <<USAGE
 Usage: ./openocd_debug/run_debug.sh [options]
@@ -43,9 +44,13 @@ for arg in "$@"; do
   esac
 done
 
+# Fungsi find_exe: mencari find exe berdasarkan kriteria yang diberikan dan mengembalikan kandidat yang sesuai.
 find_exe() {
+  # Variabel shift: variabel lokal shell untuk menyimpan state atau argumen sementara hanya selama fungsi ini berjalan.
+  # Variabel name: variabel lokal shell untuk menyimpan state atau argumen sementara hanya selama fungsi ini berjalan.
   local name="$1"; shift
   if command -v "$name" >/dev/null 2>&1; then command -v "$name"; return 0; fi
+  # Variabel c: variabel lokal shell untuk menyimpan state atau argumen sementara hanya selama fungsi ini berjalan.
   local c
   for c in "$@"; do [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }; done
   return 1
@@ -60,6 +65,7 @@ READELF="$(find_exe arm-none-eabi-readelf \
   "$HOME/.platformio/packages/toolchain-gccarmnoneeabi@1.70201.0/bin/arm-none-eabi-readelf" 2>/dev/null || true)"
 OPENOCD="$(find_exe openocd /usr/bin/openocd /usr/local/bin/openocd 2>/dev/null || true)"
 
+# Fungsi reset_target_run_best_effort: mereset reset target run best effort ke keadaan awal yang aman untuk pengujian berikutnya.
 reset_target_run_best_effort() {
   # GDB normally executes hook-quit below. This second path is deliberate: it
   # also covers Ctrl-C/terminal closure or a GDB crash. Do not depend on netcat
@@ -84,7 +90,9 @@ PY_RESET
   fi
 }
 
+# Fungsi cleanup: menjalankan operasi cleanup sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 cleanup() {
+  # Variabel rc: variabel lokal shell untuk menyimpan state atau argumen sementara hanya selama fungsi ini berjalan.
   local rc=$?
   [[ -n "$GDB_CMDS" && -f "$GDB_CMDS" ]] && rm -f "$GDB_CMDS"
   if [[ "$STARTED_OPENOCD" -eq 1 && -n "$OPENOCD_PID" ]]; then
@@ -100,6 +108,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Fungsi port3333: menjalankan operasi port3333 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 port3333() {
   if command -v ss >/dev/null 2>&1; then
     ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)3333$'
@@ -110,7 +119,9 @@ port3333() {
   fi
 }
 
+# Fungsi wait_openocd: menunggu wait openocd dengan batas waktu agar tool tidak menggantung tanpa kendali.
 wait_openocd() {
+  # Variabel i: variabel lokal shell untuk menyimpan state atau argumen sementara hanya selama fungsi ini berjalan.
   local i
   for i in {1..60}; do
     port3333 && return 0
@@ -120,7 +131,9 @@ wait_openocd() {
   return 1
 }
 
+# Fungsi start_openocd_cfg: menjalankan operasi start openocd cfg sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 start_openocd_cfg() {
+  # Variabel cfg: variabel lokal shell untuk menyimpan state atau argumen sementara hanya selama fungsi ini berjalan.
   local cfg="$1"
   : > "$OPENOCD_LOG"
   "$OPENOCD" -f "$cfg" >"$OPENOCD_LOG" 2>&1 &

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+// Variabel SystemCoreClock: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
 extern uint32_t SystemCoreClock;
 
 /* Native FreeRTOS configuration. Application task priorities intentionally

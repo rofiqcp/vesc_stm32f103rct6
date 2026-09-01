@@ -22,18 +22,29 @@
  * never runs in interrupt context. This removes the previous custom DMA/ring race.
  */
 
+// Variabel huart3_vesc: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
 UART_HandleTypeDef huart3_vesc;
+// Variabel hdma_usart3_rx: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
 DMA_HandleTypeDef hdma_usart3_rx;
+// Variabel hdma_usart3_tx: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
 DMA_HandleTypeDef hdma_usart3_tx;
 
+// Variabel s_transport_initialized: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static bool s_transport_initialized = false;
+// Variabel s_rx_dma: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static uint8_t s_rx_dma[VESC_UART_RX_DMA_SIZE] __attribute__((aligned(4)));
+// Variabel s_rx_read_pos: nilai posisi rotor atau aktuator.
 static volatile uint16_t s_rx_read_pos = 0U;
+// Variabel s_rx_restart_needed: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile bool s_rx_restart_needed = false;
 
+// Variabel s_tx_mutex: handle sinkronisasi untuk melindungi resource bersama.
 static SemaphoreHandle_t s_tx_mutex;
+// Variabel s_packet_mutex: handle sinkronisasi untuk melindungi resource bersama.
 static SemaphoreHandle_t s_packet_mutex;
+// Variabel s_packet_frame: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static uint8_t s_packet_frame[VESC_UART_TX_FRAME_MAX];
+// Variabel g_vesc_uart_stats: state global firmware yang dibagikan antarbagian modul.
 app_uartcomm_stats_t g_vesc_uart_stats;
 #define s_stats g_vesc_uart_stats
 
@@ -42,15 +53,22 @@ _Static_assert((VESC_UART_RX_DMA_SIZE & (VESC_UART_RX_DMA_SIZE - 1U)) == 0U,
 _Static_assert(VESC_UART_TX_FRAME_MAX >= VESC_PACKET_BUFFER_SIZE,
                "VESC UART TX frame buffer must fit maximum packet frame");
 
+// Fungsi rx_dma_write_pos: menyusun atau mengirim rx dma write pos dengan pemeriksaan panjang buffer dan jalur
+// transport yang aman.
 static uint16_t rx_dma_write_pos(void) {
+    // Variabel ch: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     DMA_Channel_TypeDef *ch = hdma_usart3_rx.Instance;
-    if (ch == NULL) return s_rx_read_pos;
+    if (ch == NULL)
+        return s_rx_read_pos;
     return (uint16_t)((VESC_UART_RX_DMA_SIZE - ch->CNDTR) &
                       (VESC_UART_RX_DMA_SIZE - 1U));
 }
 
+// Fungsi restart_rx_dma_if_needed: menjalankan operasi restart rx dma if needed sesuai tanggung jawab modul
+// dengan input tervalidasi dan state yang konsisten.
 static bool restart_rx_dma_if_needed(void) {
-    if (!s_rx_restart_needed) return true;
+    if (!s_rx_restart_needed)
+        return true;
 
     /* Recovery is task-context only. Do not restart a HAL DMA stream from the
      * interrupt context. Discard any incomplete VESC frame and resume at index 0;
@@ -78,8 +96,13 @@ static bool restart_rx_dma_if_needed(void) {
     return true;
 }
 
+// Parameter huart: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi HAL_UART_MspInit: menginisialisasi hal uart msp init sehingga resource, konfigurasi awal, dan state
+// modul siap digunakan dengan aman.
 void HAL_UART_MspInit(UART_HandleTypeDef *huart) {
-    if (huart == NULL || huart->Instance != USART3) return;
+    if (huart == NULL || huart->Instance != USART3)
+        return;
 
     __HAL_RCC_AFIO_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -91,7 +114,11 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart) {
      * motor_hw_init() applies the complete known-safe MAPR image once while
      * explicitly preserving SWD. */
 
-    GPIO_InitTypeDef gpio = {0};
+    // Variabel gpio: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
+    GPIO_InitTypeDef gpio = {
+        0
+    }
+    ;
     gpio.Pin = VESC_UART_TX_PIN;
     gpio.Mode = GPIO_MODE_AF_PP;
     gpio.Speed = GPIO_SPEED_FREQ_HIGH;
@@ -110,7 +137,8 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart) {
     hdma_usart3_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
     hdma_usart3_rx.Init.Mode = DMA_CIRCULAR;
     hdma_usart3_rx.Init.Priority = DMA_PRIORITY_LOW;
-    if (HAL_DMA_Init(&hdma_usart3_rx) != HAL_OK) return;
+    if (HAL_DMA_Init(&hdma_usart3_rx) != HAL_OK)
+        return;
     __HAL_LINKDMA(huart, hdmarx, hdma_usart3_rx);
 
     hdma_usart3_tx.Instance = DMA1_Channel2;
@@ -121,7 +149,8 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart) {
     hdma_usart3_tx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
     hdma_usart3_tx.Init.Mode = DMA_NORMAL;
     hdma_usart3_tx.Init.Priority = DMA_PRIORITY_LOW;
-    if (HAL_DMA_Init(&hdma_usart3_tx) != HAL_OK) return;
+    if (HAL_DMA_Init(&hdma_usart3_tx) != HAL_OK)
+        return;
     __HAL_LINKDMA(huart, hdmatx, hdma_usart3_tx);
 
     /* Same DMA channels as SmartESC. Priority 5 is below hard-real-time FOC
@@ -140,8 +169,13 @@ void HAL_UART_MspInit(UART_HandleTypeDef *huart) {
     HAL_NVIC_ClearPendingIRQ(USART3_IRQn);
 }
 
+// Parameter huart: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi HAL_UART_MspDeInit: menginisialisasi hal uart msp de init sehingga resource, konfigurasi awal, dan
+// state modul siap digunakan dengan aman.
 void HAL_UART_MspDeInit(UART_HandleTypeDef *huart) {
-    if (huart == NULL || huart->Instance != USART3) return;
+    if (huart == NULL || huart->Instance != USART3)
+        return;
 
     HAL_NVIC_DisableIRQ(USART3_IRQn);
     HAL_NVIC_DisableIRQ(DMA1_Channel2_IRQn);
@@ -152,8 +186,11 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef *huart) {
     __HAL_RCC_USART3_CLK_DISABLE();
 }
 
+// Fungsi app_uartcomm_init: menginisialisasi app uartcomm init sehingga resource, konfigurasi awal, dan state
+// modul siap digunakan dengan aman.
 bool app_uartcomm_init(void) {
-    if (s_transport_initialized) return true;
+    if (s_transport_initialized)
+        return true;
 
     memset((void *)&s_stats, 0, sizeof(s_stats));
     memset(s_rx_dma, 0, sizeof(s_rx_dma));
@@ -163,7 +200,8 @@ bool app_uartcomm_init(void) {
 
     s_tx_mutex = xSemaphoreCreateMutex();
     s_packet_mutex = xSemaphoreCreateMutex();
-    if (s_tx_mutex == NULL || s_packet_mutex == NULL) return false;
+    if (s_tx_mutex == NULL || s_packet_mutex == NULL)
+        return false;
 
     memset(&huart3_vesc, 0, sizeof(huart3_vesc));
     huart3_vesc.Instance = USART3;
@@ -174,7 +212,8 @@ bool app_uartcomm_init(void) {
     huart3_vesc.Init.Mode = UART_MODE_TX_RX;
     huart3_vesc.Init.HwFlowCtl = UART_HWCONTROL_NONE;
     huart3_vesc.Init.OverSampling = UART_OVERSAMPLING_16;
-    if (HAL_UART_Init(&huart3_vesc) != HAL_OK) return false;
+    if (HAL_UART_Init(&huart3_vesc) != HAL_OK)
+        return false;
 
     if (huart3_vesc.hdmarx != &hdma_usart3_rx ||
         huart3_vesc.hdmatx != &hdma_usart3_tx) {
@@ -192,13 +231,22 @@ bool app_uartcomm_init(void) {
     return true;
 }
 
+// Parameter byte: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi app_uartcomm_rx_get: membaca app uartcomm rx get tanpa mengubah state kendali utama dan mengembalikan
+// data yang konsisten.
 bool app_uartcomm_rx_get(uint8_t *byte) {
-    if (byte == NULL || !s_transport_initialized) return false;
-    if (!restart_rx_dma_if_needed()) return false;
+    if (byte == NULL || !s_transport_initialized)
+        return false;
+    if (!restart_rx_dma_if_needed())
+        return false;
 
+    // Variabel write_pos: nilai posisi rotor atau aktuator.
     const uint16_t write_pos = rx_dma_write_pos();
+    // Variabel read_pos: nilai posisi rotor atau aktuator.
     uint16_t read_pos = s_rx_read_pos;
-    if (read_pos == write_pos) return false;
+    if (read_pos == write_pos)
+        return false;
 
     *byte = s_rx_dma[read_pos];
     read_pos = (uint16_t)((read_pos + 1U) & (VESC_UART_RX_DMA_SIZE - 1U));
@@ -207,16 +255,24 @@ bool app_uartcomm_rx_get(uint8_t *byte) {
     return true;
 }
 
+// Parameter timeout_ticks: batas atau state waktu untuk pengamanan komunikasi dan kendali.
+// Fungsi uart_tx_wait_ready: menjalankan operasi uart tx wait ready sesuai tanggung jawab modul dengan input
+// tervalidasi dan state yang konsisten.
 static bool uart_tx_wait_ready(TickType_t timeout_ticks) {
+    // Variabel scheduler_running: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const bool scheduler_running =
         xTaskGetSchedulerState() == taskSCHEDULER_RUNNING;
+    // Variabel start_tick: nilai tick scheduler untuk pengukuran waktu.
     const TickType_t start_tick = scheduler_running ? xTaskGetTickCount() : 0U;
+    // Variabel start_ms: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const uint32_t start_ms = scheduler_running ? 0U : HAL_GetTick();
+    // Variabel timeout_ms: batas atau state waktu untuk pengamanan komunikasi dan kendali.
     uint32_t timeout_ms = ((uint32_t)timeout_ticks * 1000U) /
                           (uint32_t)configTICK_RATE_HZ;
-    if (timeout_ms == 0U) timeout_ms = 1U;
+    if (timeout_ms == 0U)
+        timeout_ms = 1U;
 
-    for (;;) {
+    for (;; ) {
         /* RX DMA is permanently BUSY_RX. Never use HAL_UART_GetState() here,
          * because it combines gState and RxState. SmartESC only needs the TX
          * side to be idle before starting the next DMA frame. */
@@ -226,25 +282,36 @@ static bool uart_tx_wait_ready(TickType_t timeout_ticks) {
         }
 
         if (scheduler_running) {
-            if ((xTaskGetTickCount() - start_tick) >= timeout_ticks) return false;
+            if ((xTaskGetTickCount() - start_tick) >= timeout_ticks)
+                return false;
             vTaskDelay(pdMS_TO_TICKS(1U));
-        } else {
-            if ((HAL_GetTick() - start_ms) >= timeout_ms) return false;
+        }
+        else {
+            if ((HAL_GetTick() - start_ms) >= timeout_ms)
+                return false;
             HAL_Delay(1U);
         }
     }
 }
 
+// Parameter timeout_ticks: batas atau state waktu untuk pengamanan komunikasi dan kendali.
+// Fungsi uart_tx_wait_complete: menjalankan operasi uart tx wait complete sesuai tanggung jawab modul dengan
+// input tervalidasi dan state yang konsisten.
 static bool uart_tx_wait_complete(TickType_t timeout_ticks) {
+    // Variabel scheduler_running: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const bool scheduler_running =
         xTaskGetSchedulerState() == taskSCHEDULER_RUNNING;
+    // Variabel start_tick: nilai tick scheduler untuk pengukuran waktu.
     const TickType_t start_tick = scheduler_running ? xTaskGetTickCount() : 0U;
+    // Variabel start_ms: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const uint32_t start_ms = scheduler_running ? 0U : HAL_GetTick();
+    // Variabel timeout_ms: batas atau state waktu untuk pengamanan komunikasi dan kendali.
     uint32_t timeout_ms = ((uint32_t)timeout_ticks * 1000U) /
                           (uint32_t)configTICK_RATE_HZ;
-    if (timeout_ms == 0U) timeout_ms = 1U;
+    if (timeout_ms == 0U)
+        timeout_ms = 1U;
 
-    for (;;) {
+    for (;; ) {
         /* HAL's DMA IRQ puts the DMA handle back to READY. In non-circular TX
          * HAL then enables UART TCIE and leaves gState BUSY_TX until USART TC.
          * SmartESC manually releases gState; here we additionally wait for the
@@ -258,15 +325,23 @@ static bool uart_tx_wait_complete(TickType_t timeout_ticks) {
         }
 
         if (scheduler_running) {
-            if ((xTaskGetTickCount() - start_tick) >= timeout_ticks) return false;
+            if ((xTaskGetTickCount() - start_tick) >= timeout_ticks)
+                return false;
             vTaskDelay(pdMS_TO_TICKS(1U));
-        } else {
-            if ((HAL_GetTick() - start_ms) >= timeout_ms) return false;
+        }
+        else {
+            if ((HAL_GetTick() - start_ms) >= timeout_ms)
+                return false;
             HAL_Delay(1U);
         }
     }
 }
 
+// Parameter data: pointer atau data kerja yang diproses oleh fungsi.
+// Parameter len: panjang data dalam byte yang boleh diproses.
+// Parameter low_priority: prioritas task atau interrupt.
+// Fungsi app_uartcomm_write_raw_class: menyusun atau mengirim app uartcomm write raw class dengan pemeriksaan
+// panjang buffer dan jalur transport yang aman.
 static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len,
                                          bool low_priority) {
     if (!s_transport_initialized || data == NULL || len == 0U ||
@@ -274,13 +349,17 @@ static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len,
         return false;
     }
 
+    // Variabel scheduler_running: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const bool scheduler_running =
         xTaskGetSchedulerState() == taskSCHEDULER_RUNNING;
+    // Variabel mutex_taken: handle sinkronisasi untuk melindungi resource bersama.
     bool mutex_taken = false;
     if (scheduler_running) {
+        // Variabel lock_wait: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         TickType_t lock_wait = low_priority ? 0U : pdMS_TO_TICKS(100U);
         if (xSemaphoreTake(s_tx_mutex, lock_wait) != pdTRUE) {
-            if (low_priority) s_stats.tx_low_priority_drops++;
+            if (low_priority)
+                s_stats.tx_low_priority_drops++;
             else s_stats.tx_queue_busy_drops++;
             return false;
         }
@@ -290,6 +369,7 @@ static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len,
      * this path (early-fatal recovery polling), so do not touch mutex ownership
      * at all. This keeps COMM_FW_VERSION usable even if motor init fails. */
 
+    // Variabel ok: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     bool ok = false;
     if (!uart_tx_wait_ready(pdMS_TO_TICKS(100U))) {
         s_stats.uart_errors++;
@@ -301,67 +381,108 @@ static bool app_uartcomm_write_raw_class(const uint8_t *data, uint16_t len,
         if (uart_tx_wait_complete(pdMS_TO_TICKS(100U))) {
             s_stats.tx_bytes += len;
             ok = true;
-        } else {
+        }
+        else {
             s_stats.uart_errors++;
             s_stats.tx_overruns++;
             (void)HAL_UART_AbortTransmit(&huart3_vesc);
             __HAL_UART_DISABLE_IT(&huart3_vesc, UART_IT_TC);
             huart3_vesc.gState = HAL_UART_STATE_READY;
         }
-    } else {
+    }
+    else {
         s_stats.uart_errors++;
         s_stats.tx_overruns++;
     }
 
-    if (mutex_taken) (void)xSemaphoreGive(s_tx_mutex);
+    if (mutex_taken)
+        (void)xSemaphoreGive(s_tx_mutex);
     return ok;
 }
 
+// Parameter data: pointer atau data kerja yang diproses oleh fungsi.
+// Parameter len: panjang data dalam byte yang boleh diproses.
+// Fungsi app_uartcomm_write_raw: menyusun atau mengirim app uartcomm write raw dengan pemeriksaan panjang
+// buffer dan jalur transport yang aman.
 bool app_uartcomm_write_raw(const uint8_t *data, uint16_t len) {
     return app_uartcomm_write_raw_class(data, len, false);
 }
 
+// Parameter data: pointer atau data kerja yang diproses oleh fungsi.
+// Parameter len: panjang data dalam byte yang boleh diproses.
+// Fungsi app_uartcomm_write_raw_low_priority: menyusun atau mengirim app uartcomm write raw low priority dengan
+// pemeriksaan panjang buffer dan jalur transport yang aman.
 bool app_uartcomm_write_raw_low_priority(const uint8_t *data, uint16_t len) {
     return app_uartcomm_write_raw_class(data, len, true);
 }
 
+// Fungsi app_uartcomm_dma_rx_irq_handler: menangani app uartcomm dma rx irq handler pada konteks interrupt
+// dengan pekerjaan minimum agar timing FOC tetap deterministik.
 void app_uartcomm_dma_rx_irq_handler(void) {
     s_stats.rx_dma_irq_count++;
     HAL_DMA_IRQHandler(&hdma_usart3_rx);
 }
 
+// Fungsi app_uartcomm_dma_tx_irq_handler: menangani app uartcomm dma tx irq handler pada konteks interrupt
+// dengan pekerjaan minimum agar timing FOC tetap deterministik.
 void app_uartcomm_dma_tx_irq_handler(void) {
     s_stats.tx_dma_irq_count++;
     s_stats.tx_irq_count++;
     HAL_DMA_IRQHandler(&hdma_usart3_tx);
 }
 
+// Parameter huart: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi HAL_UART_ErrorCallback: menangani kalibrasi hal uart error callback agar offset atau parameter hasil
+// ukur valid sebelum dipakai kendali.
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-    if (huart == NULL || huart->Instance != USART3) return;
+    if (huart == NULL || huart->Instance != USART3)
+        return;
     s_stats.uart_errors++;
-    if ((huart->ErrorCode & HAL_UART_ERROR_ORE) != 0U) s_stats.rx_overruns++;
+    if ((huart->ErrorCode & HAL_UART_ERROR_ORE) != 0U)
+        s_stats.rx_overruns++;
     s_rx_restart_needed = true;
 }
 
+// Fungsi app_uartcomm_get_stats: membaca app uartcomm get stats tanpa mengubah state kendali utama dan
+// mengembalikan data yang konsisten.
 const app_uartcomm_stats_t *app_uartcomm_get_stats(void) {
     return &s_stats;
 }
 
 /* ==================== Canonical VESC UART application API ==================== */
+// Fungsi app_uartcomm_initialize: menjalankan operasi app uartcomm initialize sesuai tanggung jawab modul
+// dengan input tervalidasi dan state yang konsisten.
 void app_uartcomm_initialize(void) {
     (void)app_uartcomm_init();
 }
 
+// Parameter port_number: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks
+// algoritma pada lingkup ini.
+// Fungsi app_uartcomm_start: memulai app uartcomm start setelah prasyarat hardware, konfigurasi, dan state
+// keselamatan terpenuhi.
 void app_uartcomm_start(UART_PORT port_number) {
     (void)port_number;
     (void)app_uartcomm_init();
 }
 
+// Parameter port_number: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks
+// algoritma pada lingkup ini.
+// Fungsi app_uartcomm_stop: menghentikan app uartcomm stop dengan menonaktifkan output atau state terkait
+// secara aman.
 void app_uartcomm_stop(UART_PORT port_number) {
     (void)port_number;
     /* USART3 is the permanent VESC Tool management transport. */
 }
 
+// Parameter baudrate: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma
+// pada lingkup ini.
+// Parameter permanent_enabled: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks
+// algoritma pada lingkup ini.
+// Parameter port_number: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks
+// algoritma pada lingkup ini.
+// Fungsi app_uartcomm_configure: menjalankan operasi app uartcomm configure sesuai tanggung jawab modul dengan
+// input tervalidasi dan state yang konsisten.
 void app_uartcomm_configure(uint32_t baudrate, bool permanent_enabled,
                             UART_PORT port_number) {
     (void)baudrate;
@@ -370,6 +491,12 @@ void app_uartcomm_configure(uint32_t baudrate, bool permanent_enabled,
     /* This board intentionally locks management UART to VESC_UART_BAUD. */
 }
 
+// Parameter data: pointer atau data kerja yang diproses oleh fungsi.
+// Parameter len: panjang data dalam byte yang boleh diproses.
+// Parameter port_number: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks
+// algoritma pada lingkup ini.
+// Fungsi app_uartcomm_send_packet: menyusun atau mengirim app uartcomm send packet dengan pemeriksaan panjang
+// buffer dan jalur transport yang aman.
 void app_uartcomm_send_packet(unsigned char *data, unsigned int len,
                               UART_PORT port_number) {
     (void)port_number;
@@ -378,7 +505,9 @@ void app_uartcomm_send_packet(unsigned char *data, unsigned int len,
         return;
     }
 
-    if (xSemaphoreTake(s_packet_mutex, portMAX_DELAY) != pdTRUE) return;
+    if (xSemaphoreTake(s_packet_mutex, portMAX_DELAY) != pdTRUE)
+        return;
+    // Variabel frame_len: panjang data yang sedang diproses atau dikirim.
     uint16_t frame_len = vesc_packet_encode(data, (uint16_t)len,
                                              s_packet_frame,
                                              (uint16_t)sizeof(s_packet_frame));

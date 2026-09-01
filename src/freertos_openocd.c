@@ -10,4 +10,5 @@
 #if defined(__GNUC__)
 __attribute__((used))
 #endif
+// Variabel uxTopUsedPriority: tingkat prioritas task atau interrupt.
 const int uxTopUsedPriority = configMAX_PRIORITIES - 1;

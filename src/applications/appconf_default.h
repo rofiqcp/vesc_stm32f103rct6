@@ -66,7 +66,9 @@
 #define RIGHT_HALL_ELEC_OFFSET_DEG_DEFAULT     0.0f
 
 /* Fallback Hall sequence only. Runtime Hall auto-detect replaces it. */
-#define HALL_TABLE_DEFAULT              { -1, 0, 4, 5, 2, 1, 3, -1 }
+/* Urutan sektor fallback mengikuti vec_hallToPos pada firmware hoverboard
+ * referensi untuk packing raw (U<<2)|(V<<1)|W. Nilai 000 dan 111 invalid. */
+#define HALL_TABLE_DEFAULT              { -1, 2, 0, 1, 4, 3, 5, -1 }
 
 /* ===================== CURRENT / VOLTAGE CALIBRATION =====================
  * A/count and V/count depend on shunt, op-amp and divider values. They must
@@ -85,28 +87,16 @@
  * Board-specific calibration can still replace this constant later. */
 #define DCLINK_V_PER_COUNT              (39.70f / 1492.0f)
 
-/* VESC-style boot current-offset calibration. */
-#define ADC_OFFSET_CAL_SAMPLES          4096U
-/* EFeru-reference boot offset averaging: number of 16-kHz DMA ISR frames the
- * default boot path averages the six raw current channels before the FOC runs
- * with the converging offsets (EFeru semantics: cur = offset - raw). 2000
- * frames ~= 125 ms, matching the reference running-average window. Only used
- * on the default boot path; VESC Tool recalibration uses the driven pipeline. */
+/* Kalibrasi offset arus stock hoverboard. Boot dan recalibration manual
+ * memakai jalur yang SAMA: kedua bridge di 50%/50%/50% zero-vector, warm-up,
+ * lalu 2000 frame ADC sinkron. Offset final adalah midpoint (min + max) / 2
+ * untuk tiap kanal, sehingga common-mode saat PWM aktif ikut terkalibrasi. */
 #define ADC_BOOT_CAL_SAMPLES            2000U
-/* VESC-style driven current-offset calibration. Upstream VESC stores
- * driven and undriven offsets separately; for low-side-shunt hardware its
- * alternative calibration runs all three phases at 50% (zero SVM amplitude)
- * and averages 1000 samples. We preserve an undriven diagnostic pass, then
- * calibrate LEFT and RIGHT one at a time under 50% zero-vector PWM. */
-#define ADC_DRIVEN_CAL_SAMPLES          1000U
-#define ADC_DRIVEN_CAL_SAMPLE_HZ        1000U
-#define ADC_DRIVEN_CAL_DECIMATION       (FOC_ISR_EVENT_HZ / ADC_DRIVEN_CAL_SAMPLE_HZ)
-#define ADC_DRIVEN_CAL_WARMUP_EVENTS    64U
-#define ADC_DRIVEN_CAL_MAX_DC_A         6.0f
-#define ADC_DRIVEN_CAL_MAX_DC_COUNTS    300U /* 6 A at 0.02 A/count */
-#define ADC_DRIVEN_CAL_DC_TRIP_SAMPLES  8U
-#define ADC_CAL_VBUS_STABLE_5MS_TICKS   400U /* 2.0 s, matching VESC settle window */
-#define ADC_CAL_VBUS_STABLE_DELTA_V     1.50f /* restart settle timer when Vbus moves more than this */
+#define ADC_NEUTRAL_CAL_SAMPLES         ADC_BOOT_CAL_SAMPLES
+#define ADC_NEUTRAL_CAL_WARMUP_EVENTS   64U
+#define ADC_CAL_VBUS_STABLE_5MS_TICKS   400U /* 2.0 s settle sebelum MOE */
+#define ADC_CAL_VBUS_STABLE_DELTA_V     1.50f
+#define ADC_OFFSET_MOE_WAIT_EVENTS      256U
 #define PWM_ENABLE_BLANK_CYCLES         8U
 /* EFeru uses I_DC_MAX=17 A for the stage-2 DC-link current chop on the stock
  * board. Do not reuse the much lower 6 A driven-calibration sanity limit for
@@ -129,7 +119,6 @@
 #define ADC_OFFSET_HARD_STDDEV_COUNT    80U
 #define ADC_OFFSET_INLIER_WINDOW_COUNT  256U
 #define ADC_OFFSET_HARD_OUTLIER_COUNT   10U
-#define ADC_OFFSET_MOE_WAIT_EVENTS      128U
 
 /* Incremental A/B has no absolute electrical origin after cold boot.
  * FOC_SENSOR_MODE_ENCODER_AB uses observer/open-loop startup to establish
@@ -260,7 +249,9 @@
 #define MCCONF_FOC_SL_ERPM_START_DEFAULT        1200.0f
 #define MCCONF_FOC_SL_ERPM_DEFAULT              2500.0f
 #define MCCONF_FOC_OPENLOOP_RPM_DEFAULT         900.0f
-#define MCCONF_FOC_OPENLOOP_RPM_LOW_DEFAULT     350.0f
+/* VESC foc_openloop_rpm_low is a FRACTION (0..1) of foc_openloop_rpm at
+ * minimum motor current, not an ERPM value. Keep the upstream default 0.0. */
+#define MCCONF_FOC_OPENLOOP_RPM_LOW_DEFAULT     0.0f
 #define MCCONF_FOC_SL_OPENLOOP_HYST_DEFAULT     0.10f
 #define MCCONF_FOC_SL_OPENLOOP_T_LOCK_DEFAULT   0.18f
 #define MCCONF_FOC_SL_OPENLOOP_T_RAMP_DEFAULT   0.55f

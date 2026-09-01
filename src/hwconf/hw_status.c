@@ -7,11 +7,17 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+// Variabel s_tone_level: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile bool s_tone_level = false;
+// Variabel g_vesc_buzzer_hz: state global firmware yang dibagikan antarbagian modul.
 volatile uint16_t g_vesc_buzzer_hz = 0U;
+// Variabel g_vesc_buzzer_remaining: state global firmware yang dibagikan antarbagian modul.
 volatile uint32_t g_vesc_buzzer_remaining = 0U;
+// Variabel g_vesc_startup_melody_active: penanda bahwa state atau fitur sedang aktif.
 volatile uint8_t g_vesc_startup_melody_active = 0U;
+// Variabel g_vesc_startup_melody_index: indeks elemen yang sedang diproses.
 volatile uint8_t g_vesc_startup_melody_index = 0U;
+// Variabel s_tone_running: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile bool s_tone_running = false;
 /* VESC-correct finite-beep support. A tone may be infinite (stopped only by an
  * explicit hw_status_tone_stop) or self-terminate after a fixed number of
@@ -19,17 +25,27 @@ static volatile bool s_tone_running = false;
  * accidentally dropped when it removed the old s_tone_toggle_remaining guard:
  * without it a tone that the status task fails to stop (delayed/blocked/stopped
  * thread) keeps TIM3 toggling the pin forever, i.e. a stuck-ON buzzer. */
+// Variabel s_tone_infinite: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile bool s_tone_infinite = false;
+// Variabel s_tone_toggle_remaining: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile uint32_t s_tone_toggle_remaining = 0U;
+// Variabel s_melody_sequencer: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile bool s_melody_sequencer = false;
+// Variabel s_melody_gap: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile bool s_melody_gap = false;
+// Variabel s_melody_next_index: indeks elemen yang sedang diproses.
 static volatile uint8_t s_melody_next_index = 0U;
+// Variabel g_vesc_buzzer_running: state global firmware yang dibagikan antarbagian modul.
 volatile uint8_t g_vesc_buzzer_running = 0U;
+// Variabel s_power_held: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static volatile bool s_power_held = true;
+// Variabel s_status_started: status runtime untuk diagnostik atau keputusan kendali.
 static bool s_status_started = false;
 
 typedef struct {
+    // Variabel hz: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     uint16_t hz;
+    // Variabel duration_ms: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     uint16_t duration_ms;
 } startup_note_t;
 
@@ -39,31 +55,63 @@ typedef struct {
  * same short, technical VESC-like character while keeping both bridges OFF.
  * Every tone/gap is advanced autonomously by TIM3, so it starts before the
  * FreeRTOS scheduler and never blocks UART or FOC startup. */
+// Variabel s_startup_notes: state internal modul yang dipertahankan antar pemanggilan fungsi.
 static const startup_note_t s_startup_notes[] = {
-    {659U,  180U}, /* E5  */
-    {0U,     55U},
-    {831U,  180U}, /* G#5 */
-    {0U,     55U},
-    {988U,  210U}, /* B5  */
-    {0U,     70U},
+    {659U, 180U}, /* E5  */
+    {
+        0U, 55U
+    }
+    ,
+    {831U, 180U}, /* G#5 */
+    {
+        0U, 55U
+    }
+    ,
+    {988U, 210U}, /* B5  */
+    {
+        0U, 70U
+    }
+    ,
     {1319U, 260U}, /* E6  */
-    {0U,    120U},
-    {988U,  150U},
+    {
+        0U, 120U
+    }
+    ,
+    {
+        988U, 150U
+    }
+    ,
     {1175U, 150U}, /* D6  */
-    {1319U, 180U},
-    {0U,     80U},
+    {
+        1319U, 180U
+    }
+    ,
+    {
+        0U, 80U
+    }
+    ,
     {1661U, 220U}, /* G#6 */
-    {0U,     70U},
+    {
+        0U, 70U
+    }
+    ,
     {1976U, 260U}, /* B6  */
-    {0U,    100U},
+    {
+        0U, 100U
+    }
+    ,
     {2637U, 520U}, /* E7 resolve */
-    {0U,    350U}
+    {
+        0U, 350U
+    }
 };
 
 /* TIM3 owns the complete startup melody so it starts before FreeRTOS and is
  * independent of timer_thread latency. Tone segments count half-cycles; silent
  * gaps run TIM3 at 1 kHz and count milliseconds. All helpers below are called
  * with interrupts already masked or from TIM3 IRQ itself. */
+// Fungsi status_timer_stop_locked: menghentikan status timer stop locked dengan menonaktifkan output atau state
+// terkait secara aman.
 static void status_timer_stop_locked(void) {
     TIM3->DIER = 0U;
     TIM3->CR1 &= ~TIM_CR1_CEN;
@@ -79,6 +127,14 @@ static void status_timer_stop_locked(void) {
     BUZZER_PORT->BRR = BUZZER_PIN;
 }
 
+// Parameter hz: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Parameter duration_ms: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks
+// algoritma pada lingkup ini.
+// Parameter gap: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi status_program_segment_locked: menjalankan operasi status program segment locked sesuai tanggung jawab
+// modul dengan input tervalidasi dan state yang konsisten.
 static void status_program_segment_locked(uint16_t hz, uint32_t duration_ms, bool gap) {
     TIM3->CR1 &= ~TIM_CR1_CEN;
     TIM3->DIER = 0U;
@@ -93,15 +149,23 @@ static void status_program_segment_locked(uint16_t hz, uint32_t duration_ms, boo
         TIM3->ARR = 999U; /* 1 MHz / 1000 = 1 ms update */
         s_tone_toggle_remaining = duration_ms ? duration_ms : 1U;
         g_vesc_buzzer_hz = 0U;
-    } else {
-        if (hz < 100U) hz = 100U;
-        if (hz > 5000U) hz = 5000U;
+    }
+    else {
+        if (hz < 100U)
+            hz = 100U;
+        if (hz > 5000U)
+            hz = 5000U;
+        // Variabel arr: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         uint32_t arr = 500000UL / (uint32_t)hz;
-        if (arr == 0U) arr = 1U;
+        if (arr == 0U)
+            arr = 1U;
         TIM3->ARR = arr - 1U;
+        // Variabel toggles: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         uint64_t toggles = ((uint64_t)hz * 2ULL * (uint64_t)duration_ms + 999ULL) / 1000ULL;
-        if (toggles == 0ULL) toggles = 1ULL;
-        if (toggles > 0xFFFFFFFEULL) toggles = 0xFFFFFFFEULL;
+        if (toggles == 0ULL)
+            toggles = 1ULL;
+        if (toggles > 0xFFFFFFFEULL)
+            toggles = 0xFFFFFFFEULL;
         s_tone_toggle_remaining = (uint32_t)toggles;
         g_vesc_buzzer_hz = hz;
     }
@@ -114,6 +178,8 @@ static void status_program_segment_locked(uint16_t hz, uint32_t duration_ms, boo
     TIM3->CR1 |= TIM_CR1_CEN;
 }
 
+// Fungsi status_melody_load_next_locked: memuat status melody load next locked dan memvalidasi integritas data
+// sebelum digunakan oleh runtime.
 static void status_melody_load_next_locked(void) {
     if (s_melody_next_index >= (uint8_t)(sizeof(s_startup_notes) / sizeof(s_startup_notes[0]))) {
         s_melody_sequencer = false;
@@ -121,12 +187,16 @@ static void status_melody_load_next_locked(void) {
         status_timer_stop_locked();
         return;
     }
+    // Variabel note: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const startup_note_t note = s_startup_notes[s_melody_next_index++];
     g_vesc_startup_melody_index = s_melody_next_index;
     status_program_segment_locked(note.hz, note.duration_ms, note.hz == 0U);
 }
 
+// Fungsi hw_status_startup_melody_begin: menjalankan operasi hw status startup melody begin sesuai tanggung
+// jawab modul dengan input tervalidasi dan state yang konsisten.
 static void hw_status_startup_melody_begin(void) {
+    // Variabel primask: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     s_melody_sequencer = true;
@@ -134,14 +204,18 @@ static void hw_status_startup_melody_begin(void) {
     g_vesc_startup_melody_active = 1U;
     g_vesc_startup_melody_index = 0U;
     status_melody_load_next_locked();
-    if (!primask) __enable_irq();
+    if (!primask)
+        __enable_irq();
 }
 
+// Fungsi hw_status_startup_melody_replay: menjalankan operasi hw status startup melody replay sesuai tanggung
+// jawab modul dengan input tervalidasi dan state yang konsisten.
 void hw_status_startup_melody_replay(void) {
     hw_status_startup_melody_begin();
 }
 
 /* Highest-priority fault present on either bridge owns both indicators. */
+// Variabel s_fault_priority: status atau data gangguan untuk sistem proteksi.
 static const motor_fault_t s_fault_priority[] = {
     MOTOR_FAULT_FLASH_CONFIG,
     MOTOR_FAULT_BREAK,
@@ -163,12 +237,21 @@ static const motor_fault_t s_fault_priority[] = {
     MOTOR_FAULT_SENSORLESS_OBSERVER
 };
 
+// Parameter argument: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma
+// pada lingkup ini.
+// Fungsi status_thread: menjalankan operasi status thread sesuai tanggung jawab modul dengan input tervalidasi
+// dan state yang konsisten.
 void status_thread(void *argument);
 
+// Fungsi highest_priority_fault: menangani highest priority fault dengan memprioritaskan pemadaman keluaran
+// daya, pencatatan penyebab, dan pemulihan yang aman.
 static motor_fault_t highest_priority_fault(void) {
+    // Variabel left: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const motor_fault_t left = g_motor_left.fault;
+    // Variabel right: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const motor_fault_t right = g_motor_right.fault;
 
+    // Variabel i: indeks iterasi lokal untuk menelusuri elemen atau sampel secara deterministik.
     for (uint32_t i = 0U;
             i < (uint32_t)(sizeof(s_fault_priority) / sizeof(s_fault_priority[0]));
             i++) {
@@ -179,10 +262,16 @@ static motor_fault_t highest_priority_fault(void) {
     return MOTOR_FAULT_NONE;
 }
 
+// Parameter digit: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi fault_digit_pulses: menangani fault digit pulses dengan memprioritaskan pemadaman keluaran daya,
+// pencatatan penyebab, dan pemulihan yang aman.
 static uint8_t fault_digit_pulses(uint8_t digit) {
     return digit == 0U ? 10U : digit;
 }
 
+// Fungsi hw_status_early_init: menginisialisasi hw status early init sehingga resource, konfigurasi awal, dan
+// state modul siap digunakan dengan aman.
 void hw_status_early_init(void) {
     /* This executes immediately after HAL_Init, while the MCU is still on the
      * reset HSI clock. It therefore proves execution even if the later 64 MHz
@@ -190,7 +279,11 @@ void hw_status_early_init(void) {
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    GPIO_InitTypeDef g = {0};
+    // Variabel g: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
+    GPIO_InitTypeDef g = {
+        0
+    }
+    ;
     g.Mode = GPIO_MODE_OUTPUT_PP;
     g.Speed = GPIO_SPEED_FREQ_LOW;
 
@@ -208,6 +301,8 @@ void hw_status_early_init(void) {
     HAL_GPIO_WritePin(LED_PORT, LED_PIN, GPIO_PIN_SET);
 }
 
+// Fungsi hw_status_timer_init: menginisialisasi hw status timer init sehingga resource, konfigurasi awal, dan
+// state modul siap digunakan dengan aman.
 void hw_status_timer_init(void) {
     __HAL_RCC_TIM3_CLK_ENABLE();
     TIM3->CR1 = 0U;
@@ -223,6 +318,10 @@ void hw_status_timer_init(void) {
     HAL_NVIC_EnableIRQ(TIM3_IRQn);
 }
 
+// Parameter hz: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi hw_status_tone_start: memulai hw status tone start setelah prasyarat hardware, konfigurasi, dan state
+// keselamatan terpenuhi.
 void hw_status_tone_start(uint16_t hz) {
     /* Infinite tone: only an explicit hw_status_tone_stop ends it. Retained for
      * VESC API parity; the fault/startup sequences below prefer the bounded
@@ -230,10 +329,19 @@ void hw_status_tone_start(uint16_t hz) {
     hw_status_tone_start_for(hz, 0U);
 }
 
+// Parameter hz: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Parameter duration_ms: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks
+// algoritma pada lingkup ini.
+// Fungsi hw_status_tone_start_for: memulai hw status tone start for setelah prasyarat hardware, konfigurasi,
+// dan state keselamatan terpenuhi.
 void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms) {
-    if (hz < 100U) hz = 100U;
-    if (hz > 5000U) hz = 5000U;
+    if (hz < 100U)
+        hz = 100U;
+    if (hz > 5000U)
+        hz = 5000U;
 
+    // Variabel primask: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     /* A user/fault tone pre-empts the startup melody deterministically. */
@@ -244,9 +352,14 @@ void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms) {
     if (duration_ms == 0U) {
         TIM3->CR1 &= ~TIM_CR1_CEN;
         TIM3->DIER = 0U;
+        // Variabel arr: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         uint32_t arr = 500000UL / (uint32_t)hz;
-        if (arr == 0U) arr = 1U;
-        TIM3->ARR = arr - 1U; TIM3->CNT = 0U; TIM3->EGR = TIM_EGR_UG; TIM3->SR = 0U;
+        if (arr == 0U)
+            arr = 1U;
+        TIM3->ARR = arr - 1U;
+        TIM3->CNT = 0U;
+        TIM3->EGR = TIM_EGR_UG;
+        TIM3->SR = 0U;
         s_tone_infinite = true;
         s_tone_toggle_remaining = 0U;
         s_tone_level = false;
@@ -255,56 +368,83 @@ void hw_status_tone_start_for(uint16_t hz, uint32_t duration_ms) {
         g_vesc_buzzer_hz = hz;
         g_vesc_buzzer_remaining = 0U;
         BUZZER_PORT->BRR = BUZZER_PIN;
-        TIM3->DIER = TIM_DIER_UIE; TIM3->CR1 |= TIM_CR1_CEN;
-    } else {
+        TIM3->DIER = TIM_DIER_UIE;
+        TIM3->CR1 |= TIM_CR1_CEN;
+    }
+    else {
         status_program_segment_locked(hz, duration_ms, false);
     }
-    if (!primask) __enable_irq();
+    if (!primask)
+        __enable_irq();
 }
 
+// Parameter on: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi hw_status_power_hold: menjalankan operasi hw status power hold sesuai tanggung jawab modul dengan
+// input tervalidasi dan state yang konsisten.
 void hw_status_power_hold(bool on) {
     s_power_held = on;
     HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, on ? GPIO_PIN_SET : GPIO_PIN_RESET);
 }
 
+// Fungsi hw_status_power_is_held: menjalankan operasi hw status power is held sesuai tanggung jawab modul
+// dengan input tervalidasi dan state yang konsisten.
 bool hw_status_power_is_held(void) {
     return s_power_held;
 }
 
+// Fungsi hw_status_tone_stop: menghentikan hw status tone stop dengan menonaktifkan output atau state terkait
+// secara aman.
 void hw_status_tone_stop(void) {
+    // Variabel primask: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     uint32_t primask = __get_PRIMASK();
     __disable_irq();
     s_melody_sequencer = false;
     g_vesc_startup_melody_active = 0U;
     status_timer_stop_locked();
-    if (!primask) __enable_irq();
+    if (!primask)
+        __enable_irq();
 }
 
+// Fungsi hw_status_tone_is_running: menjalankan operasi hw status tone is running sesuai tanggung jawab modul
+// dengan input tervalidasi dan state yang konsisten.
 bool hw_status_tone_is_running(void) {
     return s_tone_running;
 }
 
+// Fungsi hw_status_tone_level: menjalankan operasi hw status tone level sesuai tanggung jawab modul dengan
+// input tervalidasi dan state yang konsisten.
 bool hw_status_tone_level(void) {
     return s_tone_level;
 }
 
+// Fungsi hw_status_tim3_irq_handler: menangani hw status tim3 irq handler pada konteks interrupt dengan
+// pekerjaan minimum agar timing FOC tetap deterministik.
 void hw_status_tim3_irq_handler(void) {
-    if ((TIM3->SR & TIM_SR_UIF) == 0U) return;
+    if ((TIM3->SR & TIM_SR_UIF) == 0U)
+        return;
     TIM3->SR &= ~TIM_SR_UIF;
-    if (!s_tone_running) return;
+    if (!s_tone_running)
+        return;
 
     if (s_tone_infinite) {
         s_tone_level = !s_tone_level;
-        if (s_tone_level) BUZZER_PORT->BSRR = BUZZER_PIN; else BUZZER_PORT->BRR = BUZZER_PIN;
+        if (s_tone_level)
+            BUZZER_PORT->BSRR = BUZZER_PIN;
+        else BUZZER_PORT->BRR = BUZZER_PIN;
         return;
     }
 
-    if (s_tone_toggle_remaining > 0U) s_tone_toggle_remaining--;
+    if (s_tone_toggle_remaining > 0U)
+        s_tone_toggle_remaining--;
     g_vesc_buzzer_remaining = s_tone_toggle_remaining;
     if (!s_melody_gap) {
         s_tone_level = !s_tone_level;
-        if (s_tone_level) BUZZER_PORT->BSRR = BUZZER_PIN; else BUZZER_PORT->BRR = BUZZER_PIN;
-    } else {
+        if (s_tone_level)
+            BUZZER_PORT->BSRR = BUZZER_PIN;
+        else BUZZER_PORT->BRR = BUZZER_PIN;
+    }
+    else {
         s_tone_level = false;
         BUZZER_PORT->BRR = BUZZER_PIN;
     }
@@ -312,30 +452,51 @@ void hw_status_tim3_irq_handler(void) {
     if (s_tone_toggle_remaining == 0U) {
         if (s_melody_sequencer) {
             status_melody_load_next_locked();
-        } else {
+        }
+        else {
             status_timer_stop_locked();
         }
     }
 }
 
+// Parameter now: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi hw_status_service_10ms: menjalankan operasi hw status service 10ms sesuai tanggung jawab modul dengan
+// input tervalidasi dan state yang konsisten.
 void hw_status_service_10ms(uint32_t now) {
     /* Status/LED/buzzer is intentionally NOT a sixth task. Its non-blocking
      * state machine is serviced by VESC timer_thread every 10 ms. */
+    // Variabel initialized: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     static bool initialized = false;
+    // Variabel fault_deadline: status atau data gangguan untuk sistem proteksi.
     static uint32_t fault_deadline;
-    static uint8_t led_state;       /* 0=burst / 1=gap */
+    // Variabel led_state: state mesin keadaan yang menentukan tahap operasi.
+    static uint8_t led_state; /* 0=burst / 1=gap */
+    // Variabel led_pulses_left: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     static uint8_t led_pulses_left;
+    // Variabel led_output_on: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     static bool led_output_on;
+    // Variabel led_deadline: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     static uint32_t led_deadline;
+    // Variabel hb_led_on: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     static bool hb_led_on;
+    // Variabel hb_deadline: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     static uint32_t hb_deadline;
-    static uint8_t led_mode;        /* 0=heartbeat, 1=cal, 2=detect, 3=run */
+    // Variabel led_mode: mode operasi yang menentukan jalur algoritma aktif.
+    static uint8_t led_mode; /* 0=heartbeat, 1=cal, 2=detect, 3=run */
+    // Variabel announced: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     static motor_fault_t announced;
+    // Variabel fault_tens: status atau data gangguan untuk sistem proteksi.
     static uint8_t fault_tens;
+    // Variabel fault_ones: status atau data gangguan untuk sistem proteksi.
     static uint8_t fault_ones;
+    // Variabel fault_group: status atau data gangguan untuk sistem proteksi.
     static uint8_t fault_group;
+    // Variabel fault_pulses_left: status atau data gangguan untuk sistem proteksi.
     static uint8_t fault_pulses_left;
+    // Variabel fault_stage: status atau data gangguan untuk sistem proteksi.
     static uint8_t fault_stage;
+    // Variabel fault_output_on: status atau data gangguan untuk sistem proteksi.
     static bool fault_output_on;
 
     if (!initialized) {
@@ -346,7 +507,7 @@ void hw_status_service_10ms(uint32_t now) {
         led_deadline = now;
         hb_led_on = false;
         hb_deadline = now + 500U;
-        led_mode = 0xFFU;          /* force first-mode initialization */
+        led_mode = 0xFFU; /* force first-mode initialization */
         motor_hw_led(false);
         announced = MOTOR_FAULT_NONE;
         fault_tens = fault_ones = fault_group = 0U;
@@ -355,6 +516,7 @@ void hw_status_service_10ms(uint32_t now) {
         initialized = true;
     }
 
+    // Variabel fault: status atau data gangguan untuk sistem proteksi.
     const motor_fault_t fault = highest_priority_fault();
 
     if (fault != MOTOR_FAULT_NONE && g_vesc_startup_melody_active) {
@@ -364,10 +526,12 @@ void hw_status_service_10ms(uint32_t now) {
     if (fault != MOTOR_FAULT_NONE) {
         if (fault != announced) {
             announced = fault;
+            // Variabel code: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
             const uint8_t code = (uint8_t)motor_fault_to_vesc(fault);
             fault_tens = (uint8_t)(code / 10U);
             fault_ones = (uint8_t)(code % 10U);
             fault_group = fault_tens != 0U ? 0U : 1U;
+            // Variabel digit: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
             const uint8_t digit = fault_group == 0U ? fault_tens : fault_ones;
             fault_pulses_left = fault_digit_pulses(digit);
             fault_stage = 1U;
@@ -375,7 +539,8 @@ void hw_status_service_10ms(uint32_t now) {
             motor_hw_led(true);
             hw_status_tone_start_for(fault_group == 0U ? 1500U : 2400U, 100U);
             fault_deadline = now + 100U;
-        } else if ((int32_t)(now - fault_deadline) >= 0) {
+        }
+        else if ((int32_t)(now - fault_deadline) >= 0) {
             if (fault_stage == 1U) {
                 if (fault_output_on) {
                     motor_hw_led(false);
@@ -388,20 +553,24 @@ void hw_status_service_10ms(uint32_t now) {
                         if (fault_group == 0U) {
                             fault_stage = 2U;
                             fault_deadline = now + 350U;
-                        } else {
+                        }
+                        else {
                             fault_stage = 3U;
                             fault_deadline = now + 1000U;
                         }
-                    } else {
+                    }
+                    else {
                         fault_deadline = now + 100U;
                     }
-                } else {
+                }
+                else {
                     fault_output_on = true;
                     motor_hw_led(true);
                     hw_status_tone_start(fault_group == 0U ? 1500U : 2400U);
                     fault_deadline = now + 100U;
                 }
-            } else if (fault_stage == 2U) {
+            }
+            else if (fault_stage == 2U) {
                 fault_group = 1U;
                 fault_pulses_left = fault_digit_pulses(fault_ones);
                 fault_stage = 1U;
@@ -409,8 +578,10 @@ void hw_status_service_10ms(uint32_t now) {
                 motor_hw_led(true);
                 hw_status_tone_start_for(2400U, 100U);
                 fault_deadline = now + 100U;
-            } else {
+            }
+            else {
                 fault_group = fault_tens != 0U ? 0U : 1U;
+                // Variabel digit: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
                 const uint8_t digit = fault_group == 0U ? fault_tens : fault_ones;
                 fault_pulses_left = fault_digit_pulses(digit);
                 fault_stage = 1U;
@@ -420,7 +591,8 @@ void hw_status_service_10ms(uint32_t now) {
                 fault_deadline = now + 100U;
             }
         }
-    } else {
+    }
+    else {
         if (announced != MOTOR_FAULT_NONE || fault_output_on) {
             hw_status_tone_stop();
             fault_output_on = false;
@@ -448,14 +620,19 @@ void hw_status_service_10ms(uint32_t now) {
          *   running     -> 3 pulse burst, 1 s gap
          *   idle/ready  -> 500 ms toggle heartbeat (SmartESC-like normal blink)
          */
+        // Variabel calibrating: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         const bool calibrating = !foc_calibration_done();
+        // Variabel detecting: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         const bool detecting = g_motor_left.detect.busy ||
                 g_motor_right.detect.busy;
+        // Variabel running: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         const bool running = g_motor_left.pwm_enabled ||
                 g_motor_right.pwm_enabled;
+        // Variabel mode: mode operasi yang menentukan jalur algoritma aktif.
         const uint8_t mode = calibrating ? 1U :
                              (detecting ? 2U :
                              (running ? 3U : 0U));
+        // Variabel pulses: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
         const uint8_t pulses = mode;
 
         if (mode != led_mode) {
@@ -476,7 +653,8 @@ void hw_status_service_10ms(uint32_t now) {
                     led_output_on = true;
                     motor_hw_led(true);
                     led_deadline = now + 200U;
-                } else if ((int32_t)(now - led_deadline) >= 0) {
+                }
+                else if ((int32_t)(now - led_deadline) >= 0) {
                     led_output_on = !led_output_on;
                     motor_hw_led(led_output_on);
                     if (!led_output_on) {
@@ -484,14 +662,17 @@ void hw_status_service_10ms(uint32_t now) {
                         if (led_pulses_left == 0U) {
                             led_state = 1U;
                             led_deadline = now + 1000U;
-                        } else {
+                        }
+                        else {
                             led_deadline = now + 200U;
                         }
-                    } else {
+                    }
+                    else {
                         led_deadline = now + 200U;
                     }
                 }
-            } else {
+            }
+            else {
                 motor_hw_led(false);
                 if ((int32_t)(now - led_deadline) >= 0) {
                     led_state = 0U;
@@ -499,7 +680,8 @@ void hw_status_service_10ms(uint32_t now) {
                     led_output_on = false;
                 }
             }
-        } else if ((int32_t)(now - hb_deadline) >= 0) {
+        }
+        else if ((int32_t)(now - hb_deadline) >= 0) {
             /* SmartESC normal path toggles its LED roughly every 0.5 s. Use an
              * absolute deadline rather than an 8-bit divider so delayed timer
              * service cannot permanently distort the blink cadence. */
@@ -512,6 +694,8 @@ void hw_status_service_10ms(uint32_t now) {
 
 }
 
+// Fungsi hw_status_init: menginisialisasi hw status init sehingga resource, konfigurasi awal, dan state modul
+// siap digunakan dengan aman.
 bool hw_status_init(void) {
     s_status_started = true;
     /* Start the complete 3.21 s power-on melody before FreeRTOS. TIM3 advances
@@ -521,7 +705,12 @@ bool hw_status_init(void) {
     return true;
 }
 
+// Parameter delay_ms: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma
+// pada lingkup ini.
+// Fungsi early_fatal_delay_with_comm: menjalankan operasi early fatal delay with comm sesuai tanggung jawab
+// modul dengan input tervalidasi dan state yang konsisten.
 static void early_fatal_delay_with_comm(uint32_t delay_ms) {
+    // Variabel start: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     const uint32_t start = HAL_GetTick();
     while ((HAL_GetTick() - start) < delay_ms) {
         /* If USART3/commands were already brought up, preserve VESC Tool
@@ -533,18 +722,20 @@ static void early_fatal_delay_with_comm(uint32_t delay_ms) {
     }
 }
 
+// Fungsi hw_status_early_fatal_loop: menjalankan operasi hw status early fatal loop sesuai tanggung jawab modul
+// dengan input tervalidasi dan state yang konsisten.
 void hw_status_early_fatal_loop(void) {
     hw_status_tone_stop();
     HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
-    for (;;) {
-        /* 4 rapid LED flashes + buzzer indicate a pre-scheduler failure while
-         * the management UART remains serviceable when it was initialized. */
+    for (;; ) {
+        /* Pre-scheduler failure memakai LED saja. Buzzer otomatis dicadangkan
+         * untuk power-on melody dan fault-code runtime agar tidak ada pola audio
+         * yang ambigu. UART tetap serviceable jika sudah diinisialisasi. */
+        // Variabel i: indeks iterasi lokal untuk menelusuri elemen atau sampel secara deterministik.
         for (uint8_t i = 0U; i < 4U; i++) {
             motor_hw_led(true);
-            HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_SET);
             early_fatal_delay_with_comm(80U);
             motor_hw_led(false);
-            HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, GPIO_PIN_RESET);
             early_fatal_delay_with_comm(80U);
         }
         early_fatal_delay_with_comm(800U);

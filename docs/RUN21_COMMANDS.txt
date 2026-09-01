@@ -1,0 +1,28 @@
+Default serial: /dev/ttyUSB0 @ 115200 (USART3)
+
+Install:
+  python3 -m pip install -r tools/requirements.txt
+
+Text tool:
+  python3 tools/vesc.py info
+  python3 tools/vesc.py values
+  python3 tools/vesc.py stream --hz 10
+  python3 tools/vesc.py current 2.0 --motor left --seconds 3 --yes
+  python3 tools/vesc.py duty 0.05 --motor right --seconds 3 --yes
+  python3 tools/vesc.py rpm 300 --motor left --seconds 5 --yes
+  python3 tools/vesc.py position 30 --motor left --seconds 3 --yes
+  python3 tools/vesc.py brake 1.0 --motor left --seconds 2 --yes
+  python3 tools/vesc.py handbrake 1.0 --motor left --seconds 2 --yes
+  python3 tools/vesc.py stop
+  python3 tools/vesc.py shell
+
+Full debug:
+  python3 tools/debug.py info
+  python3 tools/debug.py status
+  python3 tools/debug.py comm-diag
+  python3 tools/debug.py stream-all --hz 20 --slow-hz 2
+  python3 tools/debug.py stream-all --hz 20 --slow-hz 2 --csv debug.csv
+  python3 tools/debug.py motor-test --motor 0 --mode current --value 2.0 --seconds 3 --yes
+  python3 tools/debug.py motor-test --motor 1 --mode duty --value 0.05 --seconds 3 --yes
+  python3 tools/debug.py motor-test --motor 1 --mode rpm --value 300 --seconds 5 --yes
+  python3 tools/debug.py full-test --yes

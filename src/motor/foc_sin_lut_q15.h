@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 /* 1024-point full-wave Q15 sine LUT. const => flash/.rodata, not SRAM. */
+// Variabel foc_sin_lut_q15: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
 static const int16_t foc_sin_lut_q15[1024] = {
     0, 201, 402, 603, 804, 1005, 1206, 1406, 1607, 1808, 2009, 2209, 2410, 2610, 2811, 3011,
     3211, 3411, 3611, 3811, 4011, 4210, 4409, 4608, 4807, 5006, 5205, 5403, 5601, 5799, 5997, 6195,
