@@ -1,0 +1,124 @@
+RUN31 — HARDWARE ACCEPTANCE
+===========================
+
+SAFETY:
+- roda wajib terangkat / drivetrain bebas,
+- emergency power cut siap,
+- mulai dengan arus rendah,
+- jangan lanjut ke tahap berikut jika ada fault.
+
+0) CLEAN + OPTIMIZED FLASH
+--------------------------
+pio run -t clean
+pio run -e stm32f103rc -t upload
+
+JANGAN gunakan image lama `stm32f103rc_debug` yang pernah dibangun -Og.
+Run31 debug-symbol environment memang sudah -O3, tetapi acceptance awal gunakan release.
+
+1) VESC TOOL ABI + HFI
+----------------------
+python3 tools/debug.py vesc-tool-check --motor 0
+python3 tools/debug.py vesc-tool-check --motor 1
+
+TARGET:
+HFI Start Samples = 5 (default VESC 6.00; nilai user valid >=5 tetap dipertahankan)
+Run31 factory/migrated legacy = 5
+Tidak ada popup HFI Start Samples truncated setelah reconnect VESC Tool.
+
+2) STARTUP + CALIBRATION + SAMPLING
+-----------------------------------
+python3 tools/debug.py startup-check
+python3 tools/debug.py calibrate --timeout 8
+python3 tools/debug.py startup-check
+
+TARGET:
+boot_stage             : 100
+boot_error             : 0
+motor_ready            : True
+cal_done / cal_valid   : True / True
+sampling live drive    : 0x00000000 [OK]
+
+Run31 juga ditargetkan menghilangkan warning full `TRIGGER_ROUTE` yang berasal dari jalur ADC3 Run30.
+Jika `sampling live full` masih bukan nol, simpan seluruh output sebelum menjalankan motor.
+
+3) FIRST ACTIVE-FOC PROOF — LOW CURRENT
+----------------------------------------
+python3 tools/debug.py sensor-select --motor 0 --mode sensorless
+python3 tools/debug.py motor-test --motor 0 --mode current --value 0.5 --seconds 2 --yes
+
+python3 tools/debug.py sensor-select --motor 1 --mode sensorless
+python3 tools/debug.py motor-test --motor 1 --mode current --value 0.5 --seconds 2 --yes
+
+Jika muncul fault=3, LANGSUNG jalankan:
+python3 tools/debug.py fault-detail --motor 0
+python3 tools/debug.py fault-detail --motor 1
+
+Native fault akan membedakan ADC_DMA vs FOC_ISR_OVERRUN dan mencetak ISR max cycles + register/snapshot.
+Jangan lanjut Detect-All sebelum tahap ini tidak fault.
+
+4) STANDARD R/L DETECT
+----------------------
+python3 tools/debug.py detect-rl --motor 0 --timeout 15 --yes
+python3 tools/debug.py detect-rl --motor 1 --timeout 15 --yes
+
+R dan L harus > 0.
+
+5) HALL COMMISSION
+------------------
+python3 tools/debug.py hall-commission --motor 0 --current 1.0 --run-current 0.5 --run-seconds 2 --yes
+python3 tools/debug.py hall-commission --motor 1 --current 1.0 --run-current 0.5 --run-seconds 2 --yes
+
+Hall detect wajib menghasilkan 6 state valid dan membuktikan current +/- setelah apply.
+
+6) VESC DETECT-ALL — R/L + Ld-Lq + FLUX + SENSOR + PERSIST
+-----------------------------------------------------------
+python3 tools/debug.py detect-all-foc --motor 0 --both-local --yes
+
+TARGET output per motor:
+R > 0
+L > 0
+flux > 0
+native_fault=NONE
+result=0
+
+7) FULL COMMAND MATRIX
+----------------------
+python3 tools/debug.py drive-acceptance --skip-calibration --yes
+
+Mencakup:
+- Detect-All FOC
+- sensorless current +/-
+- Hall autodetect/apply/persist
+- SET_DUTY +/-
+- SET_CURRENT +/-
+- SET_CURRENT_REL +/-
+- SET_RPM +/-
+- pre-spin + SET_CURRENT_BRAKE dua arah
+- SET_POS dua arah
+- SET_HANDBRAKE
+- config save / EEPROM
+
+8) EEPROM / BUZZER CONTRACT
+---------------------------
+python3 tools/debug.py config-status
+python3 tools/debug.py config-save
+python3 tools/debug.py config-status
+
+TARGET:
+sequence naik
+last_save_ok=True
+setiap transaksi save sukses = 5 beep
+normal running = 3 pulse LED saja, tanpa running beep buzzer
+
+9) OFFLINE REGRESSION
+---------------------
+python3 tools/debug.py --self-test
+python3 tools/audit_run29.py
+python3 tools/audit_run30.py
+python3 tools/audit_run31.py
+
+EXPECTED:
+SELF-TEST PASS
+25/25 PASS
+41/41 PASS
+71/71 PASS

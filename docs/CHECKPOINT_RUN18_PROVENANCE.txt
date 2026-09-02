@@ -1,0 +1,5 @@
+Checkpoint fisik sumber yang berhasil dipulihkan: Run12 clean-format + Run11 pembanding.
+Run13-Run17 direkonstruksi dari perubahan yang sudah tercatat dan dikunci kembali dengan acceptance tests.
+Reference DQ_SIGN_FIX(1).zip exact: tidak tersedia pada runtime/Library saat pembuatan Run18.
+Reference hardware fisik fallback: hoverboard-firmware-hack-FOC_v3_VESC_HOVERBOARD_FINAL.zip.
+Tidak menjalankan pio run.

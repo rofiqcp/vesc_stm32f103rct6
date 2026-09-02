@@ -1,0 +1,10 @@
+ADDED	docs/AUDIT_CHECKPOINT_RUN19_DUAL_SENSORLESS_CLEAN_20260831.md
+ADDED	docs/CHECKPOINT_RUN19_CHANGED_FILES.txt
+MODIFIED	src/comm/commands.c
+MODIFIED	src/confgenerator.c
+MODIFIED	src/datatypes.h
+MODIFIED	src/hwconf/hw.c
+MODIFIED	src/motor/mc_interface.c
+MODIFIED	src/motor/mcpwm_foc.c
+ADDED	tools/audit_run19_dual_sensorless.py
+MODIFIED	tools/run_static_acceptance.py

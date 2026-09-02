@@ -1,0 +1,47 @@
+PASS gcc -Werror Src/motor/foc_math.c
+PASS gcc -Werror Src/motor/mc_interface.c
+PASS gcc -Werror Src/motor/mcpwm_foc.c
+PASS gcc -Werror Src/vesc/buffer.c
+PASS gcc -Werror Src/vesc/crc.c
+PASS gcc -Werror Src/vesc/mcconf_serial.c
+PASS gcc -Werror Src/vesc/vesc_protocol.c
+PASS gcc -Werror Src/comms.c
+PASS gcc -Werror Src/util.c
+PASS gcc -Werror Src/main.c
+PASS clang -Werror Src/motor/foc_math.c
+PASS clang -Werror Src/motor/mc_interface.c
+PASS clang -Werror Src/motor/mcpwm_foc.c
+PASS clang -Werror Src/vesc/buffer.c
+PASS clang -Werror Src/vesc/crc.c
+PASS clang -Werror Src/vesc/mcconf_serial.c
+PASS clang -Werror Src/vesc/vesc_protocol.c
+PASS clang -Werror Src/comms.c
+PASS clang -Werror Src/util.c
+PASS clang -Werror Src/main.c
+HOST_COMPILE_CHANGED_SOURCES_PASS
+gcc FOC_FIXEDPOINT_RUNTIME_PASS pwm=-605,829,-830 pi_last=-162 pi_first=255
+clang FOC_FIXEDPOINT_RUNTIME_PASS pwm=-605,829,-830 pi_last=-162 pi_first=255
+FOC_GCC_CLANG_RUNTIME_PASS
+gcc MOTOR_CONTROL_V12_PASS speed_ramp=100RPM/s release=5RPM trq50=0.50A erpm=750 mode4=2A
+clang MOTOR_CONTROL_V12_PASS speed_ramp=100RPM/s release=5RPM trq50=0.50A erpm=750 mode4=2A
+MOTOR_CONTROL_V12_GCC_CLANG_PASS
+gcc VESC_PROTOCOL_HOST_PASS fw=7.01 can=2 rightIqInternal=-2.50 localRpm=300
+clang VESC_PROTOCOL_HOST_PASS fw=7.01 can=2 rightIqInternal=-2.50 localRpm=300
+VESC_PROTOCOL_GCC_CLANG_PASS
+mcconf=488 appconf=284
+mcconf=488 appconf=284
+PY_VESC_DUAL_PACKET_PASS crc=0xeed5 forward_can_id=2 values_id=2
+STATIC_PROJECT_AUDIT_PASS
+DATATYPES_SHA256 4ecae1f31c12c1ab415d47dd997396d0792e94249203cbeb877ada75f76d5340
++ /opt/pyvenv/bin/python3 -m py_compile tools/hoverserial.py tools/vesc_dual.py tools/test_vesc_dual.py
++ /opt/pyvenv/bin/python3 tools/host_compile_check.py
++ /opt/pyvenv/bin/python3 tools/test_foc_math.py
++ /opt/pyvenv/bin/python3 tools/test_motor_control_v12.py
++ /opt/pyvenv/bin/python3 tools/test_vesc_protocol_host.py
++ gcc -std=c11 -O0 -Wall -Wextra -Werror -I. -ISrc tools/test_config_sizes.c Src/vesc/buffer.c Src/vesc/mcconf_serial.c -o /tmp/vesc-config-size-esvpoypu/cfg_gcc
++ /tmp/vesc-config-size-esvpoypu/cfg_gcc
++ clang -std=c11 -O0 -Wall -Wextra -Werror -I. -ISrc tools/test_config_sizes.c Src/vesc/buffer.c Src/vesc/mcconf_serial.c -o /tmp/vesc-config-size-esvpoypu/cfg_clang
++ /tmp/vesc-config-size-esvpoypu/cfg_clang
+CONFIG_SERIALIZER_GCC_CLANG_PASS
++ /opt/pyvenv/bin/python3 tools/test_vesc_dual.py
+ALL_FINAL_HOST_CHECKS_PASS

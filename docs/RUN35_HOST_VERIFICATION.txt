@@ -1,0 +1,189 @@
+RUN35 HOST VERIFICATION
+UTC 2026-09-02T09:29:45Z
+
+== debug self-test ==
+SELF-TEST PASS: CRC/framing, VESC-6.00 FW/config, local-ID2 forwarding, sample/ADC parser, current-cal-v19 midpoint/MOE ABI, EXT-v6 telemetry, COMM_DIAG-v18 readiness/recovery + command acceptance/reject + current/buzzer trace, resources/boot, sensor/observer diagnostics
+
+== Run29 regression ==
+PASS  drive critical mask defined
+PASS  boot gate uses drive critical mask
+PASS  runtime readiness recovery exists
+PASS  recovery requires valid calibration
+PASS  recovery requires hard sampling validity
+PASS  recovery only auto-clears ADC_DMA
+PASS  command boundary retries readiness
+PASS  packet thread probes recovery
+PASS  COMM_DIAG revision 18
+PASS  COMM_DIAG exports motor_ready
+PASS  startup melody begins before scheduler
+PASS  fault audio deferred while melody active
+PASS  running does not cancel startup melody
+PASS  Hall detect forces electrical angle
+PASS  Hall detect drives Id not Hall phase
+PASS  detect phase bypass exists
+PASS  sensorless forced startup exists
+PASS  sensorless Q boost participates
+PASS  debug decodes MOTOR_NOT_READY
+PASS  debug has startup-check
+PASS  sensor select distinguishes detect result
+PASS  calibrate checks readiness
+PASS  no #if 0 dead blocks
+PASS  no tabs in project C/H
+PASS  no trailing whitespace in project C/H
+
+SUMMARY: 25/25 PASS
+
+== Run30 regression ==
+=== RUN29 BASELINE ===
+PASS  drive critical mask defined
+PASS  boot gate uses drive critical mask
+PASS  runtime readiness recovery exists
+PASS  recovery requires valid calibration
+PASS  recovery requires hard sampling validity
+PASS  recovery only auto-clears ADC_DMA
+PASS  command boundary retries readiness
+PASS  packet thread probes recovery
+PASS  COMM_DIAG revision 18
+PASS  COMM_DIAG exports motor_ready
+PASS  startup melody begins before scheduler
+PASS  fault audio deferred while melody active
+PASS  running does not cancel startup melody
+PASS  Hall detect forces electrical angle
+PASS  Hall detect drives Id not Hall phase
+PASS  detect phase bypass exists
+PASS  sensorless forced startup exists
+PASS  sensorless Q boost participates
+PASS  debug decodes MOTOR_NOT_READY
+PASS  debug has startup-check
+PASS  sensor select distinguishes detect result
+PASS  calibrate checks readiness
+PASS  no #if 0 dead blocks
+PASS  no tabs in project C/H
+PASS  no trailing whitespace in project C/H
+
+SUMMARY: 25/25 PASS
+PASS  Run29 baseline audit remains green
+
+=== RUN30 EEPROM / STATUS ===
+PASS  startup melody retained
+PASS  normal running status is exactly 3 LED pulses
+PASS  running/detect suppresses ordinary audio cue
+PASS  EEPROM uses queued event counter
+PASS  EEPROM cue explicitly five tones
+PASS  EEPROM cue documented as five beep in public header
+PASS  all four physical store wrappers notify centrally
+PASS  no duplicate high-level EEPROM notify in commands
+PASS  no duplicate high-level EEPROM notify in config generator
+
+=== RUN30 VESC COMMAND PATH ===
+PASS  COMM_SET_DUTY handler reaches motor_set_duty
+PASS  COMM_SET_CURRENT handler reaches motor_set_current
+PASS  COMM_SET_CURRENT_BRAKE handler reaches motor_set_brake_current
+PASS  COMM_SET_RPM handler reaches motor_set_speed
+PASS  COMM_SET_POS handler reaches motor_set_position
+PASS  COMM_SET_HANDBRAKE handler reaches motor_set_handbrake
+PASS  COMM_SET_CURRENT_REL handler reaches motor_set_current_rel
+PASS  all control handlers pass readiness boundary
+PASS  brake Iq opposes measured speed
+PASS  brake zero-speed guard retained
+PASS  position PID command path retained
+
+=== RUN30 HALL / FOC CROSS-CHECK ===
+PASS  Hall detect forces electrical phase
+PASS  Hall detect ramps Id with Iq zero
+PASS  Hall forward sweep keeps Id and forced phase
+PASS  Hall reverse sweep present
+PASS  Hall topology validates six Gray states
+PASS  current ADC polarity remains offset-minus-raw
+
+=== RUN30 DEBUG ACCEPTANCE ===
+PASS  debug has brake-test
+PASS  brake-test pre-spins before brake
+PASS  debug has Hall-resolution-aware position-test
+PASS  debug has full drive-acceptance
+PASS  drive-acceptance includes 'duty'
+PASS  drive-acceptance includes 'current'
+PASS  drive-acceptance includes 'current-rel'
+PASS  drive-acceptance includes 'rpm'
+PASS  drive-acceptance includes cmd_brake_test
+PASS  drive-acceptance includes cmd_position_test
+PASS  drive-acceptance includes 'handbrake'
+PASS  drive-acceptance includes cmd_config_save
+PASS  full-test aliases stronger Run30 acceptance
+PASS  config-save reports five-beep contract
+
+SUMMARY: 41/41 PASS
+
+== Run35 merge audit ==
+=== RUN31 BASE PRESERVATION ===
+PASS  all non-ADC/ISR Run31 base files are byte-identical
+PASS  Run29 audit retained
+PASS  Run30 audit retained
+PASS  Run31 Detect-All source retained
+PASS  Run31 Hall detector retained
+PASS  Run31 position path retained
+PASS  Run31 HFI minimum migration retained
+PASS  release build remains O3
+
+=== V15 ADC MAPPING ===
+PASS  ADC1 has exactly 5 conversions
+PASS  ADC2 has exactly 5 conversions
+PASS  ADC1 PC1 RIGHT DC rank1
+PASS  ADC2 PC0 LEFT DC rank1
+PASS  ADC1 PA0 LEFT A rank2
+PASS  ADC2 PC3 LEFT B rank2
+PASS  ADC1 PC4 RIGHT B rank3
+PASS  ADC2 PC5 RIGHT C rank3
+PASS  ADC1 PC2 VBUS rank4
+PASS  ADC2 PA2 APP rank4
+PASS  ADC1 TEMP rank5
+PASS  ADC2 PA3 APP rank5
+PASS  no ADC rank6 configured
+PASS  ADC master trigger remains TIM8_TRGO
+PASS  dual regular simultaneous remains active
+PASS  ADC clock remains APB2 /6
+PASS  ADC3 not active
+PASS  DMA2 not active for ADC
+
+=== DMA / ISR BUDGET ===
+PASS  five words per ADC frame
+PASS  three ADC frames per DMA batch
+PASS  DMA batch is 15 words
+PASS  ADC sampling stays 16 kHz
+PASS  full FOC rate is PWM/3
+PASS  FOC dt is 3/PWM
+PASS  FOC slot is three PWM periods
+PASS  DMA start length uses 15-word batch macro
+PASS  DMA HT IRQ disabled
+PASS  DMA TC IRQ enabled
+PASS  DMA IRQ handles TC not HT
+PASS  DMA IRQ clears TC flag
+PASS  ISR passes newest third frame
+PASS  app ADC snapshot uses newest third frame
+PASS  TE path still shuts both bridges off
+PASS  no ADC work is routed through DMA2 ISR
+
+=== FULL RUN31 CONTROL FEATURES ===
+PASS  COMM_SET_DUTY retained
+PASS  COMM_SET_CURRENT retained
+PASS  COMM_SET_CURRENT_BRAKE retained
+PASS  COMM_SET_RPM retained
+PASS  COMM_SET_POS retained
+PASS  COMM_SET_HANDBRAKE retained
+PASS  COMM_SET_CURRENT_REL retained
+PASS  detect_resistance retained
+PASS  detect_inductance retained
+PASS  detect_flux_linkage retained
+PASS  mcpwm_foc_hall_detect_motor retained
+PASS  EEPROM 5-beep contract retained
+PASS  running 3-pulse LED path retained
+
+=== VESC IDENTITY ===
+PASS  local ID1 reports MOTOR_LEFT
+PASS  forwarded ID2 reports MOTOR_RIGHT
+PASS  debug expects MOTOR_RIGHT for motor2-forward
+
+SUMMARY: 58/58 PASS
+
+== Python compile ==
+PY_COMPILE_PASS

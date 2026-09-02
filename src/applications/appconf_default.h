@@ -12,23 +12,33 @@
  * not the FOC loop period. */
 #define VESC_FOC_F_ZV_HZ                (2UL * PWM_FREQUENCY_HZ)
 #define FOC_DEADTIME_COMP_US             ((float)PWM_DEADTIME_NS / 1000.0f)
-#define PWM_MIN_DUTY                    0.10f
-#define PWM_MAX_DUTY                    0.90f
-#define PWM_MIN_DUTY_Q15                3277U
-#define PWM_MAX_DUTY_Q15                29491U
-/* Stock EFeru hoverboard timing: one dual-ADC current frame per PWM period.
- * ADC rank order is DC-link currents, LEFT phase pair, RIGHT phase pair. TIM8
- * (LEFT) is advanced from TIM1 (RIGHT) by exactly one phase-current ADC
- * conversion so the two phase pairs are sampled in their respective low-side
- * measurement windows. We retain ADC /6 (10.67 MHz) to stay inside STM32F103
- * limits, therefore 20 ADC clocks = 120 CPU timer ticks. */
+/* Samakan jendela sampling low-side dengan firmware hoverboard referensi:
+ * CCR selalu dijaga 110 tick dari tepi ARR=2000 (5.5%..94.5%). */
+#define PWM_SAMPLE_MARGIN_TICKS          110UL
+#define PWM_MIN_DUTY                    ((float)PWM_SAMPLE_MARGIN_TICKS / (float)PWM_TIMER_ARR)
+#define PWM_MAX_DUTY                    (1.0f - PWM_MIN_DUTY)
+#define PWM_MIN_DUTY_Q15                1802U
+#define PWM_MAX_DUTY_Q15                30966U
+/* Run35 keeps the proven hoverboard V15 ADC sequence exactly: one 5-rank
+ * dual-ADC scan is triggered every 16-kHz PWM period. To keep the complete
+ * Run31 VESC FOC feature set without repeating the measured 4.4k-cycle
+ * overrun, DMA stores three consecutive 5-word frames and raises TC only
+ * after the third frame. ADC sampling therefore remains 16 kHz while the
+ * full Run31 FOC update runs at 16k/3 = 5.333 kHz from the newest frame.
+ * The first two frames are DMA-only sampling: no float/observer/config work
+ * is executed in their CPU path. */
 #define ADC_CLOCK_DIV                   6UL
 #define ADC_PHASE_CONV_CYCLES           20UL /* 7.5 sample + 12.5 conversion */
 #define ADC_MOTOR_PHASE_OFFSET_TICKS    (ADC_CLOCK_DIV * ADC_PHASE_CONV_CYCLES)
+#define ADC_WORDS_PER_FRAME             5UL
+#define ADC_DMA_BATCH_FRAMES            3UL
+#define ADC_DMA_BATCH_WORDS             (ADC_WORDS_PER_FRAME * ADC_DMA_BATCH_FRAMES)
+#define ADC_SAMPLE_EVENT_HZ             PWM_FREQUENCY_HZ
 #define FOC_SAMPLE_EVENTS_PER_PWM       1UL
-#define FOC_ISR_EVENT_HZ                (PWM_FREQUENCY_HZ * FOC_SAMPLE_EVENTS_PER_PWM)
-#define FOC_ISR_SLOT_CYCLES             (CPU_CLOCK_HZ / FOC_ISR_EVENT_HZ)
-#define FOC_DT_S                        (1.0f / (float)PWM_FREQUENCY_HZ)
+#define FOC_CONTROL_DIV                 ADC_DMA_BATCH_FRAMES
+#define FOC_ISR_EVENT_HZ                (PWM_FREQUENCY_HZ / FOC_CONTROL_DIV)
+#define FOC_ISR_SLOT_CYCLES             ((CPU_CLOCK_HZ * FOC_CONTROL_DIV) / PWM_FREQUENCY_HZ)
+#define FOC_DT_S                        ((float)FOC_CONTROL_DIV / (float)PWM_FREQUENCY_HZ)
 
 /* ===================== POWER-STAGE POLARITY =====================
  * User hardware requirement:
@@ -66,7 +76,9 @@
 #define RIGHT_HALL_ELEC_OFFSET_DEG_DEFAULT     0.0f
 
 /* Fallback Hall sequence only. Runtime Hall auto-detect replaces it. */
-#define HALL_TABLE_DEFAULT              { -1, 0, 4, 5, 2, 1, 3, -1 }
+/* Urutan sektor fallback mengikuti vec_hallToPos pada firmware hoverboard
+ * referensi untuk packing raw (U<<2)|(V<<1)|W. Nilai 000 dan 111 invalid. */
+#define HALL_TABLE_DEFAULT              { -1, 2, 0, 1, 4, 3, 5, -1 }
 
 /* ===================== CURRENT / VOLTAGE CALIBRATION =====================
  * A/count and V/count depend on shunt, op-amp and divider values. They must
@@ -85,34 +97,23 @@
  * Board-specific calibration can still replace this constant later. */
 #define DCLINK_V_PER_COUNT              (39.70f / 1492.0f)
 
-/* VESC-style boot current-offset calibration. */
-#define ADC_OFFSET_CAL_SAMPLES          4096U
-/* EFeru-reference boot offset averaging: number of 16-kHz DMA ISR frames the
- * default boot path averages the six raw current channels before the FOC runs
- * with the converging offsets (EFeru semantics: cur = offset - raw). 2000
- * frames ~= 125 ms, matching the reference running-average window. Only used
- * on the default boot path; VESC Tool recalibration uses the driven pipeline. */
+/* Kalibrasi offset arus stock hoverboard. Boot dan recalibration manual
+ * memakai jalur yang SAMA: kedua bridge di 50%/50%/50% zero-vector, warm-up,
+ * lalu 2000 frame ADC sinkron. Offset final adalah midpoint (min + max) / 2
+ * untuk tiap kanal, sehingga common-mode saat PWM aktif ikut terkalibrasi. */
 #define ADC_BOOT_CAL_SAMPLES            2000U
-/* VESC-style driven current-offset calibration. Upstream VESC stores
- * driven and undriven offsets separately; for low-side-shunt hardware its
- * alternative calibration runs all three phases at 50% (zero SVM amplitude)
- * and averages 1000 samples. We preserve an undriven diagnostic pass, then
- * calibrate LEFT and RIGHT one at a time under 50% zero-vector PWM. */
-#define ADC_DRIVEN_CAL_SAMPLES          1000U
-#define ADC_DRIVEN_CAL_SAMPLE_HZ        1000U
-#define ADC_DRIVEN_CAL_DECIMATION       (FOC_ISR_EVENT_HZ / ADC_DRIVEN_CAL_SAMPLE_HZ)
-#define ADC_DRIVEN_CAL_WARMUP_EVENTS    64U
-#define ADC_DRIVEN_CAL_MAX_DC_A         6.0f
-#define ADC_DRIVEN_CAL_MAX_DC_COUNTS    300U /* 6 A at 0.02 A/count */
-#define ADC_DRIVEN_CAL_DC_TRIP_SAMPLES  8U
-#define ADC_CAL_VBUS_STABLE_5MS_TICKS   400U /* 2.0 s, matching VESC settle window */
-#define ADC_CAL_VBUS_STABLE_DELTA_V     1.50f /* restart settle timer when Vbus moves more than this */
+#define ADC_NEUTRAL_CAL_SAMPLES         ADC_BOOT_CAL_SAMPLES
+#define ADC_NEUTRAL_CAL_WARMUP_EVENTS   64U
+#define ADC_CAL_VBUS_STABLE_5MS_TICKS   400U /* 2.0 s settle sebelum MOE */
+#define ADC_CAL_VBUS_STABLE_DELTA_V     1.50f
+#define ADC_OFFSET_MOE_WAIT_EVENTS      256U
 #define PWM_ENABLE_BLANK_CYCLES         8U
 /* EFeru uses I_DC_MAX=17 A for the stage-2 DC-link current chop on the stock
  * board. Do not reuse the much lower 6 A driven-calibration sanity limit for
  * normal PWM startup; that coupling caused a false ABS_OVER_CURRENT during
  * Hall detect before the current ramp had even begun. */
 #define PWM_STARTUP_DC_TRIP_A           17.0f
+#define PWM_STARTUP_DC_TRIP_DEBOUNCE_SAMPLES 4U /* 250 us at 16 kHz; fits inside the 8-event startup blanking window while rejecting a one-sample switching spike */
 #define PWM_ENABLE_PRELOAD_EVENTS       2U
 /* Current-offset validation policy:
  * - VESC upstream calibrates by averaging current offsets and does not reject
@@ -124,11 +125,9 @@
 #define ADC_OFFSET_HARD_MIN_COUNT       128
 #define ADC_OFFSET_HARD_MAX_COUNT       3967
 #define ADC_OFFSET_WARN_SPREAD_COUNT    160U
-#define ADC_OFFSET_WARN_STDDEV_COUNT    16U
-#define ADC_OFFSET_HARD_STDDEV_COUNT    80U
+#define ADC_OFFSET_HARD_SPREAD_COUNT    512U
 #define ADC_OFFSET_INLIER_WINDOW_COUNT  256U
 #define ADC_OFFSET_HARD_OUTLIER_COUNT   10U
-#define ADC_OFFSET_MOE_WAIT_EVENTS      128U
 
 /* Incremental A/B has no absolute electrical origin after cold boot.
  * FOC_SENSOR_MODE_ENCODER_AB uses observer/open-loop startup to establish
@@ -162,11 +161,12 @@
 #define FOC_ABS_CURRENT_TRIP_A          25.0f
 #define FOC_ABS_CURRENT_FILTER_ALPHA_Q15 4096  /* 0.125 @ 16 kHz */
 #define FOC_ABS_CURRENT_FAULT_DEBOUNCE_SAMPLES 4U
+#define FOC_HARD_CURRENT_FAULT_DEBOUNCE_SAMPLES 4U /* 250 us at 16 kHz; hardware BKIN remains immediate */
 #define FOC_MAX_VOLTAGE_MODULATION      0.80f
 #define VBUS_MIN_RUN_V                  8.0f
 #define VBUS_MAX_RUN_V                  55.0f
 #define FOC_VBUS_FAULT_DEBOUNCE_SAMPLES 4U
-#define FOC_VBUS_DMA_STALE_FAULT_SAMPLES 3U /* ADC3 DMA must advance each PWM trigger */
+#define FOC_VBUS_DMA_STALE_FAULT_SAMPLES 3U /* legacy diagnostic constant; ADC3 removed in Run31 */
 #define FOC_VBUS_HARD_OV_MARGIN_V       3.0f
 #define FOC_VBUS_HARD_UV_MARGIN_V       2.0f
 #define FOC_VBUS_HARD_MAX_V             60.0f
@@ -178,9 +178,13 @@
  */
 #define SENSOR_DETECT_CURRENT_A         1.5f
 #define SENSOR_DETECT_MAX_CURRENT_A     2.0f
-/* Current VESC mcpwm_foc_hall_detect semantics: ramp Id 0->request over
- * 1000 x 1 ms, then 3 forward + 3 reverse electrical sweeps at 1 degree
- * per 5 ms. The F103 port implements the same sequence in its 1-kHz task. */
+/* Hall detect uses OPEN-LOOP SVPWM (no current PI) with a tiny fixed duty.
+ * The closed-loop current PI on this F103 port is not yet trustworthy for
+ * sub-2A excitation: a 0.1-0.5 A request drives Id/Iq to several amps and
+ * trips ABS_OVER_CURRENT. A 1.5% modulation at ~44 V bus yields a small, safe
+ * phase field that is more than enough to sample the Hall states during the
+ * electrical sweep. This matches the "try open-loop SVPWM first" request. */
+#define SENSOR_DETECT_DUTY              0.015f
 #define SENSOR_DETECT_CURRENT_RAMP_MS   1000U
 #define SENSOR_DETECT_STEP_MS           5U
 #define SENSOR_DETECT_SWEEPS            3U
@@ -254,7 +258,9 @@
 #define MCCONF_FOC_SL_ERPM_START_DEFAULT        1200.0f
 #define MCCONF_FOC_SL_ERPM_DEFAULT              2500.0f
 #define MCCONF_FOC_OPENLOOP_RPM_DEFAULT         900.0f
-#define MCCONF_FOC_OPENLOOP_RPM_LOW_DEFAULT     350.0f
+/* VESC foc_openloop_rpm_low is a FRACTION (0..1) of foc_openloop_rpm at
+ * minimum motor current, not an ERPM value. Keep the upstream default 0.0. */
+#define MCCONF_FOC_OPENLOOP_RPM_LOW_DEFAULT     0.0f
 #define MCCONF_FOC_SL_OPENLOOP_HYST_DEFAULT     0.10f
 #define MCCONF_FOC_SL_OPENLOOP_T_LOCK_DEFAULT   0.18f
 #define MCCONF_FOC_SL_OPENLOOP_T_RAMP_DEFAULT   0.55f

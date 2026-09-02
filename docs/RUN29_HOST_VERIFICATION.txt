@@ -1,0 +1,14 @@
+RUN29 HOST VERIFICATION - 2026-09-01
+
+PASS: python3 -m py_compile tools/debug.py tools/vesc.py tools/audit_run29.py
+PASS: python3 tools/debug.py --self-test
+PASS: python3 tools/audit_run29.py -> 25/25 PASS
+PASS: gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only -DFOC_MATH_UNIT_TEST -Isrc src/motor/foc_math.c
+
+NOT RUN IN THIS ENVIRONMENT:
+- pio run / pio run -t upload (PlatformIO + ARM toolchain unavailable here)
+- hardware motor spin
+- Hall physical detect
+- ISR cycle timing on STM32F103RCT6
+
+The user's supplied Run28 log did show a successful PlatformIO build/upload. Run29 is a source-level patch over Run28 and still requires board acceptance.

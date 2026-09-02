@@ -3,14 +3,27 @@
 #include "hwconf/hw.h"
 #include <math.h>
 
+// Parameter x: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi wrap_360: menjalankan operasi wrap 360 sesuai tanggung jawab modul dengan input tervalidasi dan state
+// yang konsisten.
 static float wrap_360(float x) {
-    while (x < 0.0f) x += 360.0f;
-    while (x >= 360.0f) x -= 360.0f;
+    while (x < 0.0f)
+        x += 360.0f;
+    while (x >= 360.0f)
+        x -= 360.0f;
     return x;
 }
 
+// Parameter m: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Parameter cfg: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi enc_abi_init: menginisialisasi enc abi init sehingga resource, konfigurasi awal, dan state modul siap
+// digunakan dengan aman.
 bool enc_abi_init(MotorRuntime *m, const encoder_cfg_ABI_t *cfg) {
-    if (!m || !cfg || m->id != MOTOR_LEFT || cfg->counts < 4U || cfg->counts > 65535U) return false;
+    if (!m || !cfg || m->id != MOTOR_LEFT || cfg->counts < 4U || cfg->counts > 65535U)
+        return false;
     m->encoder.cpr = cfg->counts;
     m->encoder.synced = false;
     m->encoder.motion_proved = false;
@@ -19,26 +32,48 @@ bool enc_abi_init(MotorRuntime *m, const encoder_cfg_ABI_t *cfg) {
     return true;
 }
 
+// Parameter m: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi enc_abi_deinit: melepas atau menonaktifkan resource enc abi deinit dengan urutan yang aman.
 void enc_abi_deinit(MotorRuntime *m) {
-    if (!m) return;
+    if (!m)
+        return;
     m->encoder.synced = false;
     m->encoder.motion_proved = false;
 }
 
+// Parameter m: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi enc_abi_read_deg: menjalankan operasi enc abi read deg sesuai tanggung jawab modul dengan input
+// tervalidasi dan state yang konsisten.
 float enc_abi_read_deg(MotorRuntime *m) {
-    if (!m || m->encoder.cpr == 0U) return 0.0f;
+    if (!m || m->encoder.cpr == 0U)
+        return 0.0f;
+    // Variabel rel: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     int32_t rel = motor_encoder_extended_count(m) - m->encoder.session_zero_count;
+    // Variabel deg: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     float deg = ((float)rel * 360.0f) / (float)m->encoder.cpr;
     return wrap_360(deg);
 }
 
+// Parameter m: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Parameter deg: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi enc_abi_set_deg: mengatur enc abi set deg setelah nilai masukan divalidasi dan dibatasi sesuai aturan
+// keselamatan modul.
 void enc_abi_set_deg(MotorRuntime *m, float deg) {
-    if (!m || m->encoder.cpr == 0U) return;
+    if (!m || m->encoder.cpr == 0U)
+        return;
     deg = wrap_360(deg);
+    // Variabel old_ext: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     int32_t old_ext = motor_encoder_extended_count(m);
+    // Variabel old_pos_delta: nilai posisi rotor atau aktuator.
     int32_t old_pos_delta = old_ext - m->encoder.mechanical_zero_count;
+    // Variabel target: nilai kerja yang menyimpan state atau hasil antara sesuai konteks algoritma pada lingkup ini.
     uint32_t target = (uint32_t)lrintf((deg / 360.0f) * (float)m->encoder.cpr);
-    if (target >= m->encoder.cpr) target = 0U;
+    if (target >= m->encoder.cpr)
+        target = 0U;
 
     /* Match upstream enc_abi_set_deg(): the hardware quadrature counter itself
        is rebased. The extra mechanical_zero_count compensation is only for the
@@ -54,6 +89,10 @@ void enc_abi_set_deg(MotorRuntime *m, float deg) {
     m->encoder.motion_proved = true;
 }
 
+// Parameter m: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi enc_abi_index_found: menjalankan operasi enc abi index found sesuai tanggung jawab modul dengan input
+// tervalidasi dan state yang konsisten.
 bool enc_abi_index_found(const MotorRuntime *m) {
     return m && m->encoder.synced;
 }

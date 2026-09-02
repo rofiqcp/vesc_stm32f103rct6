@@ -1,0 +1,297 @@
+RUN31 FINAL HOST/OFFLINE VERIFICATION
+UTC 2026-09-01T17:36:47Z
+
+== python compile ==
+PY_COMPILE_PASS
+
+== debug command parser/help ==
+DEBUG_COMMAND_HELP_PASS
+
+== debug self-test ==
+SELF-TEST PASS: CRC/framing, VESC-6.00 FW/config, local-ID2 forwarding, sample/ADC parser, current-cal-v19 midpoint/MOE ABI, EXT-v6 telemetry, COMM_DIAG-v18 readiness/recovery + command acceptance/reject + current/buzzer trace, resources/boot, sensor/observer diagnostics
+
+== audit_run29 ==
+PASS  drive critical mask defined
+PASS  boot gate uses drive critical mask
+PASS  runtime readiness recovery exists
+PASS  recovery requires valid calibration
+PASS  recovery requires hard sampling validity
+PASS  recovery only auto-clears ADC_DMA
+PASS  command boundary retries readiness
+PASS  packet thread probes recovery
+PASS  COMM_DIAG revision 18
+PASS  COMM_DIAG exports motor_ready
+PASS  startup melody begins before scheduler
+PASS  fault audio deferred while melody active
+PASS  running does not cancel startup melody
+PASS  Hall detect forces electrical angle
+PASS  Hall detect drives Id not Hall phase
+PASS  detect phase bypass exists
+PASS  sensorless forced startup exists
+PASS  sensorless Q boost participates
+PASS  debug decodes MOTOR_NOT_READY
+PASS  debug has startup-check
+PASS  sensor select distinguishes detect result
+PASS  calibrate checks readiness
+PASS  no #if 0 dead blocks
+PASS  no tabs in project C/H
+PASS  no trailing whitespace in project C/H
+
+SUMMARY: 25/25 PASS
+
+== audit_run30 ==
+=== RUN29 BASELINE ===
+PASS  drive critical mask defined
+PASS  boot gate uses drive critical mask
+PASS  runtime readiness recovery exists
+PASS  recovery requires valid calibration
+PASS  recovery requires hard sampling validity
+PASS  recovery only auto-clears ADC_DMA
+PASS  command boundary retries readiness
+PASS  packet thread probes recovery
+PASS  COMM_DIAG revision 18
+PASS  COMM_DIAG exports motor_ready
+PASS  startup melody begins before scheduler
+PASS  fault audio deferred while melody active
+PASS  running does not cancel startup melody
+PASS  Hall detect forces electrical angle
+PASS  Hall detect drives Id not Hall phase
+PASS  detect phase bypass exists
+PASS  sensorless forced startup exists
+PASS  sensorless Q boost participates
+PASS  debug decodes MOTOR_NOT_READY
+PASS  debug has startup-check
+PASS  sensor select distinguishes detect result
+PASS  calibrate checks readiness
+PASS  no #if 0 dead blocks
+PASS  no tabs in project C/H
+PASS  no trailing whitespace in project C/H
+
+SUMMARY: 25/25 PASS
+PASS  Run29 baseline audit remains green
+
+=== RUN30 EEPROM / STATUS ===
+PASS  startup melody retained
+PASS  normal running status is exactly 3 LED pulses
+PASS  running/detect suppresses ordinary audio cue
+PASS  EEPROM uses queued event counter
+PASS  EEPROM cue explicitly five tones
+PASS  EEPROM cue documented as five beep in public header
+PASS  all four physical store wrappers notify centrally
+PASS  no duplicate high-level EEPROM notify in commands
+PASS  no duplicate high-level EEPROM notify in config generator
+
+=== RUN30 VESC COMMAND PATH ===
+PASS  COMM_SET_DUTY handler reaches motor_set_duty
+PASS  COMM_SET_CURRENT handler reaches motor_set_current
+PASS  COMM_SET_CURRENT_BRAKE handler reaches motor_set_brake_current
+PASS  COMM_SET_RPM handler reaches motor_set_speed
+PASS  COMM_SET_POS handler reaches motor_set_position
+PASS  COMM_SET_HANDBRAKE handler reaches motor_set_handbrake
+PASS  COMM_SET_CURRENT_REL handler reaches motor_set_current_rel
+PASS  all control handlers pass readiness boundary
+PASS  brake Iq opposes measured speed
+PASS  brake zero-speed guard retained
+PASS  position PID command path retained
+
+=== RUN30 HALL / FOC CROSS-CHECK ===
+PASS  Hall detect forces electrical phase
+PASS  Hall detect ramps Id with Iq zero
+PASS  Hall forward sweep keeps Id and forced phase
+PASS  Hall reverse sweep present
+PASS  Hall topology validates six Gray states
+PASS  current ADC polarity remains offset-minus-raw
+
+=== RUN30 DEBUG ACCEPTANCE ===
+PASS  debug has brake-test
+PASS  brake-test pre-spins before brake
+PASS  debug has Hall-resolution-aware position-test
+PASS  debug has full drive-acceptance
+PASS  drive-acceptance includes 'duty'
+PASS  drive-acceptance includes 'current'
+PASS  drive-acceptance includes 'current-rel'
+PASS  drive-acceptance includes 'rpm'
+PASS  drive-acceptance includes cmd_brake_test
+PASS  drive-acceptance includes cmd_position_test
+PASS  drive-acceptance includes 'handbrake'
+PASS  drive-acceptance includes cmd_config_save
+PASS  full-test aliases stronger Run30 acceptance
+PASS  config-save reports five-beep contract
+
+SUMMARY: 41/41 PASS
+
+== audit_run31 ==
+=== RUN30 BASELINE ===
+=== RUN29 BASELINE ===
+PASS  drive critical mask defined
+PASS  boot gate uses drive critical mask
+PASS  runtime readiness recovery exists
+PASS  recovery requires valid calibration
+PASS  recovery requires hard sampling validity
+PASS  recovery only auto-clears ADC_DMA
+PASS  command boundary retries readiness
+PASS  packet thread probes recovery
+PASS  COMM_DIAG revision 18
+PASS  COMM_DIAG exports motor_ready
+PASS  startup melody begins before scheduler
+PASS  fault audio deferred while melody active
+PASS  running does not cancel startup melody
+PASS  Hall detect forces electrical angle
+PASS  Hall detect drives Id not Hall phase
+PASS  detect phase bypass exists
+PASS  sensorless forced startup exists
+PASS  sensorless Q boost participates
+PASS  debug decodes MOTOR_NOT_READY
+PASS  debug has startup-check
+PASS  sensor select distinguishes detect result
+PASS  calibrate checks readiness
+PASS  no #if 0 dead blocks
+PASS  no tabs in project C/H
+PASS  no trailing whitespace in project C/H
+
+SUMMARY: 25/25 PASS
+PASS  Run29 baseline audit remains green
+
+=== RUN30 EEPROM / STATUS ===
+PASS  startup melody retained
+PASS  normal running status is exactly 3 LED pulses
+PASS  running/detect suppresses ordinary audio cue
+PASS  EEPROM uses queued event counter
+PASS  EEPROM cue explicitly five tones
+PASS  EEPROM cue documented as five beep in public header
+PASS  all four physical store wrappers notify centrally
+PASS  no duplicate high-level EEPROM notify in commands
+PASS  no duplicate high-level EEPROM notify in config generator
+
+=== RUN30 VESC COMMAND PATH ===
+PASS  COMM_SET_DUTY handler reaches motor_set_duty
+PASS  COMM_SET_CURRENT handler reaches motor_set_current
+PASS  COMM_SET_CURRENT_BRAKE handler reaches motor_set_brake_current
+PASS  COMM_SET_RPM handler reaches motor_set_speed
+PASS  COMM_SET_POS handler reaches motor_set_position
+PASS  COMM_SET_HANDBRAKE handler reaches motor_set_handbrake
+PASS  COMM_SET_CURRENT_REL handler reaches motor_set_current_rel
+PASS  all control handlers pass readiness boundary
+PASS  brake Iq opposes measured speed
+PASS  brake zero-speed guard retained
+PASS  position PID command path retained
+
+=== RUN30 HALL / FOC CROSS-CHECK ===
+PASS  Hall detect forces electrical phase
+PASS  Hall detect ramps Id with Iq zero
+PASS  Hall forward sweep keeps Id and forced phase
+PASS  Hall reverse sweep present
+PASS  Hall topology validates six Gray states
+PASS  current ADC polarity remains offset-minus-raw
+
+=== RUN30 DEBUG ACCEPTANCE ===
+PASS  debug has brake-test
+PASS  brake-test pre-spins before brake
+PASS  debug has Hall-resolution-aware position-test
+PASS  debug has full drive-acceptance
+PASS  drive-acceptance includes 'duty'
+PASS  drive-acceptance includes 'current'
+PASS  drive-acceptance includes 'current-rel'
+PASS  drive-acceptance includes 'rpm'
+PASS  drive-acceptance includes cmd_brake_test
+PASS  drive-acceptance includes cmd_position_test
+PASS  drive-acceptance includes 'handbrake'
+PASS  drive-acceptance includes cmd_config_save
+PASS  full-test aliases stronger Run30 acceptance
+PASS  config-save reports five-beep contract
+
+SUMMARY: 41/41 PASS
+PASS  Run30 baseline audit remains green
+
+=== RUN31 REALTIME BUILD ===
+PASS  default hardware environment is optimized release
+PASS  release image uses O3
+PASS  debug-symbol image also forces O3
+PASS  firmware CPU clock contract is 64 MHz
+PASS  system clock is HSI PLL x16 = 64 MHz
+PASS  16-kHz FOC slot is derived from CPU clock
+
+=== RUN31 ADC / PWM / ISR ===
+PASS  ADC3 and DMA2 are absent from active hardware globals
+PASS  public ADC DMA frame is six words
+PASS  ADC1 and ADC2 each configure six regular ranks
+PASS  ADC1 PC1 RIGHT DC rank1
+PASS  ADC2 PC0 LEFT DC rank1
+PASS  ADC1 PA0 LEFT A rank2
+PASS  ADC2 PC3 LEFT B rank2
+PASS  ADC1 PC4 RIGHT B rank3
+PASS  ADC2 PC5 RIGHT C rank3
+PASS  ADC1 PC2 VBUS rank4
+PASS  ADC2 PA2 APP rank4
+PASS  ADC1 TEMP rank5
+PASS  ADC2 PA3 APP rank5
+PASS  rank6 filler exists only to align DMA half-transfer
+PASS  ADC1 master trigger remains TIM8_TRGO
+PASS  ADC1 regular trigger AFIO remap is forced safely
+PASS  ADC clock stays /6 at 64 MHz
+PASS  DMA length is exactly six words
+PASS  DMA ISR uses half-transfer after current rank3
+PASS  Vbus comes from ADC1 rank4 without ADC3 freshness fault
+PASS  sampling contract expects 6 ranks + HT IRQ
+PASS  trigger-route audit only checks ADC1 TIM8 remap
+PASS  legacy ADC3 diagnostic slots are zero-only
+
+=== RUN31 POWER-STAGE / PIN PARITY WITH RUNNING HOVERBOARD ===
+PASS  PWM frequency remains 16 kHz and ARR resolves to 2000 at 64 MHz
+PASS  deadtime is 750 ns = 48 timer ticks at 64 MHz, matching reference DEAD_TIME=48
+PASS  high-side active-high and low-side active-low contract retained
+PASS  advanced-timer output polarity matches running reference
+PASS  MOE-off idle levels physically switch both FET inputs off
+PASS  all three complementary PWM channel pairs are enabled
+PASS  hardware break remains disabled by default like running reference
+PASS  LEFT TIM8 phase pins match running hoverboard reference
+PASS  RIGHT TIM1 phase pins match running hoverboard reference
+PASS  current-sense and DCLINK GPIO pins match running hoverboard reference
+PASS  Hall GPIO pins match running hoverboard reference
+
+=== RUN31 HFI / VESC TOOL ===
+PASS  HFI legacy values below VESC minimum are normalized
+PASS  factory HFI start samples matches VESC 6.00 default 5
+PASS  factory HFI voltage max matches VESC 6.00 default 6 V
+PASS  factory HFI transition ERPM matches VESC 6.00 default 3000
+PASS  persistent import normalizes both motor MCCONF images
+PASS  debug VESC Tool check explicitly rejects HFI <5
+
+=== RUN31 NATIVE FAULT DIAGNOSTICS ===
+PASS  debug exposes fault-detail command
+PASS  debug decodes native ADC_DMA and FOC_ISR_OVERRUN separately
+PASS  motor-test prints native detail on any VESC fault
+PASS  firmware maps both private realtime faults to standard VESC DRV
+PASS  ISR records end-to-end cycle max and faults only after repeated overrun
+
+=== RUN31 DETECT-ALL / COMMAND ACCEPTANCE ===
+PASS  standard Detect-All FOC worker is active
+PASS  Detect-All measures R and L before flux
+PASS  Detect-All applies measured R L Ld-Lq and flux to runtime
+PASS  Detect-All tries physical sensor then sensorless fallback
+PASS  detect_can=true commissions both local motors atomically
+PASS  debug Detect-All requires positive R L flux
+PASS  drive acceptance runs Detect-All before motion matrix
+PASS  drive acceptance retains cmd_hall_commission
+PASS  drive acceptance retains 'duty'
+PASS  drive acceptance retains 'current'
+PASS  drive acceptance retains 'current-rel'
+PASS  drive acceptance retains 'rpm'
+PASS  drive acceptance retains cmd_brake_test
+PASS  drive acceptance retains cmd_position_test
+PASS  drive acceptance retains 'handbrake'
+PASS  drive acceptance retains cmd_config_save
+
+=== RUN31 HYGIENE ===
+PASS  no out-of-bounds five-word declaration with six-word diagnostic loop
+PASS  no active ADC3/DMA2 references anywhere except defensive IRQ/legacy names
+PASS  no tabs in project C/H/Python
+
+SUMMARY: 71/71 PASS
+
+== portable project util C ==
+PORTABLE_UTIL_C_GCC_WERROR_PASS
+
+== toolchain availability ==
+PIO_NOT_AVAILABLE_IN_AUDIT_ENV
+ARM_NONE_EABI_GCC_NOT_AVAILABLE_IN_AUDIT_ENV

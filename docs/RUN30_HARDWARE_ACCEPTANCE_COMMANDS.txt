@@ -1,0 +1,127 @@
+RUN30 HARDWARE ACCEPTANCE — STM32F103RCT6 DUAL VESC
+===================================================
+
+SAFETY:
+- Kedua roda/motor harus terangkat bebas dari lantai.
+- Siapkan emergency power cut.
+- Jangan pegang motor/roda selama test.
+- Mulai dengan current rendah seperti default di bawah.
+
+1) BUILD + FLASH
+----------------
+pio run -t upload
+
+Biarkan power-on melody selesai.
+
+2) BASELINE
+-----------
+python3 tools/debug.py startup-check
+python3 tools/debug.py calibrate --timeout 8
+python3 tools/debug.py startup-check
+
+Acceptance sebelum gerak:
+- cal_valid = True
+- motor_ready = True
+- sampling live drive = 0x00000000 [OK]
+- fault LEFT/RIGHT = 0
+
+3) SENSORLESS MANUAL PROOF
+--------------------------
+python3 tools/debug.py sensor-select --motor 0 --mode sensorless
+python3 tools/debug.py motor-test --motor 0 --mode current --value 1.0 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 0 --mode current --value -1.0 --seconds 3 --yes
+
+python3 tools/debug.py sensor-select --motor 1 --mode sensorless
+python3 tools/debug.py motor-test --motor 1 --mode current --value 1.0 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 1 --mode current --value -1.0 --seconds 3 --yes
+
+4) HALL AUTODETECT + PERSIST + RUN
+----------------------------------
+python3 tools/debug.py hall-commission --motor 0 --current 1.5 --run-current 1.0 --run-seconds 3 --yes
+python3 tools/debug.py hall-commission --motor 1 --current 1.5 --run-current 1.0 --run-seconds 3 --yes
+
+Setelah save sukses dan motor idle: dengarkan tepat 5 beep per transaksi EEPROM.
+
+5) DUTY
+-------
+python3 tools/debug.py motor-test --motor 0 --mode duty --value 0.05 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 0 --mode duty --value -0.05 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 1 --mode duty --value 0.05 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 1 --mode duty --value -0.05 --seconds 3 --yes
+
+6) CURRENT
+----------
+python3 tools/debug.py motor-test --motor 0 --mode current --value 1.0 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 0 --mode current --value -1.0 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 1 --mode current --value 1.0 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 1 --mode current --value -1.0 --seconds 3 --yes
+
+7) RPM / SPEED
+--------------
+python3 tools/debug.py motor-test --motor 0 --mode rpm --value 300 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 0 --mode rpm --value -300 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 1 --mode rpm --value 300 --seconds 3 --yes
+python3 tools/debug.py motor-test --motor 1 --mode rpm --value -300 --seconds 3 --yes
+
+8) BRAKE — PRE-SPIN + BRAKE REAL PROOF
+--------------------------------------
+python3 tools/debug.py brake-test --motor 0 --erpm 300 --current 1.0 --both-directions --yes
+python3 tools/debug.py brake-test --motor 1 --erpm 300 --current 1.0 --both-directions --yes
+
+PASS membutuhkan command accepted, braking Iq muncul, dan |ERPM| turun.
+
+9) POSITION — HALL RESOLUTION AWARE
+-----------------------------------
+python3 tools/debug.py position-test --motor 0 --step 5 --seconds 2 --yes
+python3 tools/debug.py position-test --motor 0 --step 5 --seconds 2 --reverse --yes
+python3 tools/debug.py position-test --motor 1 --step 5 --seconds 2 --yes
+python3 tools/debug.py position-test --motor 1 --step 5 --seconds 2 --reverse --yes
+
+Tool otomatis menaikkan step minimal menjadi 1.25 Hall edge jika diperlukan.
+
+10) CURRENT RELATIVE + HANDBRAKE
+-------------------------------
+python3 tools/debug.py motor-test --motor 0 --mode current-rel --value 0.03 --seconds 2 --yes
+python3 tools/debug.py motor-test --motor 1 --mode current-rel --value 0.03 --seconds 2 --yes
+python3 tools/debug.py motor-test --motor 0 --mode handbrake --value 0.6 --seconds 1 --yes
+python3 tools/debug.py motor-test --motor 1 --mode handbrake --value 0.6 --seconds 1 --yes
+
+11) EEPROM EXPLICIT SAVE
+------------------------
+python3 tools/debug.py config-status
+python3 tools/debug.py config-save
+python3 tools/debug.py config-status
+
+Sequence harus naik dan setelah motor idle harus terdengar tepat 5 beep.
+
+12) SATU COMMAND UNTUK SEMUA TEST DI ATAS
+-----------------------------------------
+python3 tools/debug.py drive-acceptance --yes
+
+Default:
+- current 1.0 A
+- duty 5%
+- ERPM 300
+- brake 1.0 A
+- Hall detect 1.5 A
+- current-relative 3%
+- handbrake 0.6 A
+
+13) OFFLINE AUDIT
+-----------------
+python3 tools/debug.py --self-test
+python3 tools/audit_run29.py
+python3 tools/audit_run30.py
+
+EXPECTED:
+- self-test PASS
+- audit_run29: 25/25 PASS
+- audit_run30: 41/41 PASS
+
+LED / BUZZER CONTRACT RUN30
+---------------------------
+- Power ON: startup melody buzzer tetap aktif.
+- Running normal: 3 pulse LED, BUKAN 3 beep buzzer.
+- Detect/running: ordinary non-fault audio cue ditunda.
+- EEPROM/flash save sukses: 5 beep setelah audio aman/idle.
+- Fault: diagnostic fault tone tetap diperbolehkan.

@@ -1,0 +1,30 @@
+VESC STM32F103RCT6 v2 - FreeRTOS SmartESC-style 5-task + USART3 communication fix
+Revision date: 2026-08-28
+
+Key properties:
+- Native FreeRTOS only; no CMSIS-RTOS2 application API.
+- Exactly five application tasks: fault_stop(6), timer(5), packet_process(5), blocking(5), sample_send(4).
+- FOC current loop remains DMA1_Channel1_IRQHandler -> foc_adc_dma_isr.
+- USART3 PB10/PB11 at 115200 8N1.
+- RX: DMA1 Channel3 circular, task polls CNDTR and parses VESC frames.
+- TX: DMA1 Channel2; final USART3 TC is polled in task context (no USART3 IRQ dependency).
+- Critical HAL TX-ready bug fixed: check huart3_vesc.gState, not combined HAL_UART_GetState while RX is BUSY_RX.
+- COMM_FW_VERSION is available before motor subsystem startup for recovery diagnostics.
+- OpenOCD/GDB FreeRTOS-aware debug pack included under openocd_debug/.
+- GCC 7.2 FreeRTOS vendor queue.c -Wnonnull false-positive suppressed only for queue.c.
+- STM32F1 AFIO/SWD lockout fixed: no generic MAPR read-modify-write remap helpers; one explicit JTAG-off/SWD-on MAPR write preserves PA13/PA14 while keeping USART3 PB10/PB11 and ADC1 TIM8 trigger mapping.
+- Hardware IWDG is disabled by default for commissioning (`VESC_IWDG_ENABLE=0`) to prevent fast reset loops; motor command timeout/fault protection remains active.
+- OpenOCD launcher no longer stops at main(); it runs to packet_process or early-fatal and always reset+runs the MCU on exit so UART is not left silent after GDB quit.
+
+Validation included in package:
+  python3 tools/rtos_audit.py
+  python3 tools/comm_audit.py
+  python3 vesc_tools/selftest_protocol.py
+
+Dual-motor forwarding fix (motor right / controller ID 2):
+- COMM_FORWARD_CAN ID 2 now follows upstream HW_HAS_DUAL_MOTORS behavior:
+  select motor thread 2 -> recursively process inner VESC command -> restore caller selection.
+- COMM_FW_VERSION uses the same hardware name for both local motor contexts.
+- Motor-2 UUID last byte is incremented only while motor thread 2 is selected, matching upstream VESC.
+- Added `tools/debug.py motor2-forward` raw forwarded FW_VERSION diagnostic.
+- Added `tools/debug.py vesc-tool-dual-basic` passive dual-controller routing/config verification.

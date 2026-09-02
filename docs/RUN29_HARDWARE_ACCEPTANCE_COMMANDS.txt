@@ -1,0 +1,33 @@
+RUN29 - URUTAN UJI HARDWARE
+===========================
+
+1) Build + upload
+pio run -t upload
+
+2) Biarkan power-on melody selesai, lalu cek gate
+python3 tools/debug.py startup-check
+
+3) Recalibration current
+python3 tools/debug.py calibrate --timeout 8
+python3 tools/debug.py startup-check
+
+4) Sensorless LEFT
+python3 tools/debug.py sensor-select --motor 0 --mode sensorless
+python3 tools/debug.py motor-test --motor 0 --mode current --value 1.0 --seconds 3 --yes
+
+5) Sensorless RIGHT
+python3 tools/debug.py sensor-select --motor 1 --mode sensorless
+python3 tools/debug.py motor-test --motor 1 --mode current --value 1.0 --seconds 3 --yes
+
+6) Jika command ACCEPTED tetapi motor belum bergerak
+python3 tools/debug.py comm-diag
+python3 tools/debug.py sensor-info
+python3 tools/debug.py diagnose --timeout 8
+
+7) Hall detect/commission (roda bebas, current rendah dahulu)
+python3 tools/debug.py hall-commission --motor 0 --yes
+python3 tools/debug.py hall-commission --motor 1 --yes
+
+8) Audit source lokal tanpa hardware
+python3 tools/debug.py --self-test
+python3 tools/audit_run29.py

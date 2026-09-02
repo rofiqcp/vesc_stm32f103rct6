@@ -1,0 +1,29 @@
+# Clean optimized build
+pio run -t clean
+pio run -e stm32f103rc -t upload
+
+# Offline audit
+python3 tools/debug.py --self-test
+python3 tools/audit_run29.py
+python3 tools/audit_run30.py
+python3 tools/audit_run35.py
+
+# Verify VESC identities and readiness
+python3 tools/debug.py vesc-tool-check --motor 0
+python3 tools/debug.py vesc-tool-check --motor 1
+python3 tools/debug.py motor2-forward
+python3 tools/debug.py startup-check
+python3 tools/debug.py calibrate --timeout 8
+python3 tools/debug.py startup-check
+
+# First low-current proof, wheels raised
+python3 tools/debug.py sensor-select --motor 0 --mode sensorless
+python3 tools/debug.py motor-test --motor 0 --mode current --value 0.5 --seconds 2 --yes
+python3 tools/debug.py fault-detail --motor 0
+
+python3 tools/debug.py sensor-select --motor 1 --mode sensorless
+python3 tools/debug.py motor-test --motor 1 --mode current --value 0.5 --seconds 2 --yes
+python3 tools/debug.py fault-detail --motor 1
+
+# Only after both low-current tests have fault=NONE
+python3 tools/debug.py drive-acceptance --yes

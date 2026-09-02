@@ -1,0 +1,12 @@
+ADDED    .gitignore
+ADDED    docs/AUDIT_CHECKPOINT_RUN29_READY_RECOVERY_VESC_STANDARD_20260901.md
+ADDED    docs/RUN29_HARDWARE_ACCEPTANCE_COMMANDS.txt
+MODIFIED src/comm/commands.c
+MODIFIED src/comm/commands.h
+MODIFIED src/hwconf/hw.c
+MODIFIED src/hwconf/hw.h
+MODIFIED src/hwconf/hw_status.c
+MODIFIED src/main.c
+MODIFIED tools/README.md
+ADDED    tools/audit_run29.py
+MODIFIED tools/debug.py

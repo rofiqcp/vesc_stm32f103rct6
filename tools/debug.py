@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import csv
 from datetime import datetime
+import json
 import math
 import struct
 import sys
@@ -48,17 +49,26 @@ COMM_DETECT_MOTOR_FLUX_LINKAGE = 26
 COMM_DETECT_ENCODER = 27
 COMM_DETECT_HALL_FOC = 28
 COMM_ALIVE = 30
-COMM_GET_DECODED_ADC = 31
+COMM_GET_DECODED_ADC = 32
 COMM_FORWARD_CAN = 34
 COMM_CUSTOM_APP_DATA = 36
 COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP = 57
 COMM_DETECT_APPLY_ALL_FOC = 58
+COMM_GET_VALUES_SELECTIVE = 50
+# Mask RT standar VESC: I_motor, I_in, Id, Iq, duty, ERPM, Vin, fault,
+# position, controller ID, Vd, Vq, dan status. Dipakai untuk menjaga 50 Hz
+# tetap realistis pada USART3 115200 bahkan saat Motor-2 lewat forwarding ID 2.
+RT_SELECTIVE_BITS = (2,3,4,5,6,7,8,15,16,17,19,20,21)
+RT_SELECTIVE_MASK = sum(1 << bit for bit in RT_SELECTIVE_BITS)
 COMM_PING_CAN = 62
 COMM_SET_CURRENT_REL = 84
 
 VESC6_MCCONF_WIRE_SIZE = 481
 VESC6_APPCONF_WIRE_SIZE = 493
 VESC6_MCCONF_SIGNATURE = 776184161
+VESC6_MC_OFF_FOC_SENSOR_MODE = 152
+VESC6_MC_OFF_FOC_HALL_TABLE = 223
+VESC6_MC_OFF_FOC_HFI_START_SAMPLES = 265
 VESC6_APPCONF_SIGNATURE = 486554156
 
 CUSTOM_SELECT_MOTOR = 0xA0
@@ -74,12 +84,15 @@ CUSTOM_SENSOR_INFO = 0xA9
 CUSTOM_COMM_DIAG = 0xAA
 CUSTOM_CONFIG_SAVE = 0xAB
 CUSTOM_CONFIG_STATUS = 0xAC
+CUSTOM_BUZZER_TEST = 0xAD
+CUSTOM_OPENLOOP_PHASE = 0xF1
 
 SENSOR_AUTO = 0
 SENSOR_HALL = 1
 SENSOR_ENCODER = 2
+SENSOR_SENSORLESS = 3
 
-SENSOR_NAMES = {0: "AUTO", 1: "HALL", 2: "ENCODER", 3: "FORCED"}
+SENSOR_NAMES = {0: "AUTO", 1: "HALL", 2: "ENCODER", 3: "NO_SENSOR"}
 DETECT_NAMES = {
     0: "IDLE", 1: "PREPARE", 2: "HALL_LOCK", 3: "HALL_FWD",
     4: "HALL_REV", 5: "HALL_EVAL", 6: "ENC_PREP", 7: "ENC_LOCK0",
@@ -102,9 +115,40 @@ NATIVE_FAULT_NAMES = {
     0: "NONE", 1: "ADC_DMA", 2: "ABS_OVER_CURRENT", 3: "OVER_VOLTAGE",
     4: "UNDER_VOLTAGE", 5: "HALL_INVALID", 6: "FOC_ISR_OVERRUN",
     7: "COMMAND_TIMEOUT", 8: "CURRENT_OFFSET", 9: "SENSOR_DETECT",
+    10: "OVER_TEMP_BOARD", 11: "OVER_TEMP_MOTOR", 12: "OVERSPEED",
+    13: "UNDERSPEED", 14: "ABS_OVERSPEED", 15: "ENCODER_SLIP",
+    16: "MCU_UNDER_VOLTAGE", 17: "BREAK", 18: "SENSORLESS_OBSERVER",
+    19: "FLASH_CONFIG",
+}
+
+CONTROL_RESULT_NAMES = {
+    0: "NONE", 1: "ACCEPTED", 2: "BAD_LENGTH", 3: "SHUTDOWN",
+    4: "MOTOR_NOT_READY", 5: "UART_REJECTED", 6: "INPUT_BLOCKED",
+}
+
+SAMPLING_FLAG_NAMES = {
+    0: "TIM1_MODE", 1: "TIM8_MODE", 2: "TIM8_TRGO", 3: "TIM8_RCR",
+    4: "ADC1_LEN", 5: "ADC2_LEN", 6: "DMA1_MODE", 7: "TIM1_TRGO",
+    8: "TIM8_SLAVE", 9: "ADC_DUALMODE", 10: "ADC1_TRIGGER",
+    11: "ADC_CHANNELS", 12: "DMA1_TRANSFER", 13: "ADC3_MODE",
+    14: "DMA2_MODE", 15: "DMA2_TRANSFER", 16: "ADC_CLOCK",
+    17: "ADC_SAMPLE_TIMES", 18: "DMA1_IRQ_MODE", 19: "ADC3_SAMPLE_TIME",
+    20: "TRIGGER_ROUTE",
 }
 
 
+# Fungsi decode_sampling_flags: mengubah bitmask kontrak sampling menjadi nama bit yang mudah dibaca.
+def decode_sampling_flags(flags: int) -> list[str]:
+    return [name for bit,name in SAMPLING_FLAG_NAMES.items() if flags & (1 << bit)]
+
+
+# Fungsi format_sampling_flags: memformat bitmask sampling beserta nama bit aktif.
+def format_sampling_flags(flags: int) -> str:
+    names=decode_sampling_flags(flags)
+    return f"0x{flags:08X}" + (" [" + ", ".join(names) + "]" if names else " [OK]")
+
+
+# Fungsi crc16: menjalankan operasi crc16 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def crc16(data: bytes) -> int:
     crc = 0
     for byte in data:
@@ -114,6 +158,7 @@ def crc16(data: bytes) -> int:
     return crc
 
 
+# Fungsi frame: menjalankan operasi frame sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def frame(payload: bytes) -> bytes:
     if not payload:
         raise ValueError("empty payload")
@@ -128,11 +173,14 @@ def frame(payload: bytes) -> bytes:
 
 
 class FrameParser:
+    # Fungsi __init__: menjalankan operasi init sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def __init__(self) -> None:
         self.buf = bytearray()
 
+    # Fungsi feed: menjalankan operasi feed sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def feed(self, data: bytes) -> list[bytes]:
         self.buf.extend(data)
+        # Variabel out: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
         out: list[bytes] = []
         while True:
             while self.buf and self.buf[0] not in (2, 3):
@@ -163,23 +211,34 @@ class FrameParser:
         return out
 
 
+# Fungsi be_i16: menjalankan operasi be i16 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def be_i16(v: int) -> bytes:
     return struct.pack(">h", int(v))
 
 
+# Fungsi be_u16: menjalankan operasi be u16 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def be_u16(v: int) -> bytes:
     return struct.pack(">H", int(v) & 0xFFFF)
 
 
+# Fungsi be_i32: menjalankan operasi be i32 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def be_i32(v: int) -> bytes:
     return struct.pack(">i", int(v))
 
 
+# Fungsi be_u32: menjalankan operasi be u32 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+def be_u32(v: int) -> bytes:
+    """Canonical VESC big-endian uint32 encoder (buffer_append_uint32 ABI)."""
+    return struct.pack(">I", int(v) & 0xFFFFFFFF)
+
+
 class Reader:
+    # Fungsi __init__: menjalankan operasi init sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def __init__(self, data: bytes, offset: int = 0):
         self.data = data
         self.i = offset
 
+    # Fungsi _take: menjalankan operasi take sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def _take(self, n: int) -> bytes:
         if self.i + n > len(self.data):
             raise ValueError(f"short payload at {self.i}, need {n}, len={len(self.data)}")
@@ -187,13 +246,26 @@ class Reader:
         self.i += n
         return b
 
-    def u8(self) -> int: return self._take(1)[0]
-    def i16(self) -> int: return struct.unpack(">h", self._take(2))[0]
-    def u16(self) -> int: return struct.unpack(">H", self._take(2))[0]
-    def i32(self) -> int: return struct.unpack(">i", self._take(4))[0]
-    def u32(self) -> int: return struct.unpack(">I", self._take(4))[0]
-    def f32_auto(self) -> float: return struct.unpack(">f", self._take(4))[0]
+    # Fungsi u8: menjalankan operasi u8 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+    def u8(self) -> int:
+        return self._take(1)[0]
+    # Fungsi i16: menjalankan operasi i16 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+    def i16(self) -> int:
+        return struct.unpack(">h", self._take(2))[0]
+    # Fungsi u16: menjalankan operasi u16 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+    def u16(self) -> int:
+        return struct.unpack(">H", self._take(2))[0]
+    # Fungsi i32: menjalankan operasi i32 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+    def i32(self) -> int:
+        return struct.unpack(">i", self._take(4))[0]
+    # Fungsi u32: menjalankan operasi u32 sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+    def u32(self) -> int:
+        return struct.unpack(">I", self._take(4))[0]
+    # Fungsi f32_auto: menjalankan operasi f32 auto sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+    def f32_auto(self) -> float:
+        return struct.unpack(">f", self._take(4))[0]
 
+    # Fungsi cstring: menjalankan operasi cstring sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def cstring(self) -> str:
         end = self.data.find(b"\x00", self.i)
         if end < 0:
@@ -203,6 +275,7 @@ class Reader:
         return raw.decode("ascii", errors="replace")
 
 
+# Fungsi parse_fw_version: mengurai parse fw version dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_fw_version(p: bytes) -> dict:
     if len(p) < 3 or p[0] != COMM_FW_VERSION:
         raise ValueError("bukan COMM_FW_VERSION")
@@ -225,21 +298,26 @@ def parse_fw_version(p: bytes) -> dict:
 
 
 class Link:
+    # Fungsi __init__: menjalankan operasi init sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def __init__(self, port: str, baud: int = 115200, timeout: float = 0.05):
         if serial is None:
             raise RuntimeError("pyserial belum terpasang. Jalankan: python3 -m pip install pyserial")
         self.ser = serial.Serial(port, baudrate=baud, timeout=timeout)
         self.parser = FrameParser()
+        # Variabel self.pending: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
         self.pending: list[bytes] = []
         self.ser.reset_input_buffer()
 
+    # Fungsi close: menutup close dan melepas resource yang sudah digunakan.
     def close(self) -> None:
         self.ser.close()
 
+    # Fungsi send: mengirim atau menulis send setelah input dan panjang data diperiksa.
     def send(self, payload: bytes) -> None:
         self.ser.write(frame(payload))
         self.ser.flush()
 
+    # Fungsi recv: menjalankan operasi recv sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def recv(self, timeout: float = 1.0, pred: Optional[Callable[[bytes], bool]] = None) -> bytes:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -254,10 +332,12 @@ class Link:
                     self.pending.append(p)
         raise TimeoutError("timeout menunggu frame")
 
+    # Fungsi request: menjalankan operasi request sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def request(self, payload: bytes, pred: Callable[[bytes], bool], timeout: float = 1.0) -> bytes:
         self.send(payload)
         return self.recv(timeout=timeout, pred=pred)
 
+    # Fungsi standard_route: menjalankan operasi standard route sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     @staticmethod
     def standard_route(motor: int, payload: bytes) -> bytes:
         if motor == 0:
@@ -266,51 +346,78 @@ class Link:
             return bytes((COMM_FORWARD_CAN, 2)) + payload
         raise ValueError(f"motor invalid: {motor}")
 
+    # Fungsi send_std: mengirim atau menulis send std setelah input dan panjang data diperiksa.
     def send_std(self, motor: int, payload: bytes) -> None:
         self.send(self.standard_route(motor, payload))
 
+    # Fungsi request_std: menjalankan operasi request std sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def request_std(self, motor: int, payload: bytes, pred: Callable[[bytes], bool], timeout: float = 1.0) -> bytes:
         # Upstream dual-motor COMM_FORWARD_CAN replies with the inner command
         # directly, without wrapping the reply in COMM_FORWARD_CAN.
         return self.request(self.standard_route(motor, payload), pred, timeout)
 
+    # Fungsi select_motor: menjalankan operasi select motor sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def select_motor(self, motor: int) -> None:
         # Legacy F103 diagnostic only. It does NOT alter standard UART routing.
         self.send(bytes((COMM_CUSTOM_APP_DATA, CUSTOM_SELECT_MOTOR, motor)))
         time.sleep(0.02)
 
+    # Fungsi stop: menjalankan operasi stop sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def stop(self, motor: int) -> None:
         self.send(bytes((COMM_CUSTOM_APP_DATA, CUSTOM_STOP, motor)))
 
+    # Fungsi clear_fault: menjalankan operasi clear fault sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def clear_fault(self, motor: int) -> None:
         self.send(bytes((COMM_CUSTOM_APP_DATA, CUSTOM_CLEAR_FAULT, motor)))
 
 
 @dataclass
 class Values:
+    # Variabel temp_fet: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     temp_fet: float
+    # Variabel temp_motor: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     temp_motor: float
+    # Variabel imotor: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     imotor: float
+    # Variabel ibatt: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     ibatt: float
+    # Variabel id: identitas controller, motor, command, atau objek yang sedang diproses.
     id: float
+    # Variabel iq: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     iq: float
+    # Variabel duty: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     duty: float
+    # Variabel erpm: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     erpm: int
+    # Variabel vin: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     vin: float
+    # Variabel ah: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     ah: float
+    # Variabel ah_charged: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     ah_charged: float
+    # Variabel wh: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     wh: float
+    # Variabel wh_charged: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     wh_charged: float
+    # Variabel tach: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     tach: int
+    # Variabel tach_abs: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     tach_abs: int
+    # Variabel fault: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     fault: int
+    # Variabel position: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     position: float
+    # Variabel controller_id: identitas controller, motor, command, atau objek yang sedang diproses.
     controller_id: int
+    # Variabel vd: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     vd: float
+    # Variabel vq: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     vq: float
+    # Variabel timeout_status: batas waktu untuk mencegah operasi tool menunggu tanpa kendali.
     timeout_status: int
 
 
+# Fungsi parse_values: mengurai parse values dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_values(p: bytes) -> Values:
     if not p or p[0] != COMM_GET_VALUES:
         raise ValueError("bukan COMM_GET_VALUES")
@@ -328,24 +435,102 @@ def parse_values(p: bytes) -> Values:
     ahc = r.i32()/10000
     wh = r.i32()/10000
     whc = r.i32()/10000
-    tach = r.i32(); tach_abs = r.i32(); fault = r.u8()
+    tach = r.i32()
+    tach_abs = r.i32()
+    fault = r.u8()
     pos = r.i32()/1_000_000
     cid = r.u8()
     # three MOS temperatures (present in current VESC GET_VALUES mask)
-    _ = r.i16(); _ = r.i16(); _ = r.i16()
+    _ = r.i16()
+    _ = r.i16()
+    _ = r.i16()
     vd = r.i32()/1000
     vq = r.i32()/1000
     status = r.u8()
     return Values(temp_fet,temp_motor,imotor,ibatt,id_,iq,duty,erpm,vin,ah,ahc,wh,whc,tach,tach_abs,fault,pos,cid,vd,vq,status)
 
 
+# Fungsi get_values: membaca get values dan mengembalikan hasil tanpa mengubah state yang tidak diperlukan.
 def get_values(link: Link, motor: int, timeout: float = 1.0) -> Values:
     p = link.request_std(motor, bytes((COMM_GET_VALUES,)),
+                         # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                          lambda x: bool(x) and x[0] == COMM_GET_VALUES,
                          timeout)
     return parse_values(p)
 
 
+# Fungsi parse_values_selective: mengurai COMM_GET_VALUES_SELECTIVE dengan urutan field resmi VESC 6.00.
+def parse_values_selective(p: bytes, expected_mask: int = RT_SELECTIVE_MASK) -> dict:
+    if len(p) < 5 or p[0] != COMM_GET_VALUES_SELECTIVE:
+        raise ValueError("bukan COMM_GET_VALUES_SELECTIVE")
+    r = Reader(p, 1)
+    mask = r.u32()
+    if mask != expected_mask:
+        raise ValueError(f"mask selective berbeda: 0x{mask:08X} != 0x{expected_mask:08X}")
+    out = {"mask": mask}
+    if mask & (1 << 0): out["temp_fet"] = r.i16()/10.0
+    if mask & (1 << 1): out["temp_motor"] = r.i16()/10.0
+    if mask & (1 << 2): out["imotor"] = r.i32()/100.0
+    if mask & (1 << 3): out["ibatt"] = r.i32()/100.0
+    if mask & (1 << 4): out["id"] = r.i32()/100.0
+    if mask & (1 << 5): out["iq"] = r.i32()/100.0
+    if mask & (1 << 6): out["duty"] = r.i16()/1000.0
+    if mask & (1 << 7): out["erpm"] = r.i32()
+    if mask & (1 << 8): out["vin"] = r.i16()/10.0
+    if mask & (1 << 9): out["ah"] = r.i32()/10000.0
+    if mask & (1 << 10): out["ah_charged"] = r.i32()/10000.0
+    if mask & (1 << 11): out["wh"] = r.i32()/10000.0
+    if mask & (1 << 12): out["wh_charged"] = r.i32()/10000.0
+    if mask & (1 << 13): out["tach"] = r.i32()
+    if mask & (1 << 14): out["tach_abs"] = r.i32()
+    if mask & (1 << 15): out["fault"] = r.u8()
+    if mask & (1 << 16): out["position"] = r.i32()/1_000_000.0
+    if mask & (1 << 17): out["controller_id"] = r.u8()
+    if mask & (1 << 18):
+        out["temp_mos1"] = r.i16()/10.0; out["temp_mos2"] = r.i16()/10.0; out["temp_mos3"] = r.i16()/10.0
+    if mask & (1 << 19): out["vd"] = r.i32()/1000.0
+    if mask & (1 << 20): out["vq"] = r.i32()/1000.0
+    if mask & (1 << 21): out["status"] = r.u8()
+    if r.i != len(p):
+        raise ValueError(f"selective trailing bytes: {len(p)-r.i}")
+    return out
+
+
+# Fungsi get_values_selective: meminta RT Data standar VESC dengan payload ringkas untuk 50 Hz.
+def get_values_selective(link: Link, motor: int, timeout: float = 0.08, mask: int = RT_SELECTIVE_MASK) -> dict:
+    req = bytes((COMM_GET_VALUES_SELECTIVE,)) + be_u32(mask)
+    p = link.request_std(motor, req,
+                         lambda x: len(x) >= 5 and x[0] == COMM_GET_VALUES_SELECTIVE,
+                         timeout)
+    return parse_values_selective(p, mask)
+
+
+# Fungsi get_values_selective_pair: meminta LEFT dan RIGHT dalam satu slot RT lalu mengidentifikasi reply dari controller_id standar VESC.
+def get_values_selective_pair(link: Link, timeout: float = 0.030, mask: int = RT_SELECTIVE_MASK) -> dict[int, dict]:
+    if (mask & (1 << 17)) == 0:
+        raise ValueError("pair RT membutuhkan bit controller_id (17) pada selective mask")
+    req = bytes((COMM_GET_VALUES_SELECTIVE,)) + be_u32(mask)
+    # Kirim dua request back-to-back. Reply forwarded Motor-2 tetap inner packet
+    # standar, tetapi controller_id di payload selective membedakan node 1/2.
+    link.send_std(0, req)
+    link.send_std(1, req)
+    deadline = time.monotonic() + timeout
+    out: dict[int, dict] = {}
+    while len(out) < 2 and time.monotonic() < deadline:
+        left = max(0.001, deadline - time.monotonic())
+        p = link.recv(timeout=left, pred=lambda x: len(x) >= 5 and x[0] == COMM_GET_VALUES_SELECTIVE)
+        d = parse_values_selective(p, mask)
+        cid = int(d.get("controller_id", -1))
+        if cid == 1:
+            out[0] = d
+        elif cid == 2:
+            out[1] = d
+    if len(out) != 2:
+        raise TimeoutError(f"RT pair tidak lengkap: received={sorted(out.keys())}")
+    return out
+
+
+# Fungsi parse_decoded_adc: mengurai parse decoded adc dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_decoded_adc(p: bytes) -> dict:
     if len(p) != 17 or p[0] != COMM_GET_DECODED_ADC:
         raise ValueError("bukan COMM_GET_DECODED_ADC")
@@ -358,16 +543,19 @@ def parse_decoded_adc(p: bytes) -> dict:
     }
 
 
+# Fungsi get_decoded_adc: membaca get decoded adc dan mengembalikan hasil tanpa mengubah state yang tidak diperlukan.
 def get_decoded_adc(link: Link, motor: int, timeout: float = 1.0) -> dict:
     p = link.request_std(
         motor,
         bytes((COMM_GET_DECODED_ADC,)),
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         lambda x: len(x) == 17 and x[0] == COMM_GET_DECODED_ADC,
         timeout,
     )
     return parse_decoded_adc(p)
 
 
+# Fungsi parse_cal: mengurai parse cal dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_cal(p: bytes) -> dict:
     if len(p) < 2 or p[:2] != bytes((COMM_CUSTOM_APP_DATA, CUSTOM_CURRENT_CAL)):
         raise ValueError("bukan current-cal reply")
@@ -398,8 +586,12 @@ def parse_cal(p: bytes) -> dict:
         names=["left_u","left_v","left_dc","right_u","right_v","right_dc"]
         channels={}
         for name in names:
-            if len(p) - r.i < 12: break
-            mean=r.i32(); mn=r.u16(); mx=r.u16(); var_x100=r.u32()
+            if len(p) - r.i < 12:
+                break
+            mean=r.i32()
+            mn=r.u16()
+            mx=r.u16()
+            var_x100=r.u32()
             channels[name]={"mean":mean,"min":mn,"max":mx,"spread":mx-mn,
                             "variance":var_x100/100.0,"stddev":math.sqrt(max(0.0,var_x100/100.0))}
         d["channels"] = channels
@@ -414,14 +606,18 @@ def parse_cal(p: bytes) -> dict:
         ]
         regs={}
         for name in reg_names:
-            if len(p)-r.i < 4: break
+            if len(p)-r.i < 4:
+                break
             regs[name]=r.u32()
         d["registers"] = regs
         dma_words=[]
         for _ in range(6):
-            if len(p)-r.i < 4: break
-            w=r.u32(); dma_words.append({"word":w,"adc1":w & 0xFFFF,"adc2":(w>>16)&0xFFFF})
-        if dma_words: d["dma_words"] = dma_words
+            if len(p)-r.i < 4:
+                break
+            w=r.u32()
+            dma_words.append({"word":w,"adc1":w & 0xFFFF,"adc2":(w>>16)&0xFFFF})
+        if dma_words:
+            d["dma_words"] = dma_words
 
         # V14 appended fields: driven/undriven offset split and first fault snapshot.
         if d.get("cal_diag_revision",0) >= 14 and len(p)-r.i >= 51:
@@ -432,13 +628,28 @@ def parse_cal(p: bytes) -> dict:
             d["driven_mean"] = {name:r.i32() for name in names}
             if len(p)-r.i >= 60:
                 fs={}
-                fs["valid"]=bool(r.u8()); fs["motor"]=r.u8(); fs["fault"]=r.u8(); fs["cal_stage"]=r.u8()
-                fs["raw_u"]=r.u16(); fs["raw_v"]=r.u16(); fs["raw_dc"]=r.u16()
-                fs["offset_u"]=r.i32(); fs["offset_v"]=r.i32(); fs["offset_dc"]=r.i32()
-                fs["ia_q15"]=r.i32(); fs["ib_q15"]=r.i32(); fs["ic_q15"]=r.i32()
-                fs["trip_q15"]=r.i32(); fs["id_target_q15"]=r.i32(); fs["iq_target_q15"]=r.i32()
-                fs["ccr1"]=r.u16(); fs["ccr2"]=r.u16(); fs["ccr3"]=r.u16()
-                fs["tim_cnt"]=r.u16(); fs["dma_cndtr"]=r.u16(); fs["adc_isr_count"]=r.u32()
+                fs["valid"]=bool(r.u8())
+                fs["motor"]=r.u8()
+                fs["fault"]=r.u8()
+                fs["cal_stage"]=r.u8()
+                fs["raw_u"]=r.u16()
+                fs["raw_v"]=r.u16()
+                fs["raw_dc"]=r.u16()
+                fs["offset_u"]=r.i32()
+                fs["offset_v"]=r.i32()
+                fs["offset_dc"]=r.i32()
+                fs["ia_q15"]=r.i32()
+                fs["ib_q15"]=r.i32()
+                fs["ic_q15"]=r.i32()
+                fs["trip_q15"]=r.i32()
+                fs["id_target_q15"]=r.i32()
+                fs["iq_target_q15"]=r.i32()
+                fs["ccr1"]=r.u16()
+                fs["ccr2"]=r.u16()
+                fs["ccr3"]=r.u16()
+                fs["tim_cnt"]=r.u16()
+                fs["dma_cndtr"]=r.u16()
+                fs["adc_isr_count"]=r.u32()
                 # Q15 current base in this firmware is 64 A.
                 for qn in ("ia_q15","ib_q15","ic_q15","trip_q15","id_target_q15","iq_target_q15"):
                     fs[qn.replace("_q15","_a")] = fs[qn] * 64.0 / 32768.0
@@ -447,19 +658,27 @@ def parse_cal(p: bytes) -> dict:
             # V15 appends synchronized-enable state and the immutable ADC/PWM schedule.
             if d.get("cal_diag_revision",0) >= 15 and len(p)-r.i >= 22:
                 fs=d.setdefault("fault_snapshot",{})
-                fs["blank_cycles"]=r.u16(); fs["pwm_enabled"]=bool(r.u8()); fs["moe"]=bool(r.u8())
-                fs["pending_events"]=r.u8(); fs["reserved"]=r.u8()
+                fs["blank_cycles"]=r.u16()
+                fs["pwm_enabled"]=bool(r.u8())
+                fs["moe"]=bool(r.u8())
+                fs["pending_events"]=r.u8()
+                fs["reserved"]=r.u8()
                 d["adc_motor_phase_offset_ticks"]=r.u16()
-                d["foc_isr_event_hz"]=r.u32(); d["foc_isr_slot_cycles"]=r.u32()
-                d["tim8_rcr"]=r.u16(); d["tim1_cnt_v15"]=r.u16(); d["tim8_cnt_v15"]=r.u16()
+                d["foc_isr_event_hz"]=r.u32()
+                d["foc_isr_slot_cycles"]=r.u32()
+                d["tim8_rcr"]=r.u16()
+                d["tim1_cnt_v15"]=r.u16()
+                d["tim8_cnt_v15"]=r.u16()
 
             # V16 appends the independent ADC3/DMA2 DCLINK acquisition state.
             if d.get("cal_diag_revision",0) >= 16 and len(p)-r.i >= 42:
                 d["adc3_enabled"] = bool(r.u8())
                 d["dma2_ch5_enabled"] = bool(r.u8())
                 d["dma2_ch5_cndtr"] = r.u16()
-                d["adc3_vbus_raw0"] = r.u16(); d["adc3_vbus_raw1"] = r.u16()
-                d["vbus_dma_stale_count"] = r.u8(); _ = r.u8()
+                d["adc3_vbus_raw0"] = r.u16()
+                d["adc3_vbus_raw1"] = r.u16()
+                d["vbus_dma_stale_count"] = r.u8()
+                _ = r.u8()
                 d["vbus_dma_stale_events"] = r.u32()
                 for name in ("adc3_cr1","adc3_cr2","adc3_sqr1","adc3_sqr3",
                              "dma2_ch5_ccr","dma2_ch5_cndtr32","dma2_isr"):
@@ -482,21 +701,36 @@ def parse_cal(p: bytes) -> dict:
     return d
 
 
-def get_cal(link: Link, trigger: bool = False) -> dict:
+# Fungsi get_cal: membaca get cal dan mengembalikan hasil tanpa mengubah state yang tidak diperlukan.
+def get_cal(link: Link, trigger: bool = False, timeout: float = 1.0) -> dict:
     payload=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CURRENT_CAL,1 if trigger else 0))
-    p=link.request(payload, lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CURRENT_CAL)), 1.0)
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+    p=link.request(payload, lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CURRENT_CAL)), timeout)
     return parse_cal(p)
 
 
+# Fungsi parse_sensor: mengurai parse sensor dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_sensor(p: bytes) -> dict:
     if len(p)<2 or p[:2] != bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO)):
         raise ValueError("bukan sensor-info")
     r=Reader(p,2)
-    motor=r.u8(); controller_id=r.u8(); mode=r.u8(); request=r.u8(); state=r.u8(); success=bool(r.u8()); pp=r.u8(); inv=bool(r.u8()); off=r.u16()
+    motor=r.u8()
+    controller_id=r.u8()
+    mode=r.u8()
+    request=r.u8()
+    state=r.u8()
+    success=bool(r.u8())
+    pp=r.u8()
+    inv=bool(r.u8())
+    off=r.u16()
     hall=[r.u8() for _ in range(8)]
     angles=[r.u16() for _ in range(8)]
     d={"motor":motor,"controller_id":controller_id,"mode":mode,"request":request,"state":state,"success":success,"pole_pairs":pp,
        "encoder_inverted":inv,"encoder_offset_u16":off,"hall_table":hall,"hall_angles_u16":angles}
+    # Field legacy `success` adalah hasil DETECT terakhir, bukan ACK sensor-select.
+    # Pisahkan agar output sensorless tidak lagi tampak gagal saat mode sebenarnya sudah aktif.
+    d["detect_success"]=success
+    d["selection_active"]=(mode == request and state in (0, DETECT_DONE, DETECT_FAILED))
     if r.i < len(p):
         d["diag_revision"]=r.u8()
         if d["diag_revision"] >= 13:
@@ -506,31 +740,66 @@ def parse_sensor(p: bytes) -> dict:
             d["sweep_index"]=r.u32()
             d["hall_samples"]=[r.u32() for _ in range(8)]
             d["detect_hall_table"]=[r.u8() for _ in range(8)]
-            d["raw_current_1"]=r.u16(); d["raw_current_2"]=r.u16(); d["raw_dc"]=r.u16()
-            d["ia_a"]=r.i32()/1000.0; d["ib_a"]=r.i32()/1000.0; d["ic_a"]=r.i32()/1000.0
-            d["pwm_enabled"]=bool(r.u8()); d["moe"]=bool(r.u8())
+            d["raw_current_1"]=r.u16()
+            d["raw_current_2"]=r.u16()
+            d["raw_dc"]=r.u16()
+            d["ia_a"]=r.i32()/1000.0
+            d["ib_a"]=r.i32()/1000.0
+            d["ic_a"]=r.i32()/1000.0
+            d["pwm_enabled"]=bool(r.u8())
+            d["moe"]=bool(r.u8())
             d["current_scale_a_per_count"]=r.i32()/1000000.0
             if d["diag_revision"] >= 15 and len(p)-r.i >= 11:
                 d["pwm_enable_pending_events"]=r.u8()
                 d["pwm_enable_blank_cycles"]=r.u16()
-                d["pwm_tim_cnt"]=r.u16(); d["dma_cndtr"]=r.u16()
-                d["tim8_rcr"]=r.u16(); d["adc_motor_phase_offset_ticks"]=r.u16()
+                d["pwm_tim_cnt"]=r.u16()
+                d["dma_cndtr"]=r.u16()
+                d["tim8_rcr"]=r.u16()
+                d["adc_motor_phase_offset_ticks"]=r.u16()
+            if d["diag_revision"] >= 16 and len(p)-r.i >= 2:
+                d["foc_sensor_mode"]=r.u8()
+                d["sensorless_start_failures"]=r.u8()
+            if d["diag_revision"] >= 17 and len(p)-r.i >= 18:
+                d["openloop_started"]=bool(r.u8())
+                d["phase_observer_override"]=bool(r.u8())
+                d["openloop_erpm_now"]=r.i32()
+                d["observer_valid"]=bool(r.u8())
+                d["observer_erpm"]=r.i32()
+                d["hall_raw_live"]=r.u8()
+                d["hall_valid"]=bool(r.u8())
+                hall_dir=r.u8()
+                d["hall_direction"]=hall_dir-256 if hall_dir >= 128 else hall_dir
+                d["hall_invalid_count"]=r.u16()
+                d["hall_sequence_error_count"]=r.u16()
     return d
 
 
-def get_sensor(link: Link, motor: int) -> dict:
+# Fungsi get_sensor: membaca get sensor dan mengembalikan hasil tanpa mengubah state yang tidak diperlukan.
+def get_sensor(link: Link, motor: int, timeout: float = 1.0) -> dict:
     p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO,motor)),
-                   lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO)) and x[2]==motor,1.0)
+                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                   lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO)) and x[2]==motor,timeout)
     return parse_sensor(p)
 
 
+# Fungsi parse_extended: mengurai parse extended dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_extended(p: bytes) -> dict:
     if len(p)<2 or p[:2] != bytes((COMM_CUSTOM_APP_DATA,CUSTOM_EXT_TELEMETRY)):
         raise ValueError("bukan extended telemetry")
     r=Reader(p,2)
     d={}
-    d["motor"]=r.u8(); d["revision"]=r.u8(); d["controller_id"]=r.u8(); d["sensor_mode"]=r.u8(); d["native_fault"]=r.u8(); d["native_fault_name"]=NATIVE_FAULT_NAMES.get(d["native_fault"],"?"); d["detect_state"]=r.u8()
-    d["cal_done"]=bool(r.u8()); d["cal_valid"]=bool(r.u8()); d["hall_raw"]=r.u8(); d["pole_pairs"]=r.u8(); d["encoder_inverted"]=bool(r.u8())
+    d["motor"]=r.u8()
+    d["revision"]=r.u8()
+    d["controller_id"]=r.u8()
+    d["sensor_mode"]=r.u8()
+    d["native_fault"]=r.u8()
+    d["native_fault_name"]=NATIVE_FAULT_NAMES.get(d["native_fault"],"?")
+    d["detect_state"]=r.u8()
+    d["cal_done"]=bool(r.u8())
+    d["cal_valid"]=bool(r.u8())
+    d["hall_raw"]=r.u8()
+    d["pole_pairs"]=r.u8()
+    d["encoder_inverted"]=bool(r.u8())
     if d["revision"] >= 6:
         d["phase_current_a"]=r.i32()/1000.0
         d["phase_current_b"]=r.i32()/1000.0
@@ -538,28 +807,51 @@ def parse_extended(p: bytes) -> dict:
     names_scales=[("id",1000),("iq",1000),("id_filter",1000),("iq_filter",1000),("vd",1000),("vq",1000),
                   ("imotor",1000),("ibatt",1000),("erpm",1),("mech_rpm",10),("position_deg",1000),("rotor_elec_deg",1000),
                   ("vbus",1000),("duty",100000)]
-    for name,scale in names_scales: d[name]=r.i32()/scale
-    d["offset_u"]=r.i32(); d["offset_v"]=r.i32(); d["offset_dc"]=r.i32()
-    d["cal_count"]=r.u32(); d["cal_target"]=r.u32(); d["isr_max_cycles"]=r.u32(); d["isr_overruns"]=r.u32()
-    d["encoder_count"]=r.i32(); d["encoder_offset_u16"]=r.u16()
+    for name,scale in names_scales:
+        d[name]=r.i32()/scale
+    d["offset_u"]=r.i32()
+    d["offset_v"]=r.i32()
+    d["offset_dc"]=r.i32()
+    d["cal_count"]=r.u32()
+    d["cal_target"]=r.u32()
+    d["isr_max_cycles"]=r.u32()
+    d["isr_overruns"]=r.u32()
+    d["encoder_count"]=r.i32()
+    d["encoder_offset_u16"]=r.u16()
     if d["revision"] >= 5 and len(p)-r.i >= 55:
-        d["observer_valid"]=bool(r.u8()); d["using_encoder"]=bool(r.u8()); d["encoder_synced"]=bool(r.u8())
-        d["observer_phase_deg"]=r.i32()/1000.0; d["observer_erpm"]=r.i32(); d["observer_quality"]=r.i32()/100000.0
-        d["foc_motor_r_ohm"]=r.i32()/1000000.0; d["foc_motor_l_h"]=r.i32()/1000000000.0
-        d["foc_motor_ld_lq_diff_h"]=r.i32()/1000000000.0; d["foc_motor_flux_linkage_wb"]=r.i32()/10000000.0
-        d["foc_sl_erpm_start"]=r.i32(); d["foc_sl_erpm"]=r.i32(); d["foc_openloop_rpm"]=r.i32(); d["foc_openloop_rpm_low"]=r.i32()
-        d["current_loop_hz"]=r.u32(); d["telemetry_snapshot_hz"]=r.u32()
+        d["observer_valid"]=bool(r.u8())
+        d["using_encoder"]=bool(r.u8())
+        d["encoder_synced"]=bool(r.u8())
+        d["observer_phase_deg"]=r.i32()/1000.0
+        d["observer_erpm"]=r.i32()
+        d["observer_quality"]=r.i32()/100000.0
+        d["foc_motor_r_ohm"]=r.i32()/1000000.0
+        d["foc_motor_l_h"]=r.i32()/1000000000.0
+        d["foc_motor_ld_lq_diff_h"]=r.i32()/1000000000.0
+        d["foc_motor_flux_linkage_wb"]=r.i32()/10000000.0
+        d["foc_sl_erpm_start"]=r.i32()
+        d["foc_sl_erpm"]=r.i32()
+        d["foc_openloop_rpm"]=r.i32()
+        d["foc_openloop_rpm_low"]=r.i32()
+        d["current_loop_hz"]=r.u32()
+        d["telemetry_snapshot_hz"]=r.u32()
         if d["revision"] >= 7 and len(p)-r.i >= 1:
             d["foc_sensor_mode"]=r.u8()
+        if d["revision"] >= 8 and len(p)-r.i >= 8:
+            d["id_target"]=r.i32()/1000.0
+            d["iq_target"]=r.i32()/1000.0
     return d
 
 
-def get_extended(link: Link, motor: int) -> dict:
+# Fungsi get_extended: membaca get extended dan mengembalikan hasil tanpa mengubah state yang tidak diperlukan.
+def get_extended(link: Link, motor: int, timeout: float = 1.0) -> dict:
     p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_EXT_TELEMETRY,motor)),
-                   lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_EXT_TELEMETRY)) and x[2]==motor,1.0)
+                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                   lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_EXT_TELEMETRY)) and x[2]==motor,timeout)
     return parse_extended(p)
 
 
+# Fungsi print_values: menjalankan operasi print values sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def print_values(motor: int, v: Values) -> None:
     name="LEFT" if motor==0 else "RIGHT"
     print(f"{name}: Vbus={v.vin:6.2f} V  Imotor={v.imotor:+7.2f} A  Ibatt={v.ibatt:+7.2f} A  "
@@ -568,7 +860,9 @@ def print_values(motor: int, v: Values) -> None:
           f"fault={v.fault}({FAULT_NAMES.get(v.fault,'?')}) timeout={v.timeout_status}")
 
 
+# Fungsi cmd_info: menjalankan operasi cmd info sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_info(link: Link, _args: argparse.Namespace) -> int:
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
     p=link.request(bytes((COMM_FW_VERSION,)),lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.0)
     d=parse_fw_version(p)
     print(f"FW: {d['major']}.{d['minor']}  name={d['fw_name']}  HW={d['hw_name']}")
@@ -576,6 +870,7 @@ def cmd_info(link: Link, _args: argparse.Namespace) -> int:
     return 0
 
 
+# Fungsi _validate_vesc6_wire: memeriksa validate vesc6 wire dan melaporkan ketidaksesuaian secara deterministik.
 def _validate_vesc6_wire(name: str, payload: bytes, command: int, wire_size: int, signature: int) -> bytes:
     if not payload or payload[0] != command:
         raise ValueError(f"{name}: command reply salah")
@@ -588,21 +883,25 @@ def _validate_vesc6_wire(name: str, payload: bytes, command: int, wire_size: int
     return wire
 
 
+# Fungsi cmd_vesc_tool_check: memeriksa cmd vesc tool check dan melaporkan ketidaksesuaian secara deterministik.
 def cmd_vesc_tool_check(link: Link, args: argparse.Namespace) -> int:
     """Exercise the same core FW/config path used by VESC Tool 6.00."""
     motor = args.motor
     fw = link.request_std(motor, bytes((COMM_FW_VERSION,)),
+                          # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                           lambda x: bool(x) and x[0] == COMM_FW_VERSION, args.timeout)
     info = parse_fw_version(fw)
     if (info['major'], info['minor']) != (6, 0):
         raise ValueError(f"FW ABI bukan 6.00: {info['major']}.{info['minor']}")
 
     mc_payload = link.request_std(motor, bytes((COMM_GET_MCCONF,)),
+                                  # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                                   lambda x: bool(x) and x[0] == COMM_GET_MCCONF, args.timeout)
     mc = _validate_vesc6_wire("MCCONF", mc_payload, COMM_GET_MCCONF,
                               VESC6_MCCONF_WIRE_SIZE, VESC6_MCCONF_SIGNATURE)
 
     app_payload = link.request_std(motor, bytes((COMM_GET_APPCONF,)),
+                                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                                    lambda x: bool(x) and x[0] == COMM_GET_APPCONF, args.timeout)
     app = _validate_vesc6_wire("APPCONF", app_payload, COMM_GET_APPCONF,
                                VESC6_APPCONF_WIRE_SIZE, VESC6_APPCONF_SIGNATURE)
@@ -611,11 +910,17 @@ def cmd_vesc_tool_check(link: Link, args: argparse.Namespace) -> int:
     expected_id = 1 if motor == 0 else 2
     if controller_id != expected_id:
         raise ValueError(f"APPCONF controller_id={controller_id}, expected {expected_id}")
+    hfi_start_samples = struct.unpack(">H", mc[VESC6_MC_OFF_FOC_HFI_START_SAMPLES:VESC6_MC_OFF_FOC_HFI_START_SAMPLES+2])[0]
+    if hfi_start_samples < 5:
+        raise ValueError(
+            f"MCCONF foc_hfi_start_samples={hfi_start_samples} < 5; legacy image belum dinormalisasi (Run31 target 5). "
+            "Run31 harus mengembalikan nilai valid (default 5) agar VESC Tool tidak menampilkan truncated.")
 
     print("=== VESC TOOL 6.00 CORE PATH ===")
     print(f"motor             : {motor} ({'LEFT' if motor == 0 else 'RIGHT/local-forward-id2'})")
     print(f"FW                : {info['major']}.{info['minor']}  {info['hw_name']}  {info['fw_name']}")
     print(f"MCCONF            : PASS {len(mc)} bytes signature=0x{VESC6_MCCONF_SIGNATURE:08X}")
+    print(f"HFI Start Samples : {hfi_start_samples} (PASS; valid >=5, VESC 6.00 default=5)")
     print(f"APPCONF           : PASS {len(app)} bytes signature=0x{VESC6_APPCONF_SIGNATURE:08X} controller_id={controller_id}")
 
     if args.write_back:
@@ -624,10 +929,12 @@ def cmd_vesc_tool_check(link: Link, args: argparse.Namespace) -> int:
         # it exercises the asynchronous SET + ACK + persistent-store path used
         # by VESC Tool. Firmware rejects MCCONF writes while the motor is active.
         ack_mc = link.request_std(motor, bytes((COMM_SET_MCCONF,)) + mc,
+                                  # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                                   lambda x: x == bytes((COMM_SET_MCCONF,)), args.write_timeout)
         if ack_mc != bytes((COMM_SET_MCCONF,)):
             raise ValueError("MCCONF SET ACK salah")
         ack_app = link.request_std(motor, bytes((COMM_SET_APPCONF,)) + app,
+                                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                                    lambda x: x == bytes((COMM_SET_APPCONF,)), args.write_timeout)
         if ack_app != bytes((COMM_SET_APPCONF,)):
             raise ValueError("APPCONF SET ACK salah")
@@ -637,9 +944,11 @@ def cmd_vesc_tool_check(link: Link, args: argparse.Namespace) -> int:
         # Read back and require byte-exact persistence semantics. For motor 2
         # APPCONF is exposed with controller_id=2 on the wire by design.
         mc2 = _validate_vesc6_wire("MCCONF readback",
+            # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
             link.request_std(motor, bytes((COMM_GET_MCCONF,)), lambda x: bool(x) and x[0] == COMM_GET_MCCONF, args.timeout),
             COMM_GET_MCCONF, VESC6_MCCONF_WIRE_SIZE, VESC6_MCCONF_SIGNATURE)
         app2 = _validate_vesc6_wire("APPCONF readback",
+            # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
             link.request_std(motor, bytes((COMM_GET_APPCONF,)), lambda x: bool(x) and x[0] == COMM_GET_APPCONF, args.timeout),
             COMM_GET_APPCONF, VESC6_APPCONF_WIRE_SIZE, VESC6_APPCONF_SIGNATURE)
         if mc2 != mc or app2 != app:
@@ -650,23 +959,30 @@ def cmd_vesc_tool_check(link: Link, args: argparse.Namespace) -> int:
     return 0
 
 
+# Fungsi _raw_handshake: menjalankan operasi raw handshake sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _raw_handshake(link: Link, timeout: float = 1.0) -> tuple[bytes, list[bytes]]:
     tx = frame(bytes((COMM_FW_VERSION,)))
     link.ser.reset_input_buffer()
     link.parser = FrameParser()
     link.pending.clear()
     print("TX:", tx.hex(" "))
-    link.ser.write(tx); link.ser.flush()
-    raw=bytearray(); parser=FrameParser(); frames=[]
+    link.ser.write(tx)
+    link.ser.flush()
+    raw=bytearray()
+    parser=FrameParser()
+    frames=[]
     deadline=time.monotonic()+timeout
     while time.monotonic()<deadline:
         chunk=link.ser.read(link.ser.in_waiting or 1)
         if chunk:
-            raw.extend(chunk); frames.extend(parser.feed(chunk))
-            if any(p and p[0]==COMM_FW_VERSION for p in frames): break
+            raw.extend(chunk)
+            frames.extend(parser.feed(chunk))
+            if any(p and p[0]==COMM_FW_VERSION for p in frames):
+                break
     return bytes(raw), frames
 
 
+# Fungsi cmd_handshake: menjalankan operasi cmd handshake sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_handshake(link: Link, args: argparse.Namespace) -> int:
     all_raw=bytearray()
     for attempt in range(1, args.attempts + 1):
@@ -683,19 +999,21 @@ def cmd_handshake(link: Link, args: argparse.Namespace) -> int:
         time.sleep(0.05)
 
     if not all_raw:
-        print("FAIL/LEVEL-1: MCU mengirim 0 byte. Fokus ke boot 64MHz, USART3 RXNE IRQ/ring, uartcomm packet thread, TXE/TC IRQ, wiring PB10/PB11, GND, dan baud.")
+        print("FAIL/LEVEL-1: MCU mengirim 0 byte. Fokus ke g_vesc_boot_stage/error, USART3 PB10/PB11, RX DMA1-Ch3 CNDTR, packet_process task, TX DMA1-Ch2 + USART3 TC IRQ, GND, dan baud.")
     else:
-        print("FAIL/LEVEL-2: ada byte dari MCU tetapi tidak terbentuk frame VESC valid. Fokus ke baud/clock 64MHz, USART3 TXE/TC IRQ, framing packet, atau CRC.")
+        print("FAIL/LEVEL-2: ada byte dari MCU tetapi tidak terbentuk frame VESC valid. Fokus ke clock/baud 64MHz, DMA TX + USART3 TC completion, framing VESC, atau CRC.")
         print("ALL RX raw:", bytes(all_raw).hex(" "))
     return 2
 
 
+# Fungsi cmd_baud_scan: menjalankan operasi cmd baud scan sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_baud_scan(link: Link, args: argparse.Namespace) -> int:
     rates=[int(x.strip()) for x in args.bauds.split(',') if x.strip()]
     old=link.ser.baudrate
     try:
         for rate in rates:
-            link.ser.baudrate=rate; time.sleep(0.05)
+            link.ser.baudrate=rate
+            time.sleep(0.05)
             print(f"\n=== {rate} baud ===")
             raw,frames=_raw_handshake(link,args.timeout)
             fw=next((p for p in frames if p and p[0]==COMM_FW_VERSION),None)
@@ -709,76 +1027,316 @@ def cmd_baud_scan(link: Link, args: argparse.Namespace) -> int:
     return 3
 
 
+# Fungsi parse_comm_diag: mengurai parse comm diag dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_comm_diag(p: bytes) -> dict:
     if len(p)<3 or p[:2]!=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)):
         raise ValueError("bukan COMM_DIAG")
-    r=Reader(p,2); revision=r.u8()
+    r=Reader(p,2)
+    revision=r.u8()
     d={'revision':revision}
     if revision >= 6:
         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames',
                'tx_ring_overruns','tx_complete_count','blocking_busy_drops',
                'motor2_forwards','unsupported_forward_ids','baud']
-        for name in names: d[name]=r.u32()
+        for name in names:
+            d[name]=r.u32()
         d['blocking_queue_depth']=r.u8()
         d['timeout_active']=bool(r.u8())
         d['config_valid']=bool(r.u8())
         if revision >= 8 and len(p)-r.i >= 35:
-            d['rx_dma_irq_count']=r.u32(); d['tx_dma_irq_count']=r.u32()
-            d['idle_irq_count']=r.u32(); d['dma_errors']=r.u32(); d['reset_flags']=r.u32()
-            d['had_iwdg_reset']=bool(r.u8()); d['watchdog_started']=bool(r.u8()); d['watchdog_healthy']=bool(r.u8())
+            d['rx_dma_irq_count']=r.u32()
+            d['tx_dma_irq_count']=r.u32()
+            d['idle_irq_count']=r.u32()
+            d['dma_errors']=r.u32()
+            d['reset_flags']=r.u32()
+            d['had_iwdg_reset']=bool(r.u8())
+            d['watchdog_started']=bool(r.u8())
+            d['watchdog_healthy']=bool(r.u8())
             if revision >= 9 and len(p)-r.i >= 27:
                 d['config_integrity_ok']=bool(r.u8())
-                d['config_integrity_checks']=r.u32(); d['config_integrity_failures']=r.u32()
-                d['power_hold']=bool(r.u8()); d['shutdown_latched']=bool(r.u8())
+                d['config_integrity_checks']=r.u32()
+                d['config_integrity_failures']=r.u32()
+                d['power_hold']=bool(r.u8())
+                d['shutdown_latched']=bool(r.u8())
             if len(p)-r.i >= 16:
                 d['watchdog_required_mask']=r.u32()
-                d['heartbeat_foc']=r.u32(); d['heartbeat_motor_service']=r.u32(); d['heartbeat_comm']=r.u32()
+                d['heartbeat_foc']=r.u32()
+                d['heartbeat_motor_service']=r.u32()
+                d['heartbeat_comm']=r.u32()
                 if revision >= 12 and len(p)-r.i >= 4:
                     d['heartbeat_fault']=r.u32()
             if revision >= 10 and len(p)-r.i >= 28:
                 d['watchdog_unhealthy_mask']=r.u32()
-                d['watchdog_miss_foc']=r.u32(); d['watchdog_miss_motor_service']=r.u32(); d['watchdog_miss_comm']=r.u32()
+                d['watchdog_miss_foc']=r.u32()
+                d['watchdog_miss_motor_service']=r.u32()
+                d['watchdog_miss_comm']=r.u32()
                 if revision >= 12 and len(p)-r.i >= 5:
-                    d['watchdog_miss_fault']=r.u32(); d['config_boot_status']=r.u8()
-                d['sample_clamp_left']=r.u32(); d['sample_clamp_right']=r.u32()
-                d['sample_margin_left_q15']=r.u16(); d['sample_margin_right_q15']=r.u16()
+                    d['watchdog_miss_fault']=r.u32()
+                    d['config_boot_status']=r.u8()
+                d['sample_clamp_left']=r.u32()
+                d['sample_clamp_right']=r.u32()
+                d['sample_margin_left_q15']=r.u16()
+                d['sample_margin_right_q15']=r.u16()
                 if revision >= 11 and len(p)-r.i >= 20:
-                    d['app_adc_raw1']=r.u16(); d['app_adc_raw2']=r.u16()
-                    d['app_adc_mv1']=r.u16(); d['app_adc_mv2']=r.u16()
-                    d['app_adc_decoded1']=r.i16()/1000.0; d['app_adc_decoded2']=r.i16()/1000.0
+                    d['app_adc_raw1']=r.u16()
+                    d['app_adc_raw2']=r.u16()
+                    d['app_adc_mv1']=r.u16()
+                    d['app_adc_mv2']=r.u16()
+                    d['app_adc_decoded1']=r.i16()/1000.0
+                    d['app_adc_decoded2']=r.i16()/1000.0
                     d['app_adc_command']=r.i16()/1000.0
-                    d['app_adc_fault_flags']=r.u8(); d['app_adc_range_ok']=bool(r.u8())
-                    d['app_adc_armed_left']=bool(r.u8()); d['app_adc_armed_right']=bool(r.u8())
-                    d['app_cmd_source_left']=r.u8(); d['app_cmd_source_right']=r.u8()
+                    d['app_adc_fault_flags']=r.u8()
+                    d['app_adc_range_ok']=bool(r.u8())
+                    d['app_adc_armed_left']=bool(r.u8())
+                    d['app_adc_armed_right']=bool(r.u8())
+                    d['app_cmd_source_left']=r.u8()
+                    d['app_cmd_source_right']=r.u8()
                     if revision >= 13 and len(p)-r.i >= 46:
                         d['sampling_contract_flags']=r.u32()
-                        d['isr_total_max_cycles']=r.u32(); d['isr_near_deadline_count']=r.u32()
-                        d['isr_period_min_cycles']=r.u32(); d['isr_period_max_cycles']=r.u32()
-                        d['heap_free_bytes']=r.u32(); d['heap_min_ever_bytes']=r.u32()
-                        d['stack_motor_free_bytes']=r.u16(); d['stack_sample_free_bytes']=r.u16()
-                        d['stack_fault_free_bytes']=r.u16(); d['stack_status_free_bytes']=r.u16()
-                        d['stack_packet_free_bytes']=r.u16(); d['stack_block_free_bytes']=r.u16()
-                        d['tx_queue_high_water']=r.u16(); d['tx_queue_busy_drops']=r.u32()
+                        d['isr_total_max_cycles']=r.u32()
+                        d['isr_near_deadline_count']=r.u32()
+                        d['isr_period_min_cycles']=r.u32()
+                        d['isr_period_max_cycles']=r.u32()
+                        d['heap_free_bytes']=r.u32()
+                        d['heap_min_ever_bytes']=r.u32()
+                        d['stack_motor_free_bytes']=r.u16()
+                        d['stack_sample_free_bytes']=r.u16()
+                        d['stack_fault_free_bytes']=r.u16()
+                        d['stack_status_free_bytes']=r.u16()
+                        d['stack_packet_free_bytes']=r.u16()
+                        d['stack_block_free_bytes']=r.u16()
+                        d['tx_queue_high_water']=r.u16()
+                        d['tx_queue_busy_drops']=r.u32()
                         if revision >= 14 and len(p)-r.i >= 4:
                             d['tx_low_priority_drops']=r.u32()
+                        if revision >= 15 and len(p)-r.i >= 12:
+                            d['rx_restarts']=r.u32()
+                            d['boot_stage']=r.u32()
+                            d['boot_error']=r.u32()
+                        if revision >= 16 and len(p)-r.i >= 38:
+                            d['last_outer_cmd']=r.u8()
+                            d['last_forward_target']=r.u8()
+                            d['last_forward_inner_cmd']=r.u8()
+                            d['last_motor_context']=r.u8()
+                            d['last_reply_cmd']=r.u8()
+                            d['last_tx_ok']=r.u8()
+                            d['buzzer_running']=bool(r.u8())
+                            d['melody_active']=bool(r.u8())
+                            d['melody_index']=r.u8()
+                            d['diag_reserved']=r.u8()
+                            d['get_values_m1']=r.u32()
+                            d['get_values_m2']=r.u32()
+                            d['forward_m2_count']=r.u32()
+                            d['forward_m2_reply_count']=r.u32()
+                            d['buzzer_hz']=r.u16()
+                            d['buzzer_remaining']=r.u32()
+                            if len(p)-r.i >= 4:
+                                d['fault_snapshot_valid']=bool(r.u8())
+                                d['fault_snapshot_motor']=r.u8()
+                                d['fault_snapshot_fault']=r.u8()
+                                d['fault_snapshot_cal_stage']=r.u8()
+                            if len(p)-r.i >= 38:
+                                d['fault_raw_u']=r.u16()
+                                d['fault_raw_v']=r.u16()
+                                d['fault_raw_dc']=r.u16()
+                                d['fault_offset_u']=r.i32()
+                                d['fault_offset_v']=r.i32()
+                                d['fault_offset_dc']=r.i32()
+                                d['fault_ia_q15']=r.i32()
+                                d['fault_ib_q15']=r.i32()
+                                d['fault_ic_q15']=r.i32()
+                                d['fault_trip_q15']=r.i32()
+                                d['fault_iq_target_q15']=r.i32()
+                            if revision >= 17 and len(p)-r.i >= 16:
+                                d['last_control_cmd']=r.u8()
+                                d['last_control_motor']=r.u8()
+                                d['last_control_result']=r.u8()
+                                d['last_control_result_name']=CONTROL_RESULT_NAMES.get(d['last_control_result'], '?')
+                                d['last_control_app_reject']=r.u8()
+                                d['last_control_value_scaled']=r.i32()
+                                d['control_accept_count']=r.u32()
+                                d['control_reject_count']=r.u32()
+                                if revision >= 18 and len(p)-r.i >= 18:
+                                    d['motor_ready']=bool(r.u8())
+                                    d['config_ready_runtime']=bool(r.u8())
+                                    d['ready_shutdown_latched']=bool(r.u8())
+                                    d['cal_done_runtime']=bool(r.u8())
+                                    d['cal_valid_runtime']=bool(r.u8())
+                                    d['ready_reserved']=r.u8()
+                                    d['sampling_drive_flags']=r.u32()
+                                    d['sampling_boot_flags']=r.u32()
+                                    d['motor_ready_recovery_count']=r.u32()
     elif revision >= 5:
         names=['rx_bytes','rx_ring_overruns','rx_frames_ok','tx_bytes','uart_errors','tx_frames','tx_ring_overruns','tx_complete_count','blocking_busy_drops','baud']
-        for name in names: d[name]=r.u32()
-        d['tx_queue_depth']=r.u8(); d['blocking_queue_depth']=r.u8()
+        for name in names:
+            d[name]=r.u32()
+        d['tx_queue_depth']=r.u8()
+        d['blocking_queue_depth']=r.u8()
     else:
         names=['rx_dma_bytes','rx_ring_overruns','rx_frames_ok','uart_idle_events','uart_errors','tx_frames','tx_queue_drops','tx_dma_errors','blocking_busy_drops','baud']
-        for name in names: d[name]=r.u32()
-        d['tx_queue_depth']=r.u8(); d['blocking_queue_depth']=r.u8()
+        for name in names:
+            d[name]=r.u32()
+        d['tx_queue_depth']=r.u8()
+        d['blocking_queue_depth']=r.u8()
     return d
 
+
+# Fungsi get_comm_diag: membaca snapshot diagnostik command/USART tanpa mengubah state motor.
+def get_comm_diag(link: Link, timeout: float = 0.5) -> dict:
+    p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                   lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                   timeout)
+    return parse_comm_diag(p)
+
+
+# Fungsi _print_fault_detail: memisahkan fault standar VESC (mis. DRV=3) menjadi fault native port dan bukti ISR/ADC.
+def _print_fault_detail(link: Link, motor: int, reason: str = "") -> None:
+    if reason:
+        print(f"=== FAULT DETAIL M{motor}: {reason} ===")
+    else:
+        print(f"=== FAULT DETAIL M{motor} ===")
+    native = None
+    try:
+        e = get_extended(link, motor, timeout=0.35)
+        native = int(e.get('native_fault', 0))
+        print(f"native_fault          : {native} ({NATIVE_FAULT_NAMES.get(native,'?')})")
+        print(f"ISR motor max/overrun : {e.get('isr_max_cycles','?')} / {e.get('isr_overruns','?')} cycles/events")
+        print(f"PWM/FOC target        : Id_ref={e.get('id_target','?')} Iq_ref={e.get('iq_target','?')} "
+              f"Id={e.get('id','?')} Iq={e.get('iq','?')} duty={e.get('duty','?')}")
+        print(f"observer/openloop     : valid={e.get('observer_valid','?')} erpm={e.get('observer_erpm','?')} "
+              f"sensor={e.get('foc_sensor_mode','?')}")
+    except Exception as exc:
+        print(f"extended telemetry    : unavailable ({exc})")
+    try:
+        d = get_comm_diag(link, timeout=0.5)
+        full = int(d.get('sampling_contract_flags', 0))
+        drive = int(d.get('sampling_drive_flags', full))
+        print(f"sampling full/drive   : {format_sampling_flags(full)} / {format_sampling_flags(drive)}")
+        print(f"ISR total max/period  : {d.get('isr_total_max_cycles','?')} / "
+              f"{d.get('isr_period_min_cycles','?')}..{d.get('isr_period_max_cycles','?')} cycles")
+        print(f"near-deadline count   : {d.get('isr_near_deadline_count','?')}")
+        if d.get('fault_snapshot_valid'):
+            nf=int(d.get('fault_snapshot_fault',-1))
+            print(f"fault snapshot        : M{d.get('fault_snapshot_motor')} native={nf} ({NATIVE_FAULT_NAMES.get(nf,'?')}) "
+                  f"cal_stage={d.get('fault_snapshot_cal_stage')}")
+            print(f"raw U/V/DC            : {d.get('fault_raw_u')} / {d.get('fault_raw_v')} / {d.get('fault_raw_dc')}")
+            print(f"offset U/V/DC         : {d.get('fault_offset_u')} / {d.get('fault_offset_v')} / {d.get('fault_offset_dc')}")
+            print(f"current q15 A/B/C     : {d.get('fault_ia_q15')} / {d.get('fault_ib_q15')} / {d.get('fault_ic_q15')}")
+            print(f"trip/iq-target q15    : {d.get('fault_trip_q15')} / {d.get('fault_iq_target_q15')}")
+    except Exception as exc:
+        print(f"COMM_DIAG             : unavailable ({exc})")
+    try:
+        c=get_cal(link,False,timeout=0.5)
+        print(f"cal valid/count       : {c.get('valid')} / {c.get('count')} of {c.get('target')}  dma_cndtr={c.get('dma_cndtr','?')}")
+    except Exception as exc:
+        print(f"CAL diag              : unavailable ({exc})")
+    if native == 6:
+        print("ROOT HINT: FOC_ISR_OVERRUN. Run35 ADC tetap 16 kHz tetapi full FOC berjalan tiap 3 frame; slot kontrol = 12000 cycles @64 MHz.")
+    elif native == 1:
+        print("ROOT HINT: ADC_DMA. Run35 memakai ADC V15 5-rank, DMA1 Channel1 TC-only, batch 15 word (3 frame), TIM8_TRGO dan ADC1 external-trigger remap.")
+
+def cmd_fault_detail(link: Link, args: argparse.Namespace) -> int:
+    _print_fault_detail(link, args.motor, "manual diagnostic")
+    return 0
+
+# Fungsi verify_control_accept: memastikan command VESC benar-benar diterima motor target, bukan hanya terkirim dari host.
+def verify_control_accept(link: Link, motor: int, expected_cmd: int) -> dict:
+    d=get_comm_diag(link,0.5)
+    result=int(d.get('last_control_result',0))
+    seen_cmd=int(d.get('last_control_cmd',-1))
+    seen_motor=int(d.get('last_control_motor',-1))
+    if result != 1 or seen_cmd != expected_cmd or seen_motor != motor:
+        full=int(d.get('sampling_contract_flags',0))
+        drive=int(d.get('sampling_drive_flags',full))
+        raise RuntimeError(
+            'command ditolak/tidak mencapai motor: '
+            f'cmd={seen_cmd} expected={expected_cmd} motor={seen_motor} expected_motor={motor} '
+            f'result={result}({CONTROL_RESULT_NAMES.get(result,"?")}) '
+            f'app_reject={d.get("last_control_app_reject")} timeout={d.get("timeout_active")} '
+            f'motor_ready={d.get("motor_ready","n/a")} cal_valid={d.get("cal_valid_runtime","n/a")} '
+            f'drive_flags={format_sampling_flags(drive)} full_flags={format_sampling_flags(full)} '
+            f'boot_error={d.get("boot_error","n/a")}. Jalankan: debug.py startup-check')
+    return d
+
+# Fungsi cmd_comm_diag: menjalankan operasi cmd comm diag sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_comm_diag(link: Link, _args: argparse.Namespace) -> int:
     p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                    lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),1.0)
     d=parse_comm_diag(p)
-    for k,v in d.items(): print(f"{k:22s}: {v}")
+    for k,v in d.items():
+        if k in ('sampling_contract_flags','sampling_drive_flags','sampling_boot_flags'):
+            print(f"{k:22s}: {format_sampling_flags(int(v))}")
+        else:
+            print(f"{k:22s}: {v}")
     return 0
 
 
+# Fungsi cmd_startup_check: memeriksa readiness, sampling, kalibrasi, fault, dan melody tanpa menggerakkan motor.
+def cmd_startup_check(link: Link, _args: argparse.Namespace) -> int:
+    d=get_comm_diag(link,1.0)
+    cal=get_cal(link,False)
+    print("=== STARTUP / MOTOR READY CHECK ===")
+    print(f"boot_stage             : {d.get('boot_stage','n/a')}")
+    print(f"boot_error             : {d.get('boot_error','n/a')}")
+    print(f"motor_ready            : {d.get('motor_ready','n/a')}")
+    print(f"ready_recovery_count   : {d.get('motor_ready_recovery_count','n/a')}")
+    print(f"cal_done / cal_valid   : {cal.get('done')} / {cal.get('valid')}")
+    full=int(d.get('sampling_contract_flags',0))
+    drive=int(d.get('sampling_drive_flags',full))
+    boot=int(d.get('sampling_boot_flags',full))
+    print(f"sampling live full     : {format_sampling_flags(full)}")
+    print(f"sampling live drive    : {format_sampling_flags(drive)}")
+    print(f"sampling boot snapshot : {format_sampling_flags(boot)}")
+    print(f"buzzer/melody          : running={d.get('buzzer_running')} active={d.get('melody_active')} index={d.get('melody_index')}")
+    faults=[]
+    for motor in (0,1):
+        try:
+            ext=get_extended(link,motor,0.5)
+            faults.append(int(ext.get('native_fault',0)))
+            print(f"M{motor} fault              : {ext.get('native_fault')} ({ext.get('native_fault_name')})  "
+                  f"PWM={ext.get('pwm_enabled')} MOE={ext.get('moe')} sensor={ext.get('sensor_mode')} foc_sensor={ext.get('foc_sensor_mode')}")
+        except Exception as exc:
+            faults.append(255)
+            print(f"M{motor} extended           : ERROR {exc}")
+    ready=d.get('motor_ready')
+    if ready is False:
+        print("RESULT: FAIL/NOT READY - lihat drive_flags, calibration, dan fault di atas.")
+        return 4
+    if drive != 0 or not cal.get('valid',False) or any(f != 0 for f in faults):
+        print("RESULT: FAIL - readiness belum memenuhi acceptance aktif.")
+        return 5
+    if full != 0:
+        print("RESULT: PASS DRIVE + WARNING audit-only sampling flags masih aktif; kirim output ini untuk audit register.")
+        return 0
+    print("RESULT: PASS - sampling, calibration, fault, dan motor_ready siap untuk motor-test.")
+    return 0
+
+
+# Fungsi parse_buzzer_status: mengurai parse buzzer status dari data masukan menjadi representasi yang dapat divalidasi.
+def parse_buzzer_status(p: bytes) -> dict:
+    if len(p) != 13 or p[:2] != bytes((COMM_CUSTOM_APP_DATA, CUSTOM_BUZZER_TEST)):
+        raise ValueError("bukan buzzer-test reply")
+    r=Reader(p,2)
+    return {
+        "action": r.u8(), "accepted": bool(r.u8()), "running": bool(r.u8()),
+        "melody_active": bool(r.u8()), "melody_index": r.u8(),
+        "hz": r.u16(), "remaining": r.u32(),
+    }
+
+
+# Fungsi cmd_buzzer_test: menguji cmd buzzer test dan memastikan hasilnya sesuai kontrak yang diharapkan.
+def cmd_buzzer_test(link: Link, args: argparse.Namespace) -> int:
+    action={"status":0,"stop":3}[args.mode]
+    p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_BUZZER_TEST,action)),
+                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                   lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_BUZZER_TEST)),1.0)
+    d=parse_buzzer_status(p)
+    print(d)
+    return 0
+
+
+# Fungsi cmd_status: menjalankan operasi cmd status sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_status(link: Link, args: argparse.Namespace) -> int:
     motors=[args.motor] if args.motor is not None else [0,1]
     for m in motors:
@@ -794,66 +1352,77 @@ def cmd_status(link: Link, args: argparse.Namespace) -> int:
     return 0
 
 
+# Fungsi _calibration_channel_status: menjalankan operasi calibration channel status sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _calibration_channel_status(d: dict, idx: int, name: str) -> str:
     bit=1<<idx
-    if d.get("fail_range_mask",0) & bit: return "FAIL_RANGE"
-    if d.get("fail_noise_mask",0) & bit: return "FAIL_NOISE"
-    if d.get("warn_mask",0) & bit: return "WARN_NOISE"
+    if d.get("fail_range_mask",0) & bit:
+        return "FAIL_RANGE"
+    if d.get("fail_noise_mask",0) & bit:
+        return "FAIL_NOISE"
+    if d.get("warn_mask",0) & bit:
+        return "WARN_NOISE"
     return "PASS"
 
 
+# Fungsi _print_calibration_diagnostics: menjalankan operasi print calibration diagnostics sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _print_calibration_diagnostics(d: dict) -> None:
     print("\n=== CURRENT CALIBRATION RESULT ===")
     for k in ("done","valid","count","target","left_u","left_v","left_dc","right_u","right_v","right_dc"):
-        if k in d: print(f"{k:24s}: {d[k]}")
+        if k in d:
+            print(f"{k:24s}: {d[k]}")
     print("\n=== HARDWARE LIVENESS ===")
     for k in ("adc_isr_count","dma_cndtr","tim2_cnt","tim1_dir","tim1_running","tim8_running","tim2_running",
               "adc1_enabled","adc2_enabled","dma1_ch1_enabled"):
-        if k in d: print(f"{k:24s}: {d[k]}")
+        if k in d:
+            print(f"{k:24s}: {d[k]}")
     if "cal_diag_revision" in d:
         print("\n=== CURRENT CALIBRATION STATISTICS ===")
         print(f"diag_revision           : {d['cal_diag_revision']}")
         print(f"warn_mask               : 0x{d.get('warn_mask',0):04X}")
         print(f"fail_range_mask         : 0x{d.get('fail_range_mask',0):04X}")
         print(f"fail_noise_mask         : 0x{d.get('fail_noise_mask',0):04X}")
-        print("channel      mean   min   max spread  stddev outlier      status")
+        print("channel      mean   min   max spread   variance outlier      status")
         names=["left_u","left_v","left_dc","right_u","right_v","right_dc"]
         for idx,name in enumerate(names):
             c=d.get("channels",{}).get(name)
-            if not c: continue
+            if not c:
+                continue
             outliers=d.get("outlier_count",{}).get(name,0)
             print(f"{name:10s} {c['mean']:5d} {c['min']:5d} {c['max']:5d} "
-                  f"{c['spread']:6d} {c['stddev']:8.3f} {outliers:7d}  "
+                  f"{c['spread']:6d} {c['variance']:10.2f} {outliers:7d}  "
                   f"{_calibration_channel_status(d,idx,name)}")
         print("\nThreshold policy:")
-        print("  undriven pass         : only reject ADC rail / gross hardware fault")
-        print("  driven offset source  : 50%/50%/50% zero-vector switching, 1000 samples/motor")
-        print("  hard mean range       : 128..3967 ADC counts")
+        print("  source                 : both bridges 50% zero-vector, one unified calibration")
+        print("  estimator              : midpoint(min,max), 2000 coherent ADC frames")
+        print("  hard rail guard        : reject midpoint <=128 or >=3967 ADC counts")
         if d.get("cal_diag_revision",0) >= 17:
-            print("  robust inlier window  : +/-256 counts around undriven mean")
-            print("  warning noise         : any outlier OR raw spread >160 OR clean stddev >16")
-            print("  hard driven-noise fail: >10 outliers, <990 inliers, OR clean stddev >80")
+            print("  current polarity       : offset - raw, scale 0.020 A/count")
+            print("  warning noise         : any outlier OR raw spread >160 counts")
+            print("  hard noise fail        : >10 outliers OR raw spread >512 counts")
+            print("  ISR statistic         : variance disabled; calibration ISR tracks min/max only")
         else:
             print("  warning noise         : spread >160 OR stddev >16 counts")
-            print("  hard driven-noise fail: spread >800 OR stddev >80 counts")
+            print("  hard noise fail        : spread/stddev gross sanity")
         print("  PWM start blanking    : 8 driven samples at 50% zero vector; DC trip 17 A")
         print("  warning does NOT inhibit PWM; hard failure does.")
         if d.get("cal_diag_revision",0) >= 14:
-            stage_names={0:"UNDRIVEN",1:"WAIT_LEFT_DRIVEN",2:"LEFT_WARMUP",3:"LEFT_DRIVEN",
-                         4:"WAIT_RIGHT_DRIVEN",5:"RIGHT_WARMUP",6:"RIGHT_DRIVEN",
+            stage_names={0:"LEGACY",1:"WAIT_NEUTRAL",2:"NEUTRAL_WARMUP",3:"NEUTRAL_SAMPLE",
+                         4:"LEGACY",5:"LEGACY",6:"LEGACY",
                          7:"WAIT_FINALIZE",8:"DONE",9:"FAILED"}
             st=d.get("cal_stage",-1)
-            print("\n=== DRIVEN/OFFSET SPLIT ===")
+            print("\n=== UNIFIED NEUTRAL OFFSET ===")
             print(f"cal_stage               : {st} {stage_names.get(st,'?')}")
             print(f"shift_warn_mask         : 0x{d.get('shift_warn_mask',0):04X}")
-            print("channel      undriven driven  delta")
+            print("channel       midpoint stored  delta")
             for name in ["left_u","left_v","left_dc","right_u","right_v","right_dc"]:
-                u=d.get("undriven_mean",{}).get(name,0); v=d.get("driven_mean",{}).get(name,0)
+                u=d.get("undriven_mean",{}).get(name,0)
+                v=d.get("driven_mean",{}).get(name,0)
                 print(f"{name:10s} {u:8d} {v:6d} {v-u:6d}")
             fs=d.get("fault_snapshot",{})
             print("\n=== FIRST ACTIVE-DRIVE CURRENT-FAULT SNAPSHOT ===")
             if fs.get("valid"):
-                for k,v in fs.items(): print(f"{k:24s}: {v}")
+                for k,v in fs.items():
+                    print(f"{k:24s}: {v}")
             else:
                 print("valid                   : False (no active-drive current fault captured)")
         if d.get("cal_diag_revision",0) >= 15:
@@ -867,13 +1436,14 @@ def _print_calibration_diagnostics(d: dict) -> None:
             print("rank2                   : ADC1 LEFT_A   | ADC2 LEFT_B")
             print("rank3                   : ADC1 RIGHT_B  | ADC2 RIGHT_C")
         if d.get("cal_diag_revision",0) >= 16:
-            print("\n=== ADC3 DCLINK PATH ===")
+            print("\n=== LEGACY ADC3 DIAGNOSTIC SLOTS ===")
             for k in ("adc3_enabled","dma2_ch5_enabled","dma2_ch5_cndtr",
                       "adc3_vbus_raw0","adc3_vbus_raw1","vbus_dma_stale_count",
                       "vbus_dma_stale_events"):
-                if k in d: print(f"{k:24s}: {d[k]}")
-            print("trigger                  : TIM8_TRGO (same PWM frame as current scan)")
-            print("DCLINK                   : PC2 / ADC3_IN12 / DMA2 Channel 5")
+                if k in d:
+                    print(f"{k:24s}: {d[k]}")
+            print("Run35                   : V15 5-rank ADC, 3-frame DMA batch, ADC3/DMA2 disabled")
+            print("DCLINK                   : PC2 / ADC1 rank-4 in dual ADC1+ADC2 scan")
         if d.get("cal_diag_revision",0) >= 17:
             print("\n=== PWM MOE CALIBRATION TRACE ===")
             print(f"moe_fail_mask           : 0x{d.get('moe_fail_mask',0):02X}")
@@ -883,24 +1453,30 @@ def _print_calibration_diagnostics(d: dict) -> None:
             first=d.get("first_sample_adc",[0,0])
             print("motor        request_adc confirm_adc first_sample delta_confirm delta_sample")
             for idx,name in enumerate(("LEFT", "RIGHT")):
-                req=request[idx]; con=confirm[idx]; fst=first[idx]
+                req=request[idx]
+                con=confirm[idx]
+                fst=first[idx]
                 print(f"{name:10s} {req:11d} {con:11d} {fst:12d} "
                       f"{(con-req) if con else -1:13d} {(fst-con) if fst and con else -1:12d}")
     regs=d.get("registers",{})
     if regs:
         print("\n=== RAW PERIPHERAL REGISTERS ===")
-        for k,v in regs.items(): print(f"{k:24s}: 0x{v:08X} ({v})")
+        for k,v in regs.items():
+            print(f"{k:24s}: 0x{v:08X} ({v})")
     if d.get("dma_words"):
         print("\n=== ADC DUAL DMA RAW WORDS ===")
         for idx,w in enumerate(d["dma_words"],1):
             print(f"rank{idx}: word=0x{w['word']:08X} ADC1={w['adc1']:4d} ADC2={w['adc2']:4d}")
 
 
+# Fungsi _cmd_calibrate_body: menjalankan operasi cmd calibrate body sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _cmd_calibrate_body(link: Link,args: argparse.Namespace)->int:
     print(f"timestamp               : {datetime.now().isoformat(timespec='seconds')}")
     print(f"port                    : {link.ser.port}")
     print(f"baud                    : {link.ser.baudrate}")
-    link.stop(0); link.stop(1); time.sleep(0.1)
+    link.stop(0)
+    link.stop(1)
+    time.sleep(0.1)
     d=get_cal(link,trigger=True)
     print("Calibration started; both motor PWM commands stopped.")
     deadline=time.monotonic()+args.timeout
@@ -909,7 +1485,8 @@ def _cmd_calibrate_body(link: Link,args: argparse.Namespace)->int:
         time.sleep(0.1)
         d=get_cal(link,False)
         history.append((time.monotonic(),d.get('adc_isr_count',0),d.get('dma_cndtr',-1),d.get('tim8_cnt_v15',d.get('tim2_cnt',-1)),d.get('count',0)))
-        if d['done']: break
+        if d['done']:
+            break
     _print_calibration_diagnostics(d)
     print("\n=== LIVENESS SAMPLES DURING CALIBRATION ===")
     for j,(ts,isrc,cndtr,timcnt,cnt) in enumerate(history[-12:]):
@@ -925,20 +1502,41 @@ def _cmd_calibrate_body(link: Link,args: argparse.Namespace)->int:
     print("\n=== ZERO-CURRENT TELEMETRY AFTER CALIBRATION ===")
     for m in (0,1):
         try:
-            v=get_values(link,m); print_values(m,v)
-            e=get_extended(link,m); print("EXT:",e)
+            v=get_values(link,m)
+            print_values(m,v)
+            e=get_extended(link,m)
+            print("EXT:",e)
             if abs(v.id)>args.zero_limit or abs(v.iq)>args.zero_limit or abs(v.imotor)>args.zero_limit*1.5:
                 ok=False
         except Exception as exc:
-            ok=False; print(f"M{m} telemetry error: {exc}")
-    print("\nRESULT:", "PASS zero-current" if ok else "WARN/FAIL zero-current residual/telemetry")
+            ok=False
+            print(f"M{m} telemetry error: {exc}")
+    print("\n=== READINESS AFTER CALIBRATION ===")
+    try:
+        diag=get_comm_diag(link,1.0)
+        full=int(diag.get('sampling_contract_flags',0))
+        drive=int(diag.get('sampling_drive_flags',full))
+        print(f"motor_ready             : {diag.get('motor_ready','n/a')}")
+        print(f"ready_recovery_count    : {diag.get('motor_ready_recovery_count','n/a')}")
+        print(f"sampling drive flags    : {format_sampling_flags(drive)}")
+        print(f"sampling full flags     : {format_sampling_flags(full)}")
+        if diag.get('motor_ready') is False or drive != 0:
+            print("RESULT: FAIL - calibration valid tetapi gate motor belum READY; jalankan startup-check.")
+            return 4
+    except Exception as exc:
+        # Firmware rev17/lama tidak memiliki readiness fields; jangan membuat
+        # tool kalibrasi lama gagal hanya karena diagnostic extension baru tidak ada.
+        print(f"readiness diagnostic    : unavailable ({exc})")
+    print("\nRESULT:", "PASS zero-current + readiness" if ok else "WARN/FAIL zero-current residual/telemetry")
     return 0 if ok else 3
 
 
+# Fungsi _default_txt: menjalankan operasi default txt sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _default_txt(prefix: str) -> Path:
     return Path(f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
 
 
+# Fungsi cmd_calibrate: menjalankan operasi cmd calibrate sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_calibrate(link: Link,args: argparse.Namespace)->int:
     path=Path(getattr(args,"out",None) or _default_txt("vesc_f103_calibration"))
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -956,6 +1554,7 @@ def cmd_calibrate(link: Link,args: argparse.Namespace)->int:
 
 
 # Full passive diagnostic report including observer/model and hardware timing fields.
+# Fungsi cmd_diagnose: menjalankan operasi cmd diagnose sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_diagnose(link: Link,args: argparse.Namespace)->int:
     path=Path(getattr(args,"out",None) or _default_txt("vesc_f103_full_debug"))
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -970,35 +1569,42 @@ def cmd_diagnose(link: Link,args: argparse.Namespace)->int:
             print("\n=== COMM USART3 IRQ/RING ===")
             cmd_comm_diag(link,args)
             print("\n=== PRE-CAL HARDWARE SNAPSHOT ===")
-            pre=get_cal(link,False); _print_calibration_diagnostics(pre)
+            pre=get_cal(link,False)
+            _print_calibration_diagnostics(pre)
             print("\n=== RECALIBRATION ===")
             cal_args=argparse.Namespace(timeout=args.timeout,zero_limit=args.zero_limit,out=None)
             # Call the body directly so the whole report stays in this one TXT.
             cr=_cmd_calibrate_body(link,cal_args)
-            if cr != 0: rc=cr
+            if cr != 0:
+                rc=cr
             print("\n=== SENSOR STATE ===")
             for m in (0,1):
                 try:
                     print(("LEFT" if m==0 else "RIGHT"),get_sensor(link,m))
-                except Exception as exc: print(f"sensor M{m} error: {exc}")
+                except Exception as exc:
+                    print(f"sensor M{m} error: {exc}")
             print("\n=== FINAL TELEMETRY SNAPSHOTS ===")
             for sample in range(5):
                 print(f"-- snapshot {sample} --")
                 for m in (0,1):
                     try:
-                        print_values(m,get_values(link,m)); print("EXT:",get_extended(link,m))
-                    except Exception as exc: print(f"M{m}: {exc}")
+                        print_values(m,get_values(link,m))
+                        print("EXT:",get_extended(link,m))
+                    except Exception as exc:
+                        print(f"M{m}: {exc}")
                 time.sleep(0.2)
             print("\n=== FINAL COMM USART3 IRQ/RING ===")
             cmd_comm_diag(link,args)
         except Exception:
             print("\n=== EXCEPTION ===")
-            traceback.print_exc(); rc=1
+            traceback.print_exc()
+            rc=1
     print(f"DEBUG TXT: {path.resolve()}")
     print(f"RESULT CODE: {rc}")
     return rc
 
 
+# Fungsi cmd_sensor_info: menjalankan operasi cmd sensor info sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_sensor_info(link: Link,args: argparse.Namespace)->int:
     motors=[args.motor] if args.motor is not None else [0,1]
     for m in motors:
@@ -1009,48 +1615,68 @@ def cmd_sensor_info(link: Link,args: argparse.Namespace)->int:
     return 0
 
 
+# Fungsi require_yes: menjalankan operasi require yes sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def require_yes(args: argparse.Namespace, what: str) -> None:
     if not getattr(args,"yes",False):
         raise RuntimeError(f"{what} dapat menggerakkan motor. Ulangi dengan --yes setelah power-stage siap.")
 
 
+# Fungsi cmd_sensor_select: menjalankan operasi cmd sensor select sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_sensor_select(link: Link,args: argparse.Namespace)->int:
-    mode={"hall":SENSOR_HALL,"encoder":SENSOR_ENCODER}[args.mode]
+    mode={"hall":SENSOR_HALL,"encoder":SENSOR_ENCODER,"sensorless":SENSOR_SENSORLESS}[args.mode]
     if args.motor==1 and mode==SENSOR_ENCODER:
         raise RuntimeError("RIGHT pada PCB ini hanya Hall")
-    link.stop(args.motor); time.sleep(0.05)
+    link.stop(args.motor)
+    time.sleep(0.05)
     p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_SELECT,args.motor,mode)),
+                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                    lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO)) and x[2]==args.motor,1.0)
-    print(parse_sensor(p)); return 0
+    d=parse_sensor(p)
+    active=(d.get('mode')==mode and d.get('request')==mode)
+    d['selection_active']=active
+    print(d)
+    print(f"SELECT RESULT: {'PASS' if active else 'FAIL'} active={SENSOR_NAMES.get(d.get('mode'),d.get('mode'))} "
+          f"detect_success(last)={d.get('detect_success')}")
+    return 0 if active else 4
 
 
+# Fungsi _cmd_sensor_detect_body: menjalankan operasi cmd sensor detect body sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _cmd_sensor_detect_body(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"Auto-detect sensor")
     mode={"auto":SENSOR_AUTO,"hall":SENSOR_HALL,"encoder":SENSOR_ENCODER}[args.mode]
-    if args.motor==1 and mode==SENSOR_ENCODER: raise RuntimeError("RIGHT tidak memiliki encoder")
+    if args.motor==1 and mode==SENSOR_ENCODER:
+        raise RuntimeError("RIGHT tidak memiliki encoder")
     cal=get_cal(link,False)
-    if not cal['done'] or not cal['valid']: raise RuntimeError("Current-zero calibration belum valid. Jalankan 'calibrate' dulu.")
+    if not cal['done'] or not cal['valid']:
+        raise RuntimeError("Current-zero calibration belum valid. Jalankan 'calibrate' dulu.")
     print("VESC F103 SENSOR DETECT TRACE")
     print("timestamp:",datetime.now().isoformat(timespec='seconds'))
     print("motor:","LEFT" if args.motor==0 else "RIGHT","mode:",args.mode,"current_A:",args.current)
     print("NOTE: Hall detect follows VESC 1s Id ramp + 1deg/5ms forward/reverse sweeps.")
-    link.stop(args.motor); link.clear_fault(args.motor); time.sleep(0.1)
+    link.stop(args.motor)
+    link.clear_fault(args.motor)
+    time.sleep(0.1)
     print("PRE:",get_sensor(link,args.motor))
     print("PRE-EXT:",get_extended(link,args.motor))
     ma=int(round(args.current*1000.0))
-    if ma < 200 or ma > 2000: raise ValueError("--current harus 0.2..2.0 A")
+    if ma < 200 or ma > 2000:
+        raise ValueError("--current harus 0.2..2.0 A")
     link.send(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_DETECT,args.motor,mode))+be_i32(ma))
     deadline=time.monotonic()+args.timeout
-    last=None; seq=0
+    last=None
+    seq=0
     while time.monotonic()<deadline:
-        d=get_sensor(link,args.motor); state=d['state']
+        d=get_sensor(link,args.motor)
+        state=d['state']
         if state!=last:
             print(f"\nSTATE {state} {DETECT_NAMES.get(state,'?')} mode={SENSOR_NAMES.get(d['mode'],d['mode'])}")
             last=state
         if seq % 5 == 0 or state in (10, 11, DETECT_DONE, DETECT_FAILED):
             print("SENSOR:",d)
-            try: print("EXT   :",get_extended(link,args.motor))
-            except Exception as exc: print("EXT error:",exc)
+            try:
+                print("EXT   :",get_extended(link,args.motor))
+            except Exception as exc:
+                print("EXT error:",exc)
         if state in (DETECT_DONE,DETECT_FAILED):
             print("FINAL:",d)
             try:
@@ -1060,10 +1686,177 @@ def _cmd_sensor_detect_body(link: Link,args: argparse.Namespace)->int:
             except Exception as exc:
                 print("fault snapshot read error:",exc)
             return 0 if state==DETECT_DONE and d['success'] else 4
-        seq+=1; time.sleep(0.1)
+        seq+=1
+        time.sleep(0.1)
     raise TimeoutError("sensor detect timeout")
 
 
+# Fungsi _hall_table_valid: memvalidasi tabel Hall hasil detect dengan aturan enam-state Gray-code dan jarak sektor.
+def _hall_table_valid(table: list[int]) -> bool:
+    if len(table) != 8 or table[0] != 255 or table[7] != 255:
+        return False
+    pairs=[]
+    for raw in range(1,7):
+        a=table[raw]
+        if not 0 <= a < 200:
+            return False
+        pairs.append((a,raw))
+    pairs.sort()
+    for i,(ang,raw) in enumerate(pairs):
+        nang,nraw=pairs[(i+1)%6]
+        changed=raw ^ nraw
+        if changed == 0 or (changed & (changed-1)) != 0:
+            return False
+        spacing=(nang + (200 if i==5 else 0)) - ang
+        if not 15 <= spacing <= 55:
+            return False
+    return True
+
+
+# Parameter link: koneksi serial VESC yang dipakai untuk command dan telemetry.
+# Parameter motor: indeks motor internal 0=LEFT, 1=RIGHT.
+# Parameter current_a: arus Iq uji dengan tanda arah eksternal VESC.
+# Parameter seconds: durasi uji running dalam detik.
+# Parameter min_erpm: batas motion minimum untuk acceptance Hall.
+# Parameter require_motion: bila benar, uji gagal jika ERPM tidak melewati batas.
+# Fungsi _hall_run_current_check: menguji satu arah current Hall dengan command standar VESC dan telemetry RT.
+def _hall_run_current_check(link: Link, motor: int, current_a: float, seconds: float,
+                            min_erpm: float, require_motion: bool) -> bool:
+    payload=command_payload("current",current_a)
+    end=time.monotonic()+seconds
+    next_cmd=time.monotonic()
+    peak_abs_erpm=0.0
+    signed_peak=0.0
+    accepted_before=None
+    run_cd=None
+    try:
+        try:
+            dp=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                            lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),0.5)
+            accepted_before=parse_comm_diag(dp).get("control_accept_count")
+        except Exception:
+            pass
+        while time.monotonic()<end:
+            now=time.monotonic()
+            if now>=next_cmd:
+                link.send_std(motor,payload)
+                next_cmd+=0.02
+            rt=get_values_selective(link,motor,0.08)
+            erpm=float(rt.get("erpm",0))
+            if abs(erpm)>peak_abs_erpm:
+                peak_abs_erpm=abs(erpm)
+                signed_peak=erpm
+            if rt.get("fault",0):
+                raise RuntimeError(f"fault={rt.get('fault')}")
+            time.sleep(0.02)
+
+        # Ambil trace ketika command current uji masih menjadi command terakhir.
+        # Jangan membaca trace setelah SET_CURRENT=0/SET_DUTY=0 karena stop
+        # tersebut dapat menutupi penolakan command running.
+        dp=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                        lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),0.5)
+        run_cd=parse_comm_diag(dp)
+    finally:
+        link.send_std(motor,bytes((COMM_SET_CURRENT,))+be_i32(0))
+        link.send_std(motor,bytes((COMM_SET_DUTY,))+be_i32(0))
+        link.stop(motor)
+        time.sleep(0.15)
+
+    if run_cd is None:
+        print("FAIL tidak dapat membaca command trace saat current masih aktif")
+        return False
+    if (run_cd.get("last_control_motor") != motor or
+            run_cd.get("last_control_cmd") != COMM_SET_CURRENT or
+            run_cd.get("last_control_result") != 1):
+        print(f"FAIL running-current command trace: {run_cd}")
+        return False
+    if accepted_before is not None and run_cd.get("control_accept_count",0) <= accepted_before:
+        print("FAIL running-current accept counter tidak naik")
+        return False
+    print(f"current={current_a:+.2f} A peak_erpm={signed_peak:+.1f} abs_peak={peak_abs_erpm:.1f} command=ACCEPTED")
+    if require_motion and peak_abs_erpm < min_erpm:
+        print(f"FAIL Hall command diterima tetapi motion < {min_erpm} ERPM")
+        return False
+    return True
+
+
+# Fungsi cmd_hall_commission: mendeteksi, menerapkan, memverifikasi, lalu menguji running Hall dua arah pada satu/dua motor.
+def cmd_hall_commission(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"Hall commissioning aktif; roda wajib diangkat dari lantai")
+    motors=(0,1) if args.motor == "both" else (int(args.motor),)
+    for motor in motors:
+        name="LEFT" if motor==0 else "RIGHT"
+        print(f"=== {name}: HALL DETECT/APPLY/PERSIST ===")
+        det_args=argparse.Namespace(motor=motor,mode="hall",current=args.current,
+                                    timeout=args.detect_timeout,yes=True,out=None)
+        rc=_cmd_sensor_detect_body(link,det_args)
+        if rc != 0:
+            print(f"FAIL {name}: hall detect rc={rc}")
+            return 20+motor
+        sdata=get_sensor(link,motor)
+        ext=get_extended(link,motor)
+        if not sdata.get("success",False) or not _hall_table_valid(list(sdata.get("hall_table",[]))):
+            print(f"FAIL {name}: tabel Hall tidak valid: {sdata.get('hall_table')}")
+            return 22+motor
+        if ext.get("foc_sensor_mode") != 2:
+            print(f"FAIL {name}: foc_sensor_mode bukan HALL(2): {ext.get('foc_sensor_mode')}")
+            return 24+motor
+
+        # Verifikasi melalui GET_MCCONF standar VESC bahwa mode dan tabel yang
+        # baru diterapkan benar-benar terlihat pada wire config yang sama dengan VESC Tool.
+        mc=_read_mcconf_wire(link,motor,1.0)
+        wire_mode=mc[VESC6_MC_OFF_FOC_SENSOR_MODE]
+        wire_table=list(mc[VESC6_MC_OFF_FOC_HALL_TABLE:VESC6_MC_OFF_FOC_HALL_TABLE+8])
+        if wire_mode != 2 or wire_table != list(sdata["hall_table"]):
+            print(f"FAIL {name}: MCCONF readback mode/table berbeda: mode={wire_mode} table={wire_table}")
+            return 25+motor
+        cp=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),
+                        lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),1.0)
+        cstat=parse_config_status(cp)
+        if not cstat.get("valid",False) or not cstat.get("last_save_ok",False):
+            print(f"FAIL {name}: persistence status={cstat}")
+            return 27+motor
+        print(f"PASS {name}: Hall table={sdata['hall_table']} MCCONF+flash status valid")
+
+        if args.run_seconds > 0.0:
+            _motion_precheck(link,motor,force=True,position=False)
+            for current_a in (abs(args.run_current),-abs(args.run_current)):
+                print(f"=== {name}: HALL RUN CURRENT {current_a:+.2f} A ===")
+                if not _hall_run_current_check(link,motor,current_a,args.run_seconds,
+                                               args.min_erpm,args.require_motion):
+                    return 26+motor
+            print(f"PASS {name}: Hall current running forward/reverse")
+    return 0
+
+
+# Fungsi cmd_openloop_phase: menjalankan operasi cmd openloop phase sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+def cmd_openloop_phase(link: Link,args: argparse.Namespace)->int:
+    require_yes(args, "Diagnostik SVPWM open-loop fixed-phase (tanpa current PI)")
+    if not -0.02 <= args.duty <= 0.02:
+        raise ValueError("--duty harus -0.02..0.02")
+    if args.ms > 500:
+        args.ms = 500
+    # Custom command 0xF1: [motor][duty_milli i32][phase_mdeg i32][duration_ms u16]
+    duty_milli = int(round(args.duty * 1000.0))
+    phase_milli = int(round(args.phase * 1000.0))
+    for i in range(max(1, args.repeat)):
+        payload = (bytes((COMM_CUSTOM_APP_DATA, CUSTOM_OPENLOOP_PHASE, args.motor))
+                   + be_i32(duty_milli) + be_i32(phase_milli) + be_u16(args.ms))
+        try:
+            link.send(payload)
+        except Exception as exc:
+            print("send error:", exc)
+            return 1
+        time.sleep(args.ms / 1000.0 + 0.3)
+        try:
+            print(f"--- openloop phase={args.phase:.1f} duty={args.duty:.3f} ms={args.ms} ---")
+            print("EXT:", get_extended(link, args.motor))
+        except Exception as exc:
+            print("EXT error:", exc)
+    return 0
+
+
+# Fungsi cmd_sensor_detect: menjalankan operasi cmd sensor detect sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_sensor_detect(link: Link,args: argparse.Namespace)->int:
     path=Path(getattr(args,"out",None) or _default_txt("vesc_f103_sensor_detect"))
     path.parent.mkdir(parents=True,exist_ok=True)
@@ -1072,19 +1865,24 @@ def cmd_sensor_detect(link: Link,args: argparse.Namespace)->int:
         try:
             rc=_cmd_sensor_detect_body(link,args)
         except Exception:
-            print("\n=== EXCEPTION ==="); traceback.print_exc(); rc=1
+            print("\n=== EXCEPTION ===")
+            traceback.print_exc()
+            rc=1
     print(f"DEBUG TXT: {path.resolve()}")
     print(f"RESULT CODE: {rc}")
     return rc
 
 
+# Fungsi _read_mcconf_wire: membaca read mcconf wire dan mengembalikan hasil tanpa mengubah state yang tidak diperlukan.
 def _read_mcconf_wire(link: Link, motor: int, timeout: float) -> bytes:
     payload=link.request_std(motor,bytes((COMM_GET_MCCONF,)),
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         lambda x: bool(x) and x[0]==COMM_GET_MCCONF,timeout)
     return _validate_vesc6_wire("MCCONF",payload,COMM_GET_MCCONF,
                                 VESC6_MCCONF_WIRE_SIZE,VESC6_MCCONF_SIGNATURE)
 
 
+# Fungsi parse_standard_encoder_detect: mengurai parse standard encoder detect dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_standard_encoder_detect(p: bytes) -> dict:
     if len(p) != 10 or p[0] != COMM_DETECT_ENCODER:
         raise ValueError(f"COMM_DETECT_ENCODER reply size/command invalid: {len(p)}")
@@ -1096,6 +1894,7 @@ def parse_standard_encoder_detect(p: bytes) -> dict:
     return {"ok":ok,"offset_deg":offset,"ratio":ratio,"inverted":inverted}
 
 
+# Fungsi parse_standard_hall_detect: mengurai parse standard hall detect dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_standard_hall_detect(p: bytes) -> dict:
     if len(p) != 10 or p[0] != COMM_DETECT_HALL_FOC:
         raise ValueError(f"COMM_DETECT_HALL_FOC reply size/command invalid: {len(p)}")
@@ -1104,6 +1903,7 @@ def parse_standard_hall_detect(p: bytes) -> dict:
     return {"ok":ok,"hall_table":table}
 
 
+# Fungsi cmd_detect_encoder_standard: menjalankan operasi cmd detect encoder standard sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_detect_encoder_standard(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"Standard VESC encoder detection")
     if args.motor != 0:
@@ -1111,9 +1911,12 @@ def cmd_detect_encoder_standard(link: Link,args: argparse.Namespace)->int:
     if not 0.2 <= args.current <= 5.0:
         raise ValueError("--current harus 0.2..5.0 A")
     before=_read_mcconf_wire(link,args.motor,args.timeout)
-    link.stop(args.motor); link.clear_fault(args.motor); time.sleep(0.1)
+    link.stop(args.motor)
+    link.clear_fault(args.motor)
+    time.sleep(0.1)
     req=bytes((COMM_DETECT_ENCODER,))+be_i32(int(round(args.current*1000.0)))
     p=link.request_std(args.motor,req,
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         lambda x: len(x)==10 and x[0]==COMM_DETECT_ENCODER,args.timeout)
     d=parse_standard_encoder_detect(p)
     after=_read_mcconf_wire(link,args.motor,2.0)
@@ -1124,14 +1927,18 @@ def cmd_detect_encoder_standard(link: Link,args: argparse.Namespace)->int:
     return 0 if d['ok'] and unchanged else 3
 
 
+# Fungsi cmd_detect_hall_standard: menjalankan operasi cmd detect hall standard sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_detect_hall_standard(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"Standard VESC Hall detection")
     if not 0.2 <= args.current <= 5.0:
         raise ValueError("--current harus 0.2..5.0 A")
     before=_read_mcconf_wire(link,args.motor,args.timeout)
-    link.stop(args.motor); link.clear_fault(args.motor); time.sleep(0.1)
+    link.stop(args.motor)
+    link.clear_fault(args.motor)
+    time.sleep(0.1)
     req=bytes((COMM_DETECT_HALL_FOC,))+be_i32(int(round(args.current*1000.0)))
     p=link.request_std(args.motor,req,
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         lambda x: len(x)==10 and x[0]==COMM_DETECT_HALL_FOC,args.timeout)
     d=parse_standard_hall_detect(p)
     after=_read_mcconf_wire(link,args.motor,2.0)
@@ -1143,12 +1950,14 @@ def cmd_detect_hall_standard(link: Link,args: argparse.Namespace)->int:
     return 0 if d['ok'] and valid_states==6 and unchanged else 3
 
 
+# Fungsi cmd_rotor: menjalankan operasi cmd rotor sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_rotor(link: Link,args: argparse.Namespace)->int:
     mode=DISPLAY_MODES[args.mode]
     link.send_std(args.motor, bytes((COMM_SET_DETECT,mode)))
     end=time.monotonic()+args.seconds
     try:
         while time.monotonic()<end:
+            # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
             p=link.recv(timeout=0.5,pred=lambda x: len(x)>=5 and x[0]==COMM_ROTOR_POSITION)
             pos=struct.unpack(">i",p[1:5])[0]/100000
             print(f"rotor/position = {pos:10.5f} deg")
@@ -1157,6 +1966,7 @@ def cmd_rotor(link: Link,args: argparse.Namespace)->int:
     return 0
 
 
+# Fungsi parse_sample_packet: mengurai parse sample packet dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_sample_packet(p: bytes) -> tuple[int, dict]:
     if len(p) < 1 or p[0] != COMM_SAMPLE_PRINT:
         raise ValueError("not COMM_SAMPLE_PRINT")
@@ -1175,14 +1985,19 @@ def parse_sample_packet(p: bytes) -> tuple[int, dict]:
     return index16,row
 
 
+# Fungsi cmd_sample: menjalankan operasi cmd sample sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_sample(link: Link,args: argparse.Namespace)->int:
-    count=max(1,min(args.count,256)); dec=max(1,min(args.decimation,255))
+    count=max(1,min(args.count,256))
+    dec=max(1,min(args.decimation,255))
     # mode=1 is immediate/NOW sampling in the F103 port; wire format follows
     # COMM_SAMPLE_PRINT: mode, uint16 sample_len, uint8 decimation, raw.
     req=bytes((COMM_SAMPLE_PRINT,1))+be_u16(count)+bytes((dec,1 if getattr(args,'raw',False) else 0))
     link.send_std(args.motor,req)
-    collected:dict[int,dict]={}; deadline=time.monotonic()+args.timeout
+    # Variabel collected: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
+    collected:dict[int,dict]={}
+    deadline=time.monotonic()+args.timeout
     while time.monotonic()<deadline and len(collected)<count:
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         p=link.recv(timeout=1.0,pred=lambda x: len(x)>=1 and x[0]==COMM_SAMPLE_PRINT)
         idx,row=parse_sample_packet(p)
         collected[idx]=row
@@ -1193,33 +2008,52 @@ def cmd_sample(link: Link,args: argparse.Namespace)->int:
         path=Path(args.csv)
         with path.open("w",newline="") as f:
             w=csv.DictWriter(f,fieldnames=list(rows[0].keys()) if rows else [])
-            if rows: w.writeheader(); w.writerows(rows)
+            if rows:
+                w.writeheader()
+                w.writerows(rows)
         print("CSV:",path)
-    for row in rows[:min(12,len(rows))]: print(row)
+    for row in rows[:min(12,len(rows))]:
+        print(row)
     return 0 if len(rows)==count else 5
 
+# Fungsi command_payload: menjalankan operasi command payload sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def command_payload(mode:str,value:float)->bytes:
-    if mode=="current": return bytes((COMM_SET_CURRENT,))+be_i32(round(value*1000))
-    if mode=="brake": return bytes((COMM_SET_CURRENT_BRAKE,))+be_i32(round(abs(value)*1000))
-    if mode=="rpm": return bytes((COMM_SET_RPM,))+be_i32(round(value))
-    if mode=="duty": return bytes((COMM_SET_DUTY,))+be_i32(round(value*100000))
-    if mode=="position": return bytes((COMM_SET_POS,))+be_i32(round(value*1_000_000))
+    if mode=="current":
+        return bytes((COMM_SET_CURRENT,))+be_i32(round(value*1000))
+    if mode=="brake":
+        return bytes((COMM_SET_CURRENT_BRAKE,))+be_i32(round(abs(value)*1000))
+    if mode=="rpm":
+        return bytes((COMM_SET_RPM,))+be_i32(round(value))
+    if mode=="duty":
+        return bytes((COMM_SET_DUTY,))+be_i32(round(value*100000))
+    if mode=="position":
+        return bytes((COMM_SET_POS,))+be_i32(round(value*1_000_000))
+    if mode=="handbrake":
+        return bytes((COMM_SET_HANDBRAKE,))+be_i32(round(abs(value)*1000))
+    if mode=="current-rel":
+        return bytes((COMM_SET_CURRENT_REL,))+be_i32(round(value*100000))
     raise ValueError(mode)
 
 
 
+# Fungsi cmd_detect_rl: menjalankan operasi cmd detect rl sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_detect_rl(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"R/L detection")
     p=link.request_std(args.motor,bytes((COMM_DETECT_MOTOR_R_L,)),
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         lambda x: len(x)>=9 and x[0]==COMM_DETECT_MOTOR_R_L,args.timeout)
-    r=Reader(p,1); resistance=r.i32()/1_000_000.0; inductance_uH=r.i32()/1000.0
+    r=Reader(p,1)
+    resistance=r.i32()/1_000_000.0
+    inductance_uH=r.i32()/1000.0
     ld_lq_uH=(r.i32()/1000.0) if len(p)-r.i>=4 else 0.0
-    inductance=inductance_uH*1.0e-6; ld_lq=ld_lq_uH*1.0e-6
+    inductance=inductance_uH*1.0e-6
+    ld_lq=ld_lq_uH*1.0e-6
     print(f"R={resistance:.8f} ohm  L={inductance_uH:.3f} uH ({inductance:.9f} H)  "
           f"Ld-Lq={ld_lq_uH:.3f} uH ({ld_lq:.9f} H)")
     return 0 if resistance>0 and inductance>0 else 3
 
 
+# Fungsi cmd_detect_flux: menjalankan operasi cmd detect flux sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_detect_flux(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"Flux linkage detection")
     current=int(round(args.current*1000.0))
@@ -1235,55 +2069,438 @@ def cmd_detect_flux(link: Link,args: argparse.Namespace)->int:
                  be_i32(int(round(args.min_erpm*1000.0)))+
                  be_i32(int(round(args.duty*1000.0)))+be_i32(resistance))
         cmd=COMM_DETECT_MOTOR_FLUX_LINKAGE
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
     p=link.request_std(args.motor,payload,lambda x: len(x)>=5 and x[0]==cmd,args.timeout)
     flux=Reader(p,1).i32()/10_000_000.0
     print(f"flux_linkage={flux:.9f} Wb")
     return 0 if flux>0 else 3
 
 
+# Fungsi cmd_detect_all_foc: menjalankan operasi cmd detect all foc sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_detect_all_foc(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"Full FOC auto-detection")
-    # Port ini tidak memiliki physical CAN. Byte detect_can tetap ada pada wire
-    # command VESC, tetapi selalu nol agar tidak mengiklankan backend yang tidak ada.
-    payload=(bytes((COMM_DETECT_APPLY_ALL_FOC,0))+
+    # Tidak ada physical CAN. Pada firmware dual-local ini detect_can=true saat
+    # command dikirim ke M0 sengaja berarti ikut commissioning local forwarded
+    # Motor-2 (controller ID 2), mengikuti alur Board Setup VESC Tool.
+    both_local=bool(getattr(args,'both_local',False))
+    if both_local and args.motor != 0:
+        raise ValueError("--both-local harus dikirim melalui --motor 0")
+    payload=(bytes((COMM_DETECT_APPLY_ALL_FOC,1 if both_local else 0))+
              be_i32(int(round(args.max_power_loss*1000.0)))+
              be_i32(int(round(args.min_input_current*1000.0)))+
              be_i32(int(round(args.max_input_current*1000.0)))+
              be_i32(int(round(args.openloop_erpm*1000.0)))+
              be_i32(int(round(args.sl_erpm*1000.0))))
     p=link.request_std(args.motor,payload,lambda x: len(x)>=3 and x[0]==COMM_DETECT_APPLY_ALL_FOC,args.timeout)
-    result=Reader(p,1).i16(); print(f"detect_apply_all_foc result={result}")
-    try: print("EXT:",get_extended(link,args.motor))
-    except Exception as exc: print("extended telemetry after detect error:",exc)
-    return 0 if result==0 else 3
+    result=Reader(p,1).i16()
+    print(f"detect_apply_all_foc result={result} both_local={both_local}")
+    motors=(0,1) if both_local else (args.motor,)
+    parameter_fail=False
+    for m in motors:
+        try:
+            e=get_extended(link,m)
+            print(f"M{m}: R={e.get('foc_motor_r_ohm',0):.8f} ohm  L={e.get('foc_motor_l_h',0)*1e6:.3f} uH  "
+                  f"Ld-Lq={e.get('foc_motor_ld_lq_diff_h',0)*1e6:.3f} uH  flux={e.get('foc_motor_flux_linkage_wb',0):.9f} Wb  "
+                  f"sensor={e.get('foc_sensor_mode')} native_fault={e.get('native_fault')}({e.get('native_fault_name')})")
+            if result == 0 and (e.get('foc_motor_r_ohm',0) <= 0 or e.get('foc_motor_l_h',0) <= 0 or e.get('foc_motor_flux_linkage_wb',0) <= 0):
+                parameter_fail=True
+        except Exception as exc:
+            print(f"M{m} extended telemetry after detect error: {exc}")
+    if result != 0:
+        for m in motors:
+            _print_fault_detail(link,m,f"Detect-All result={result}")
+        return 3
+    if parameter_fail:
+        print("FAIL Detect-All ACK sukses tetapi R/L/flux belum semuanya positif")
+        return 4
+    print("PASS Detect-All: R/L + flux linkage + sensor auto-detect + MCCONF persist tervalidasi.")
+    return 0
 
+# Fungsi _motion_precheck: memvalidasi kondisi minimum sebelum command motor aktif tanpa mewajibkan Hall/encoder pada pure sensorless.
+def _motion_precheck(link: Link, motor: int, force: bool = False, position: bool = False) -> tuple[dict, dict]:
+    # Hapus fault yang memang sudah pulih sebelum memutuskan command harus ditolak.
+    link.clear_fault(motor)
+    time.sleep(0.03)
+    cal=get_cal(link,False)
+    if not cal.get("valid",False):
+        raise RuntimeError("current calibration tidak valid")
+    diag=get_comm_diag(link,0.5)
+    if diag.get('motor_ready') is False:
+        drive=int(diag.get('sampling_drive_flags',diag.get('sampling_contract_flags',0)))
+        raise RuntimeError(
+            f"motor_ready=false; drive_flags={format_sampling_flags(drive)} "
+            f"boot_error={diag.get('boot_error')}. Jalankan 'debug.py startup-check' terlebih dahulu.")
+    ext=get_extended(link,motor)
+    sensor=get_sensor(link,motor)
+    foc_sensor_mode=ext.get("foc_sensor_mode")
+    # FOC_SENSOR_MODE_SENSORLESS = 0 pada ABI VESC. sensor_mode=3 adalah
+    # internal physical mux NO_SENSOR pada firmware F103. Keduanya diterima.
+    pure_sensorless=(foc_sensor_mode==0 or ext.get("sensor_mode")==3)
+    if ext.get("native_fault",0)!=0:
+        raise RuntimeError(f"fault motor aktif: {ext.get('native_fault')} ({ext.get('native_fault_name','?')})")
+    if position and pure_sensorless and not ext.get("observer_valid",False) and not force:
+        raise RuntimeError(
+            "SET_POS pure sensorless dari zero-speed tidak mempunyai referensi posisi rotor absolut. "
+            "Gunakan encoder LEFT atau jalankan motor sampai observer valid; --force hanya untuk eksperimen."
+        )
+    if not pure_sensorless and not force:
+        sensor_ok=bool(sensor.get("detect_success",False))
+        if foc_sensor_mode == 2:  # VESC FOC_SENSOR_MODE_HALL
+            sensor_ok=_hall_table_valid(sensor.get('hall_table',[])) and bool(sensor.get('hall_valid',False))
+        elif foc_sensor_mode in (1,9):  # encoder / encoder AB
+            sensor_ok=bool(ext.get('encoder_synced',False) or ext.get('using_encoder',False) or sensor.get('detect_success',False))
+        if not sensor_ok:
+            raise RuntimeError(
+                f"Mode sensored belum siap (foc_sensor_mode={foc_sensor_mode}, detect_success={sensor.get('detect_success')}, "
+                f"hall_valid={sensor.get('hall_valid')}). Pilih sensorless atau jalankan detect/commission sensor yang sesuai."
+            )
+    return ext,sensor
+
+
+# Fungsi _angle_diff_deg: menghitung selisih sudut terpendek untuk acceptance posisi circular VESC.
+def _angle_diff_deg(a: float, b: float) -> float:
+    d=(float(a)-float(b)) % 360.0
+    if d > 180.0:
+        d -= 360.0
+    return d
+
+
+# Fungsi cmd_motor_test: menguji satu command kontrol standar VESC dengan command-trace dan respons fisik telemetry.
 def cmd_motor_test(link: Link,args: argparse.Namespace)->int:
     require_yes(args,"Motor test")
-    cal=get_cal(link,False)
-    if not cal['valid']: raise RuntimeError("current calibration tidak valid")
-    s=get_sensor(link,args.motor)
-    if not s['success'] and not args.force:
-        raise RuntimeError("sensor belum lulus auto-detect. Jalankan sensor-detect atau gunakan --force dengan risiko sendiri.")
-    link.clear_fault(args.motor); time.sleep(0.05)
+    if args.seconds <= 0.0:
+        raise ValueError("--seconds harus > 0")
+    _motion_precheck(link,args.motor,args.force,position=(args.mode=="position"))
+    link.clear_fault(args.motor)
+    time.sleep(0.05)
+    initial=get_values(link,args.motor,timeout=0.5)
     payload=command_payload(args.mode,args.value)
-    end=time.monotonic()+args.seconds; next_t=0.0
+    expected_cmd=payload[0]
+    end=time.monotonic()+args.seconds
+    next_t=0.0
+    first_send=True
+    max_erpm=0.0
+    min_erpm=abs(float(initial.erpm))
+    max_duty=0.0
+    max_iq=0.0
+    max_iq_ref=0.0
+    max_id_ref=0.0
+    max_pos_move=0.0
+    last=initial
     try:
         while time.monotonic()<end:
             now=time.monotonic()
             if now>=next_t:
-                link.send_std(args.motor,payload); next_t=now+0.02  # 50 Hz command refresh
+                link.send_std(args.motor,payload)
+                next_t=now+0.02  # 50 Hz command refresh seperti aplikasi VESC nyata.
+                if first_send:
+                    time.sleep(0.03)
+                    d=verify_control_accept(link,args.motor,expected_cmd)
+                    print(f"COMMAND: ACCEPTED result={d.get('last_control_result')} raw={d.get('last_control_value_scaled')}")
+                    first_send=False
             try:
-                v=get_values(link,args.motor); print_values(args.motor,v)
-                if v.fault!=0: return 6
+                v=get_values(link,args.motor,timeout=0.08)
+                last=v
+                print_values(args.motor,v)
+                ae=abs(float(v.erpm))
+                max_erpm=max(max_erpm,ae)
+                min_erpm=min(min_erpm,ae)
+                max_duty=max(max_duty,abs(float(v.duty)))
+                max_iq=max(max_iq,abs(float(v.iq)))
+                max_pos_move=max(max_pos_move,abs(_angle_diff_deg(v.position,initial.position)))
+                if v.fault!=0:
+                    print(f"RESULT: FAIL - fault={v.fault} {FAULT_NAMES.get(v.fault,'?')}")
+                    _print_fault_detail(link,args.motor,"fault during motor-test")
+                    return 6
             except TimeoutError:
                 pass
-            time.sleep(0.05)
+            try:
+                ext=get_extended(link,args.motor,timeout=0.05)
+                max_iq_ref=max(max_iq_ref,abs(float(ext.get('iq_target',0.0))))
+                max_id_ref=max(max_id_ref,abs(float(ext.get('id_target',0.0))))
+            except Exception:
+                pass
+            time.sleep(0.02)
     finally:
         link.stop(args.motor)
         link.send_std(args.motor,bytes((COMM_SET_CURRENT,))+be_i32(0))
+        time.sleep(0.05)
+    print(f"PEAK: ERPM={max_erpm:.1f} duty={max_duty:.4f} Iq={max_iq:.2f}A "
+          f"Iq_ref={max_iq_ref:.2f}A Id_ref={max_id_ref:.2f}A pos_move={max_pos_move:.2f}deg")
+
+    if args.mode in ('current','rpm','duty','current-rel'):
+        if max_iq_ref < 0.1 and max_duty < 0.001:
+            print('RESULT: FAIL - command diterima tetapi target/PWM tidak pernah aktif')
+            return 9
+        if max_erpm < 20.0:
+            print('RESULT: FAIL - command aktif tetapi motor tidak membuktikan gerakan >=20 ERPM')
+            return 10
+    elif args.mode == 'position':
+        target_delta=abs(_angle_diff_deg(args.value,initial.position))
+        if target_delta >= 2.0 and max_pos_move < min(2.0,target_delta*0.35):
+            print('RESULT: FAIL - SET_POS diterima tetapi posisi tidak berubah secara terukur')
+            return 11
+        final_error=abs(_angle_diff_deg(args.value,last.position))
+        initial_error=max(0.001,target_delta)
+        print(f"POSITION: initial={initial.position:.2f} target={args.value:.2f} final={last.position:.2f} "
+              f"error {initial_error:.2f}->{final_error:.2f} deg")
+        if target_delta >= 2.0 and final_error >= initial_error and max_pos_move < target_delta*0.5:
+            print('RESULT: FAIL - SET_POS tidak mendekatkan posisi ke target')
+            return 12
+    elif args.mode == 'handbrake':
+        if max_id_ref < 0.1:
+            print('RESULT: FAIL - handbrake diterima tetapi Id lock tidak pernah aktif')
+            return 13
+    elif args.mode == 'brake':
+        if abs(float(initial.erpm)) < 20.0:
+            print('RESULT: FAIL - brake diuji dari kondisi diam; gunakan command brake-test agar ada pre-spin')
+            return 14
+        if max_iq_ref < 0.1:
+            print('RESULT: FAIL - brake diterima tetapi braking Iq tidak pernah aktif')
+            return 15
+        if min_erpm >= abs(float(initial.erpm))*0.85 and min_erpm > 20.0:
+            print('RESULT: FAIL - braking tidak menurunkan |ERPM| secara terukur')
+            return 16
+    print('RESULT: PASS - command diterima dan respons motor terukur')
     return 0
 
 
+# Fungsi cmd_brake_test: membuktikan SET_CURRENT_BRAKE dengan pre-spin RPM lalu mengukur deselerasi nyata.
+def cmd_brake_test(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"Brake test aktif; roda wajib bebas dari lantai")
+    if args.spin_seconds <= 0.0 or args.brake_seconds <= 0.0:
+        raise ValueError("durasi spin/brake harus > 0")
+    _motion_precheck(link,args.motor,args.force,position=False)
+    directions=(1,-1) if args.both_directions else ((1,) if args.direction>0 else (-1,))
+    for direction in directions:
+        link.clear_fault(args.motor)
+        spin_payload=command_payload("rpm",direction*abs(args.erpm))
+        brake_payload=command_payload("brake",abs(args.current))
+        peak=0.0
+        brake_start=0.0
+        brake_min=float('inf')
+        brake_final=0.0
+        max_brake_iq_ref=0.0
+        max_brake_iq=0.0
+        print(f"=== M{args.motor} PRE-SPIN {direction*abs(args.erpm):+.0f} ERPM ===")
+        try:
+            end=time.monotonic()+args.spin_seconds
+            next_cmd=0.0
+            verified=False
+            while time.monotonic()<end:
+                now=time.monotonic()
+                if now>=next_cmd:
+                    link.send_std(args.motor,spin_payload)
+                    next_cmd=now+0.02
+                    if not verified:
+                        time.sleep(0.03)
+                        verify_control_accept(link,args.motor,COMM_SET_RPM)
+                        verified=True
+                v=get_values(link,args.motor,0.08)
+                if v.fault:
+                    _print_fault_detail(link,args.motor,"fault saat brake pre-spin")
+                    raise RuntimeError(f"fault saat pre-spin: {v.fault} {FAULT_NAMES.get(v.fault,'?')}")
+                peak=max(peak,abs(float(v.erpm)))
+                time.sleep(0.015)
+            if peak < args.min_spin_erpm:
+                print(f"FAIL: pre-spin hanya {peak:.1f} ERPM < {args.min_spin_erpm:.1f}")
+                return 21
+
+            print(f"=== M{args.motor} SET_CURRENT_BRAKE {abs(args.current):.2f} A ===")
+            end=time.monotonic()+args.brake_seconds
+            next_cmd=0.0
+            verified=False
+            first=True
+            while time.monotonic()<end:
+                now=time.monotonic()
+                if now>=next_cmd:
+                    link.send_std(args.motor,brake_payload)
+                    next_cmd=now+0.02
+                    if not verified:
+                        time.sleep(0.02)
+                        verify_control_accept(link,args.motor,COMM_SET_CURRENT_BRAKE)
+                        verified=True
+                v=get_values(link,args.motor,0.08)
+                if v.fault:
+                    _print_fault_detail(link,args.motor,"fault saat SET_CURRENT_BRAKE")
+                    raise RuntimeError(f"fault saat brake: {v.fault} {FAULT_NAMES.get(v.fault,'?')}")
+                ae=abs(float(v.erpm))
+                max_brake_iq=max(max_brake_iq,abs(float(v.iq)))
+                if first:
+                    brake_start=ae
+                    first=False
+                brake_min=min(brake_min,ae)
+                brake_final=ae
+                try:
+                    ext=get_extended(link,args.motor,0.04)
+                    max_brake_iq_ref=max(max_brake_iq_ref,abs(float(ext.get('iq_target',0.0))))
+                except Exception:
+                    pass
+                time.sleep(0.015)
+        finally:
+            link.stop(args.motor)
+            time.sleep(0.1)
+        print(f"BRAKE RESULT: peak_spin={peak:.1f} start={brake_start:.1f} min={brake_min:.1f} "
+              f"final={brake_final:.1f} ERPM max_Iq_ref={max_brake_iq_ref:.2f}A max_Iq={max_brake_iq:.2f}A")
+        if max(max_brake_iq_ref,max_brake_iq) < 0.1:
+            print("FAIL: command brake diterima tetapi Iq braking tidak aktif")
+            return 22
+        reference=max(brake_start,peak*0.5)
+        if brake_min > max(args.stop_erpm,reference*0.70):
+            print("FAIL: |ERPM| tidak turun cukup saat brake")
+            return 23
+        print(f"PASS M{args.motor}: brake direction {direction:+d}")
+    return 0
+
+
+# Fungsi cmd_position_test: membuat target relatif yang cukup besar untuk resolusi Hall lalu membuktikan SET_POS.
+def cmd_position_test(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"Position test aktif; roda wajib bebas dari lantai")
+    ext,sensor=_motion_precheck(link,args.motor,args.force,position=True)
+    start=get_values(link,args.motor,0.5)
+    step=abs(args.step)
+    if ext.get('foc_sensor_mode') == 2:
+        pp=max(1,int(ext.get('pole_pairs',sensor.get('pole_pairs',1))))
+        hall_edge=60.0/pp
+        step=max(step,1.25*hall_edge)
+        print(f"Hall resolution approx {hall_edge:.2f} mechanical deg/edge; test step={step:.2f} deg")
+    if args.reverse:
+        step=-step
+    target=start.position+step
+    if not (args.motor==0 and ext.get('foc_sensor_mode') in (1,9)):
+        target%=360.0
+    ns=argparse.Namespace(motor=args.motor,mode='position',value=target,seconds=args.seconds,
+                          yes=True,force=args.force)
+    rc=cmd_motor_test(link,ns)
+    if rc==0:
+        print(f"PASS SET_POS M{args.motor}: {start.position:.2f} -> target {target:.2f} deg")
+    return rc
+
+
+# Fungsi _run_acceptance_motor_test: wrapper internal commissioning agar setiap command memakai validator yang sama.
+def _run_acceptance_motor_test(link: Link,motor: int,mode: str,value: float,seconds: float)->int:
+    print(f"--- M{motor} {mode.upper()} {value:+.4f} ---")
+    ns=argparse.Namespace(motor=motor,mode=mode,value=value,seconds=seconds,yes=True,force=False)
+    return cmd_motor_test(link,ns)
+
+
+# Fungsi cmd_drive_acceptance: commissioning end-to-end Hall autodetect dan seluruh command gerak utama VESC.
+def cmd_drive_acceptance(link: Link,args: argparse.Namespace)->int:
+    require_yes(args,"VESC FULL DRIVE ACCEPTANCE; kedua roda wajib terangkat dan area aman")
+    print("=== A0 STOP + CLEAR FAULT ===")
+    for m in (0,1):
+        link.stop(m); link.clear_fault(m)
+    time.sleep(0.15)
+
+    if not args.skip_calibration:
+        print("=== A1 CURRENT CALIBRATION (50% ZERO-VECTOR) ===")
+        rc=cmd_calibrate(link,argparse.Namespace(timeout=args.cal_timeout,zero_limit=args.zero_limit,out=None))
+        if rc!=0:
+            return rc
+    print("=== A2 STARTUP / READY ===")
+    if cmd_startup_check(link,argparse.Namespace())!=0:
+        return 30
+
+    print("=== A3 VESC DETECT-ALL FOC: R/L + FLUX + SENSOR AUTO + ATOMIC EEPROM ===")
+    da=argparse.Namespace(motor=0,both_local=True,max_power_loss=args.max_power_loss,
+                          min_input_current=args.min_input_current,max_input_current=args.max_input_current,
+                          openloop_erpm=args.detect_openloop_erpm,sl_erpm=args.detect_sl_erpm,
+                          timeout=args.detect_all_timeout,yes=True)
+    rc=cmd_detect_all_foc(link,da)
+    if rc!=0:
+        return 31
+
+    print("=== A4 SENSORLESS REAL-RUN PROOF (SET_CURRENT +/-) ===")
+    for m in (0,1):
+        if cmd_sensor_select(link,argparse.Namespace(motor=m,mode='sensorless'))!=0:
+            return 31+m
+        for val in (abs(args.current),-abs(args.current)):
+            rc=_run_acceptance_motor_test(link,m,'current',val,args.stage_seconds)
+            if rc!=0:
+                print(f"FAIL sensorless M{m} current {val:+.2f} rc={rc}")
+                return 34+m
+
+    print("=== A5 HALL AUTODETECT -> APPLY -> EEPROM -> RUN +/- ===")
+    hargs=argparse.Namespace(motor='both',current=args.hall_current,detect_timeout=args.detect_timeout,
+                             run_current=args.current,run_seconds=args.stage_seconds,
+                             min_erpm=args.min_erpm,require_motion=True,yes=True)
+    rc=cmd_hall_commission(link,hargs)
+    if rc!=0:
+        return rc
+
+    print("=== A6 STANDARD VESC COMMAND MATRIX IN HALL MODE ===")
+    for m in (0,1):
+        print(f"\n##### MOTOR {m} ({'LEFT' if m==0 else 'RIGHT / local ID2'}) #####")
+        # Duty (VESC closed-loop duty semantics), current, current-relative, and RPM both directions.
+        for mode,values in (
+            ('duty',(abs(args.duty),-abs(args.duty))),
+            ('current',(abs(args.current),-abs(args.current))),
+            ('current-rel',(abs(args.current_rel),-abs(args.current_rel))),
+            ('rpm',(abs(args.erpm),-abs(args.erpm))),
+        ):
+            for val in values:
+                rc=_run_acceptance_motor_test(link,m,mode,val,args.stage_seconds)
+                if rc!=0:
+                    print(f"FAIL M{m} {mode} value={val} rc={rc}")
+                    return 40+m
+
+        # Brake harus dibuktikan dari motor yang sedang bergerak, dua arah.
+        bargs=argparse.Namespace(motor=m,erpm=abs(args.erpm),current=abs(args.brake_current),
+                                 spin_seconds=max(1.0,args.stage_seconds),brake_seconds=max(1.0,args.stage_seconds),
+                                 min_spin_erpm=args.min_erpm,stop_erpm=20.0,both_directions=True,
+                                 direction=1,yes=True,force=False)
+        rc=cmd_brake_test(link,bargs)
+        if rc!=0:
+            return 50+m
+
+        # Position: target relatif otomatis dibesarkan minimal 1.25 Hall edge.
+        pargs=argparse.Namespace(motor=m,step=abs(args.position_step),seconds=max(1.5,args.stage_seconds),
+                                 reverse=False,yes=True,force=False)
+        rc=cmd_position_test(link,pargs)
+        if rc!=0:
+            return 60+m
+        pargs.reverse=True
+        rc=cmd_position_test(link,pargs)
+        if rc!=0:
+            return 62+m
+
+        # Handbrake tidak diharapkan berputar: acceptance adalah Id lock benar-benar aktif.
+        rc=_run_acceptance_motor_test(link,m,'handbrake',abs(args.handbrake_current),max(0.5,args.stage_seconds))
+        if rc!=0:
+            return 64+m
+
+    print("=== A7 EXPLICIT EEPROM SAVE / 5-BEEP CUE ===")
+    before_p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),
+                          lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),1.0)
+    before=parse_config_status(before_p)
+    rc=cmd_config_save(link,argparse.Namespace())
+    if rc!=0:
+        return 70
+    after_p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),
+                         lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),1.0)
+    after=parse_config_status(after_p)
+    if int(after.get('sequence',0)) <= int(before.get('sequence',0)):
+        print(f"FAIL EEPROM sequence tidak naik: before={before} after={after}")
+        return 71
+    print("PASS EEPROM transaction. Setelah motor idle, firmware mengantrikan tepat 5 beep untuk save ini.")
+
+    print("=== A8 FINAL STOP / FAULT / HALL READBACK ===")
+    fail=0
+    for m in (0,1):
+        link.stop(m); time.sleep(0.05)
+        v=get_values(link,m); sd=get_sensor(link,m); ext=get_extended(link,m)
+        print_values(m,v)
+        print(f"M{m} hall={sd.get('hall_table')} hall_valid={sd.get('hall_valid')} foc_sensor={ext.get('foc_sensor_mode')}")
+        if v.fault or ext.get('native_fault',0) or ext.get('foc_sensor_mode')!=2 or not _hall_table_valid(sd.get('hall_table',[])):
+            fail+=1
+    if fail:
+        print(f"FULL DRIVE ACCEPTANCE FAIL final_failures={fail}")
+        return 72
+    print("FULL DRIVE ACCEPTANCE PASS: Detect-All (R/L + flux + sensor), sensorless current, Hall autodetect, duty, current, current-rel, RPM, brake, position, handbrake, EEPROM.")
+    return 0
+
+
+# Fungsi _measured_rate_hz: menjalankan operasi measured rate hz sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _measured_rate_hz(timestamps: list[float]) -> float:
     if len(timestamps) < 2:
         return 0.0
@@ -1291,21 +2508,14 @@ def _measured_rate_hz(timestamps: list[float]) -> float:
     return (len(timestamps) - 1) / span if span > 0.0 else 0.0
 
 
+# Fungsi cmd_speed_test: menguji cmd speed test dan memastikan hasilnya sesuai kontrak yang diharapkan.
 def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
     """Active ERPM test with independently measured RT and APP rates."""
     require_yes(args, "Speed test")
     if args.seconds <= 0.0:
         raise ValueError("--seconds harus > 0")
 
-    cal = get_cal(link, False)
-    if not cal["valid"]:
-        raise RuntimeError("current calibration tidak valid")
-    sensor = get_sensor(link, args.motor)
-    if not sensor["success"] and not args.force:
-        raise RuntimeError(
-            "sensor belum lulus auto-detect. Jalankan sensor-detect atau "
-            "gunakan --force dengan risiko sendiri."
-        )
+    _motion_precheck(link,args.motor,args.force,position=False)
 
     initial = get_values(link, args.motor)
     if initial.fault != 0:
@@ -1317,19 +2527,31 @@ def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
     rt_period = 1.0 / 50.0
     app_period = 1.0 / 20.0
     payload = command_payload("rpm", args.erpm)
+    # Variabel command_times: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     command_times: list[float] = []
+    # Variabel rt_times: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     rt_times: list[float] = []
+    # Variabel app_times: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     app_times: list[float] = []
+    # Variabel rt_jitter_ms: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     rt_jitter_ms: list[float] = []
+    # Variabel app_jitter_ms: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     app_jitter_ms: list[float] = []
+    # Variabel rows: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     rows: list[dict] = []
     rt_timeouts = 0
     app_timeouts = 0
     missed_rt_slots = 0
     missed_app_slots = 0
     fault_seen = 0
+    max_motion_erpm = 0.0
+    max_motion_duty = 0.0
+    max_motion_iq = 0.0
+    command_verified = False
+    # Variabel latest_app: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
     latest_app: dict = {}
-    latest_values: Optional[Values] = None
+    # Variabel latest_values: variabel beranotasi yang menyimpan state atau data kerja sesuai konteks tool.
+    latest_values: dict = {}
 
     link.clear_fault(args.motor)
     time.sleep(0.05)
@@ -1360,10 +2582,17 @@ def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
                 rt_jitter_ms.append((now - scheduled) * 1000.0)
                 link.send_std(args.motor, payload)
                 command_times.append(time.monotonic())
+                if not command_verified:
+                    time.sleep(0.003)
+                    verify_control_accept(link,args.motor,COMM_SET_RPM)
+                    command_verified = True
                 try:
-                    latest_values = get_values(link, args.motor, timeout=0.04)
+                    latest_values = get_values_selective(link, args.motor, timeout=0.018)
                     rt_times.append(time.monotonic())
                     rt_ok = True
+                    max_motion_erpm=max(max_motion_erpm,abs(float(latest_values.get("erpm",0.0))))
+                    max_motion_duty=max(max_motion_duty,abs(float(latest_values.get("duty",0.0))))
+                    max_motion_iq=max(max_motion_iq,abs(float(latest_values.get("iq",0.0))))
                 except TimeoutError:
                     rt_timeouts += 1
                 next_rt += rt_period
@@ -1375,7 +2604,7 @@ def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
                 scheduled = next_app
                 app_jitter_ms.append((now - scheduled) * 1000.0)
                 try:
-                    latest_app = get_decoded_adc(link, args.motor, timeout=0.04)
+                    latest_app = get_decoded_adc(link, 0, timeout=0.025)
                     app_times.append(time.monotonic())
                     app_updated = True
                 except TimeoutError:
@@ -1392,14 +2621,14 @@ def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
                 "target_erpm": args.erpm,
                 "rt_ok": int(rt_ok),
                 "app_updated": int(app_updated),
-                "erpm": latest_values.erpm if latest_values else "",
-                "duty": latest_values.duty if latest_values else "",
-                "imotor_a": latest_values.imotor if latest_values else "",
-                "ibatt_a": latest_values.ibatt if latest_values else "",
-                "id_a": latest_values.id if latest_values else "",
-                "iq_a": latest_values.iq if latest_values else "",
-                "vin_v": latest_values.vin if latest_values else "",
-                "fault": latest_values.fault if latest_values else "",
+                "erpm": latest_values.get("erpm", ""),
+                "duty": latest_values.get("duty", ""),
+                "imotor_a": latest_values.get("imotor", ""),
+                "ibatt_a": latest_values.get("ibatt", ""),
+                "id_a": latest_values.get("id", ""),
+                "iq_a": latest_values.get("iq", ""),
+                "vin_v": latest_values.get("vin", ""),
+                "fault": latest_values.get("fault", ""),
                 "app_decoded1": latest_app.get("decoded1", ""),
                 "app_voltage1_v": latest_app.get("voltage1", ""),
                 "app_decoded2": latest_app.get("decoded2", ""),
@@ -1407,8 +2636,8 @@ def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
             }
             rows.append(row)
 
-            if rt_ok and latest_values is not None and latest_values.fault != 0:
-                fault_seen = latest_values.fault
+            if rt_ok and latest_values.get("fault", 0) != 0:
+                fault_seen = int(latest_values.get("fault", 0))
                 break
     finally:
         link.stop(args.motor)
@@ -1435,6 +2664,7 @@ def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
     print(f"mean/max_jitter_ms RT   : {rt_mean_jitter:.3f} / {rt_max_jitter:.3f}")
     print(f"mean/max_jitter_ms APP  : {app_mean_jitter:.3f} / {app_max_jitter:.3f}")
     print(f"fault                   : {fault_seen} ({FAULT_NAMES.get(fault_seen, '?')})")
+    print(f"peak motion             : ERPM={max_motion_erpm:.1f} duty={max_motion_duty:.4f} Iq={max_motion_iq:.2f}A")
 
     if args.csv:
         path = Path(args.csv)
@@ -1454,44 +2684,221 @@ def cmd_speed_test(link: Link, args: argparse.Namespace) -> int:
     if not rates_ok or rt_timeouts or app_timeouts:
         print("RESULT: FAIL - telemetry rate/timeout requirement not met")
         return 8
-    print("RESULT: PASS - RT 50 Hz and APP 20 Hz schedules verified")
+    if max_motion_erpm < 20.0 or (max_motion_duty < 0.001 and max_motion_iq < 0.1):
+        print("RESULT: FAIL - telemetry 50/20 sehat tetapi motor tidak benar-benar bergerak")
+        return 10
+    print("RESULT: PASS - command diterima, motor bergerak, RT 50 Hz dan APP 20 Hz terverifikasi")
     return 0
 
 
+# Fungsi _flatten_debug_row: meratakan telemetry nested menjadi satu baris CSV/JSON tanpa mengubah data sumber.
+def _flatten_debug_row(prefix: str, data: dict, out: dict) -> None:
+    for key,value in data.items():
+        name=f"{prefix}{key}"
+        if isinstance(value,dict):
+            _flatten_debug_row(name+"_",value,out)
+        elif isinstance(value,(list,tuple)):
+            out[name]=";".join(str(x) for x in value)
+        else:
+            out[name]=value
+
+
+# Fungsi _values_to_dict: mengubah paket GET_VALUES menjadi dictionary lengkap untuk logging.
+def _values_to_dict(v: Values) -> dict:
+    return {name:getattr(v,name) for name in v.__dataclass_fields__}
+
+
+# Fungsi cmd_stream_all: melakukan streaming telemetry cepat dan diagnostik raw multi-rate tanpa membebani USART3 dengan paket besar 50 Hz.
+def cmd_stream_all(link: Link,args: argparse.Namespace)->int:
+    """Stream RT VESC 50 Hz + APP ADC 20 Hz + heavy diagnostics at slow rate."""
+    end=time.monotonic()+args.seconds if args.seconds>0 else math.inf
+    rt_period=1.0/max(1.0,args.hz)
+    app_period=1.0/max(1.0,args.app_hz)
+    diag_period=1.0/max(0.2,args.slow_hz)
+    print_period=1.0/max(0.2,args.print_hz)
+    now=time.monotonic()
+    next_rt=now
+    next_app=now
+    next_diag=now
+    next_print=now
+    latest_rt={0:{},1:{}}
+    latest_app={0:{},1:{}}
+    diag_cache={"cal":{},"comm":{},"m0_ext":{},"m1_ext":{},"m0_sensor":{},"m1_sensor":{}}
+    rt_times=[]
+    app_times=[]
+    rt_timeouts=0
+    app_timeouts=0
+    writer=None
+    csv_file=None
+    diag_keys=("cal","comm","m0_ext","m1_ext","m0_sensor","m1_sensor")
+    diag_index=0
+    last_csv_flush=now
+
+    def make_row(ts: float) -> dict:
+        row={"timestamp":datetime.now().isoformat(timespec="milliseconds"),"monotonic_s":ts}
+        for motor in (0,1):
+            _flatten_debug_row(f"m{motor}_rt_",latest_rt[motor],row)
+            _flatten_debug_row(f"m{motor}_app_",latest_app[motor],row)
+            _flatten_debug_row(f"m{motor}_ext_",diag_cache[f"m{motor}_ext"],row)
+            _flatten_debug_row(f"m{motor}_sensor_",diag_cache[f"m{motor}_sensor"],row)
+        _flatten_debug_row("cal_",diag_cache["cal"],row)
+        _flatten_debug_row("comm_",diag_cache["comm"],row)
+        return row
+
+    try:
+        while time.monotonic()<end:
+            now=time.monotonic()
+            due=min(next_rt,next_app,next_diag,next_print)
+            if now<due:
+                time.sleep(min(due-now,0.002))
+                continue
+
+            if now>=next_rt:
+                scheduled=next_rt
+                # Jangan menumpuk slot lama bila terminal/OS sempat terlambat.
+                while next_rt<=now:
+                    next_rt+=rt_period
+                try:
+                    pair = get_values_selective_pair(link, timeout=min(0.030, max(0.012, rt_period * 1.25)))
+                    latest_rt[0] = pair[0]
+                    latest_rt[1] = pair[1]
+                    rt_times.append(time.monotonic())
+                except TimeoutError:
+                    rt_timeouts+=1
+                row=make_row(scheduled)
+                if args.csv:
+                    if writer is None:
+                        csv_file=open(args.csv,"w",newline="")
+                        writer=csv.DictWriter(csv_file,fieldnames=list(row.keys()),extrasaction="ignore")
+                        writer.writeheader()
+                    writer.writerow(row)
+
+            now=time.monotonic()
+            if now>=next_app:
+                while next_app<=now:
+                    next_app+=app_period
+                try:
+                    # APP ADC adalah aplikasi board-level bersama seperti upstream VESC.
+                    # Poll sekali dari node lokal agar 20 Hz tidak digandakan tanpa manfaat.
+                    app = get_decoded_adc(link,0,timeout=min(0.030,max(0.012,app_period*0.60)))
+                    latest_app[0]=app
+                    latest_app[1]=app.copy()
+                    app_times.append(time.monotonic())
+                except TimeoutError:
+                    app_timeouts+=1
+
+            now=time.monotonic()
+            if now>=next_diag:
+                while next_diag<=now:
+                    next_diag+=diag_period
+                # Satu request diagnostik per slot slow-rate. Cara round-robin ini
+                # mencegah burst enam request besar yang sebelumnya menahan scheduler
+                # RT50/App20 puluhan millisecond setiap periode diagnostik.
+                key=diag_keys[diag_index]
+                diag_index=(diag_index+1)%len(diag_keys)
+                try:
+                    if key=="cal":
+                        diag_cache[key]=get_cal(link,False,timeout=0.035)
+                    elif key=="comm":
+                        dp=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                                        lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),0.035)
+                        diag_cache[key]=parse_comm_diag(dp)
+                    elif key.endswith("_ext"):
+                        motor=0 if key.startswith("m0") else 1
+                        diag_cache[key]=get_extended(link,motor,timeout=0.035)
+                    else:
+                        motor=0 if key.startswith("m0") else 1
+                        diag_cache[key]=get_sensor(link,motor,timeout=0.035)
+                except TimeoutError:
+                    pass
+
+            now=time.monotonic()
+            if now>=next_print:
+                while next_print<=now:
+                    next_print+=print_period
+                if csv_file is not None and (now-last_csv_flush)>=0.5:
+                    csv_file.flush()
+                    last_csv_flush=now
+                row=make_row(now)
+                if args.json:
+                    print(json.dumps(row,sort_keys=True,default=str),flush=True)
+                else:
+                    for motor in (0,1):
+                        rt=latest_rt[motor]; app=latest_app[motor]; ext=diag_cache[f"m{motor}_ext"]
+                        name="LEFT" if motor==0 else "RIGHT"
+                        print(
+                            f"{name} I_motor={rt.get('imotor',0.0):+7.2f} I_in={rt.get('ibatt',0.0):+7.2f} "
+                            f"Id/Iq={rt.get('id',0.0):+6.2f}/{rt.get('iq',0.0):+6.2f} "
+                            f"Id_ref/Iq_ref={ext.get('id_target',0.0):+6.2f}/{ext.get('iq_target',0.0):+6.2f} "
+                            f"Vd/Vq={rt.get('vd',0.0):+6.2f}/{rt.get('vq',0.0):+6.2f} "
+                            f"ERPM={rt.get('erpm',0):+7d} duty={rt.get('duty',0.0):+.4f} "
+                            f"pos={rt.get('position',0.0):+8.2f} fault={rt.get('fault',0)} "
+                            f"APP={app.get('decoded1','?')}/{app.get('decoded2','?')}",flush=True)
+                    cd=diag_cache["comm"]
+                    print(
+                        f"rates measured RT={_measured_rate_hz(rt_times):.1f}Hz APP={_measured_rate_hz(app_times):.1f}Hz "
+                        f"timeouts={rt_timeouts}/{app_timeouts} ISRmax={cd.get('isr_total_max_cycles','?')} "
+                        f"UARTerr={cd.get('uart_errors','?')}",flush=True)
+                    print("-",flush=True)
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+
+    rt_hz=_measured_rate_hz(rt_times)
+    app_hz=_measured_rate_hz(app_times)
+    print(f"FINAL RT_DATA={rt_hz:.2f} Hz target={args.hz:.2f}; APP_DATA={app_hz:.2f} Hz target={args.app_hz:.2f}; timeouts={rt_timeouts}/{app_timeouts}")
+    if args.seconds>0 and (rt_hz < args.hz*0.90 or app_hz < args.app_hz*0.90):
+        print("WARN rate aktual di bawah 90% target; cek beban host/USART3 dan gunakan --print-hz lebih rendah.")
+        return 12
+    return 0
+
+
+# Fungsi cmd_monitor: menjalankan operasi cmd monitor sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_monitor(link: Link,args: argparse.Namespace)->int:
     end=time.monotonic()+args.seconds if args.seconds>0 else math.inf
     period=1/max(1.0,args.hz)
     while time.monotonic()<end:
         t0=time.monotonic()
-        for m in (0,1): print_values(m,get_values(link,m))
+        for m in (0,1):
+            print_values(m,get_values(link,m))
         print("-")
         dt=time.monotonic()-t0
-        if dt<period: time.sleep(period-dt)
+        if dt<period:
+            time.sleep(period-dt)
     return 0
 
 
+# Fungsi cmd_test_all: menguji cmd test all dan memastikan hasilnya sesuai kontrak yang diharapkan.
 def cmd_test_all(link: Link,args: argparse.Namespace)->int:
     print("PASS UART/VESC frame: FW response")
     cmd_info(link,args)
-    c=get_cal(link,False); print("CAL:",c)
+    c=get_cal(link,False)
+    print("CAL:",c)
     failures=0
     if not c['done'] or not c['valid']:
-        print("FAIL startup current calibration"); failures+=1
+        print("FAIL startup current calibration")
+        failures+=1
     for m in (0,1):
         try:
-            v=get_values(link,m); print_values(m,v)
-            e=get_extended(link,m); s=get_sensor(link,m)
-            print(" EXT:",e); print(" SENSOR:",s)
-            if v.fault: failures+=1
+            v=get_values(link,m)
+            print_values(m,v)
+            e=get_extended(link,m)
+            s=get_sensor(link,m)
+            print(" EXT:",e)
+            print(" SENSOR:",s)
+            if v.fault:
+                failures+=1
             if c['valid'] and abs(v.id)>args.zero_limit and abs(v.iq)>args.zero_limit:
                 print("WARN residual Id/Iq tinggi saat passive test")
         except Exception as exc:
-            print(f"FAIL motor {m}: {exc}"); failures+=1
+            print(f"FAIL motor {m}: {exc}")
+            failures+=1
     print("PASS passive test-all" if failures==0 else f"FAILURES={failures}")
     return 0 if failures==0 else 7
 
 
 
+# Fungsi _wait_sensor_done: menunggu wait sensor done dengan batas waktu agar tool tidak menggantung tanpa kendali.
 def _wait_sensor_done(link: Link, motor: int, timeout: float) -> dict:
     deadline=time.monotonic()+timeout
     last=None
@@ -1505,6 +2912,7 @@ def _wait_sensor_done(link: Link, motor: int, timeout: float) -> dict:
         time.sleep(0.1)
     raise TimeoutError(f"sensor detect M{motor} timeout")
 
+# Fungsi _run_command_stage: menjalankan operasi run command stage sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def _run_command_stage(link: Link, motor: int, mode: str, value: float, seconds: float) -> Values:
     payload=command_payload(mode,value)
     end=time.monotonic()+seconds
@@ -1531,86 +2939,38 @@ def _run_command_stage(link: Link, motor: int, mode: str, value: float, seconds:
         raise TimeoutError(f"tidak ada telemetry saat stage {mode} M{motor}")
     return last
 
+# Fungsi cmd_full_test: kompatibilitas command lama; Run30 menjalankan acceptance drive yang lebih lengkap.
 def cmd_full_test(link: Link,args: argparse.Namespace)->int:
-    require_yes(args,"FULL ACTIVE COMMISSIONING TEST")
-    print("=== 0. STOP + CLEAR FAULT ===")
-    for m in (0,1):
-        link.stop(m); link.clear_fault(m)
-    time.sleep(0.1)
+    ns=argparse.Namespace(
+        yes=args.yes,
+        skip_calibration=False,
+        current=max(0.5,abs(args.current)),
+        current_rel=0.03,
+        duty=0.05,
+        erpm=abs(args.erpm),
+        brake_current=max(0.8,abs(args.current)),
+        handbrake_current=max(0.5,min(1.0,abs(args.current))),
+        hall_current=1.5,
+        position_step=max(5.0,abs(args.position_step)),
+        stage_seconds=max(1.0,args.stage_seconds),
+        cal_timeout=args.cal_timeout,
+        detect_timeout=max(25.0,args.detect_timeout),
+        zero_limit=args.zero_limit,
+        min_erpm=20.0,
+    )
+    return cmd_drive_acceptance(link,ns)
 
-    print("=== 1. CURRENT ZERO CALIBRATION ===")
-    cal_args=argparse.Namespace(timeout=args.cal_timeout,zero_limit=args.zero_limit)
-    rc=cmd_calibrate(link,cal_args)
-    if rc != 0:
-        return rc
 
-    print("=== 2. RUNTIME SENSOR AUTO-DETECT ===")
-    for m in (0,1):
-        link.clear_fault(m)
-        link.send(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_DETECT,m,SENSOR_AUTO)))
-        d=_wait_sensor_done(link,m,args.detect_timeout)
-        if not d['success'] or d['state'] != DETECT_DONE:
-            print(f"FAIL sensor auto-detect M{m}: {d}")
-            return 8
-        print(f"PASS M{m}: sensor={SENSOR_NAMES.get(d['mode'],d['mode'])}, pole_pairs={d['pole_pairs']}")
-
-    print("=== 3. PASSIVE TELEMETRY ===")
-    for m in (0,1):
-        v=get_values(link,m); e=get_extended(link,m)
-        print_values(m,v); print(" EXT:",e)
-        if v.fault != 0:
-            return 9
-
-    print("=== 4. FAST ISR SAMPLE BUFFER ===")
-    for m in (0,1):
-        tmp=argparse.Namespace(motor=m,count=64,decimation=max(1,args.sample_decimation),timeout=5.0,csv=None)
-        rc=cmd_sample(link,tmp)
-        if rc != 0:
-            return rc
-
-    print("=== 5. LOW CURRENT + / - ===")
-    for m in (0,1):
-        for val in (abs(args.current),-abs(args.current)):
-            print(f"M{m} CURRENT {val:+.3f} A")
-            _run_command_stage(link,m,"current",val,args.stage_seconds)
-
-    if not args.skip_rpm:
-        print("=== 6. LOW RPM + / - ===")
-        for m in (0,1):
-            for val in (abs(args.erpm),-abs(args.erpm)):
-                print(f"M{m} RPM {val:+.0f} eRPM")
-                _run_command_stage(link,m,"rpm",val,args.stage_seconds)
-
-    if args.position_step != 0.0:
-        print("=== 7. POSITION (LEFT only when encoder selected) ===")
-        sd=get_sensor(link,0)
-        if sd['mode']==SENSOR_ENCODER and sd['success']:
-            v0=get_values(link,0)
-            target=(v0.position+args.position_step)%360.0
-            print(f"LEFT POS {v0.position:.2f} -> {target:.2f} deg")
-            _run_command_stage(link,0,"position",target,args.stage_seconds)
-        else:
-            print("SKIP position: LEFT sensor hasil detect bukan encoder")
-
-    print("=== 8. FINAL STOP / FAULT CHECK ===")
-    failures=0
-    for m in (0,1):
-        link.stop(m); time.sleep(0.05)
-        v=get_values(link,m); print_values(m,v)
-        if v.fault != 0: failures += 1
-    if failures:
-        print(f"FULL TEST FAIL: faults={failures}")
-        return 10
-    print("FULL ACTIVE TEST PASS (protocol/firmware-level; verify waveforms/current physically with scope/clamp)")
-    return 0
-
+# Fungsi parse_ping_can: mengurai parse ping can dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_ping_can(p: bytes) -> list[int]:
     if not p or p[0] != COMM_PING_CAN:
         raise ValueError("bukan COMM_PING_CAN")
     return list(p[1:])
 
 
+# Fungsi cmd_can_scan: menjalankan operasi cmd can scan sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_can_scan(link: Link, _args: argparse.Namespace) -> int:
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
     p=link.request(bytes((COMM_PING_CAN,)), lambda x: bool(x) and x[0]==COMM_PING_CAN, 2.0)
     devs=parse_ping_can(p)
     print("VESC Tool-compatible device scan:", devs)
@@ -1620,18 +2980,27 @@ def cmd_can_scan(link: Link, _args: argparse.Namespace) -> int:
     return 0
 
 
+# Fungsi cmd_vesc_tool_dual_basic: menjalankan operasi cmd vesc tool dual basic sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     print("=== VESC TOOL DUAL BASIC PASSIVE CHECK ===")
+    # Fungsi step: menjalankan operasi step sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+    def step(name: str):
+        print(f"[STEP] {name}", flush=True)
     # Direct/root controller.
+    step("M1 COMM_FW_VERSION")
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
     fw1=link.request(bytes((COMM_FW_VERSION,)), lambda x: bool(x) and x[0]==COMM_FW_VERSION, 2.0)
     i1=parse_fw_version(fw1)
     if (i1['major'],i1['minor']) != (6,0):
         raise ValueError(f"root FW ABI {i1['major']}.{i1['minor']} != 6.00")
+    step("M1 COMM_GET_VALUES (includes current_motor/current_in/Id/Iq/Vd/Vq)")
     v1=get_values(link,0)
     if v1.controller_id != 1:
         raise ValueError(f"root GET_VALUES controller_id={v1.controller_id}, expected 1")
 
     # Discovery is exactly what VESC Tool CAN Scan uses.
+    step("M1 COMM_PING_CAN")
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
     ping=link.request(bytes((COMM_PING_CAN,)), lambda x: bool(x) and x[0]==COMM_PING_CAN, 2.0)
     devs=parse_ping_can(ping)
     if devs != [2]:
@@ -1639,20 +3008,78 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
 
     # VESC Tool switches to the discovered node by wrapping requests in
     # COMM_FORWARD_CAN, ID 2. Replies remain normal inner replies.
+    step("M2 forwarded COMM_FW_VERSION")
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
     fw2=link.request_std(1,bytes((COMM_FW_VERSION,)), lambda x: bool(x) and x[0]==COMM_FW_VERSION, 2.0)
     i2=parse_fw_version(fw2)
     if (i2['major'],i2['minor']) != (6,0):
         raise ValueError(f"M2 FW ABI {i2['major']}.{i2['minor']} != 6.00")
     if i2['uuid'] == i1['uuid']:
         raise ValueError("M1/M2 UUID must differ for VESC Tool backup/identity")
-    v2=get_values(link,1)
+    step("M2 forwarded COMM_GET_VALUES")
+    try:
+        v2=get_values(link,1,2.0)
+    except TimeoutError:
+        print("[DIAG] M2 GET_VALUES timed out; requesting COMM_DIAG-v16 on local route...", flush=True)
+        try:
+            dp=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),
+                            # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                            lambda x: len(x)>=3 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG)),1.0)
+            dd=parse_comm_diag(dp)
+            for k in ('revision','last_outer_cmd','last_forward_target','last_forward_inner_cmd',
+                      'last_motor_context','last_reply_cmd','last_tx_ok','get_values_m1','get_values_m2',
+                      'forward_m2_count','forward_m2_reply_count','stack_packet_free_bytes',
+                      'uart_errors','tx_ring_overruns','rx_ring_overruns'):
+                if k in dd:
+                    print(f"  {k:26s}: {dd[k]}")
+        except Exception as diag_exc:
+            print(f"[DIAG] COMM_DIAG unavailable too: {diag_exc}")
+        raise
     if v2.controller_id != 2:
         raise ValueError(f"forwarded GET_VALUES controller_id={v2.controller_id}, expected 2")
 
+    # VESC Tool uses COMM_GET_VALUES_SELECTIVE. Upstream ABI has three
+    # independent tail bits: 19=Vd (4 B), 20=Vq (4 B), 21=status (1 B).
+    # A grouped 19=(Vd,Vq) layout can pass full GET_VALUES yet break the GUI
+    # as soon as it changes the selective mask while polling a CAN-forwarded node.
+    step("M1/M2 COMM_GET_VALUES_SELECTIVE ABI")
+    for motor in (0,1):
+        for bit,field_len in ((2,4),(3,4),(4,4),(5,4),(19,4),(20,4),(21,1)):
+            mask=1 << bit
+            req=bytes((COMM_GET_VALUES_SELECTIVE,))+be_u32(mask)
+            rsp=link.request_std(motor,req,
+                    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                    lambda x: len(x)>=5 and x[0]==COMM_GET_VALUES_SELECTIVE,2.0)
+            if len(rsp) != 1+4+field_len:
+                raise ValueError(f"M{motor+1} selective bit{bit} length={len(rsp)}, "
+                                 f"expected {1+4+field_len}")
+            if int.from_bytes(rsp[1:5],"big") != mask:
+                raise ValueError(f"M{motor+1} selective bit{bit} mask echo mismatch")
+
+    # Repeatedly alternate direct and forwarded FW_VERSION exactly as VESC Tool
+    # does while changing selected devices. This catches leaked motor-thread 2
+    # context: local must always return UUID1 and forwarded ID2 must return UUID2.
+    step("8x local <-> motor2 routing stress")
+    for n in range(8):
+        a=parse_fw_version(link.request(bytes((COMM_FW_VERSION,)),
+                # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                lambda x: bool(x) and x[0]==COMM_FW_VERSION,2.0))
+        b=parse_fw_version(link.request_std(1,bytes((COMM_FW_VERSION,)),
+                # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                lambda x: bool(x) and x[0]==COMM_FW_VERSION,2.0))
+        c=parse_fw_version(link.request(bytes((COMM_FW_VERSION,)),
+                # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+                lambda x: bool(x) and x[0]==COMM_FW_VERSION,2.0))
+        if a['uuid'] != i1['uuid'] or c['uuid'] != i1['uuid'] or b['uuid'] != i2['uuid']:
+            raise ValueError(f"dual route context leak on cycle {n+1}")
+
     # Both configuration read paths must be independently addressable.
+    step("M1/M2 MCCONF + APPCONF read")
     for motor,expected in ((0,1),(1,2)):
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         mc_payload=link.request_std(motor,bytes((COMM_GET_MCCONF,)),lambda x: bool(x) and x[0]==COMM_GET_MCCONF,2.0)
         _validate_vesc6_wire(f"M{motor+1} MCCONF",mc_payload,COMM_GET_MCCONF,VESC6_MCCONF_WIRE_SIZE,VESC6_MCCONF_SIGNATURE)
+        # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
         app_payload=link.request_std(motor,bytes((COMM_GET_APPCONF,)),lambda x: bool(x) and x[0]==COMM_GET_APPCONF,2.0)
         app=_validate_vesc6_wire(f"M{motor+1} APPCONF",app_payload,COMM_GET_APPCONF,VESC6_APPCONF_WIRE_SIZE,VESC6_APPCONF_SIGNATURE)
         if app[4] != expected:
@@ -1662,23 +3089,56 @@ def cmd_vesc_tool_dual_basic(link: Link, _args: argparse.Namespace) -> int:
     print(f"SCAN          : PASS  remote IDs={devs}")
     print(f"M2 FW/UUID/ID : PASS  {i2['major']}.{i2['minor']}  {i2['uuid']}  ID=2")
     print("M1/M2 VALUES  : PASS")
+    print("SELECTIVE ABI : PASS  bits 2=I_motor, 3=I_in, 4=Id, 5=Iq, 19=Vd, 20=Vq, 21=status")
+    print("ROUTE STRESS  : PASS  local/ID2 context stable")
     print("M1/M2 MCCONF  : PASS")
     print("M1/M2 APPCONF : PASS")
     print("PASS: basic VESC Tool dual-controller discovery/routing path is coherent")
     return 0
 
 
-def cmd_motor2_forward(link: Link, _args: argparse.Namespace) -> int:
-    # Board ini tidak memiliki CAN PHY. COMM_FORWARD_CAN ID 2 dipakai seperti
-    # cabang local second-motor pada VESC dual-motor: request diproses oleh
-    # runtime motor kanan di MCU yang sama. Motor-2 tetap diiklankan ke VESC
-    # Tool melalui COMM_PING_CAN agar muncul pada device scan.
-    fw=link.request_std(1,bytes((COMM_FW_VERSION,)),lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.0)
-    d=parse_fw_version(fw)
-    print("RIGHT FW via local COMM_FORWARD_CAN ID 2:",d)
+# Fungsi cmd_rt_data_abi: menjalankan operasi cmd rt data abi sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+def cmd_rt_data_abi(link: Link, args: argparse.Namespace) -> int:
+    motors = (0, 1) if args.motor is None else (args.motor,)
+    for motor in motors:
+        print(f"=== M{motor+1} RT DATA / VESC 6.00 ABI ===")
+        v = get_values(link, motor, 2.0)
+        print(f"I_motor={v.imotor:+.3f} A  I_in={v.ibatt:+.3f} A  Id={v.id:+.3f} A  Iq={v.iq:+.3f} A")
+        print(f"Vd={v.vd:+.3f} V  Vq={v.vq:+.3f} V  ERPM={v.erpm}  duty={v.duty:+.4f}")
+        for bit,name,flen in ((2,'I_motor',4),(3,'I_in',4),(4,'Id',4),(5,'Iq',4),(19,'Vd',4),(20,'Vq',4),(21,'status',1)):
+            mask=1 << bit
+            req=bytes((COMM_GET_VALUES_SELECTIVE,))+be_u32(mask)
+            # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+            rsp=link.request_std(motor,req,lambda x: len(x)>=5 and x[0]==COMM_GET_VALUES_SELECTIVE,2.0)
+            expected=1+4+flen
+            if len(rsp)!=expected or int.from_bytes(rsp[1:5],'big')!=mask:
+                raise ValueError(f"M{motor+1} {name}: selective ABI mismatch len={len(rsp)} expected={expected}")
+            print(f"  bit{bit:02d} {name:8s}: PASS ({flen} byte field)")
+    print("PASS: VESC RT Data current_motor/current_in/Id/Iq/Vd/Vq ABI")
     return 0
 
 
+# Fungsi cmd_motor2_forward: menjalankan operasi cmd motor2 forward sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
+def cmd_motor2_forward(link: Link, _args: argparse.Namespace) -> int:
+    # This is the exact VESC Tool CAN-forwarded firmware-version transaction:
+    # payload [COMM_FORWARD_CAN, 2, COMM_FW_VERSION]. Upstream dual-motor VESC
+    # returns the bare inner COMM_FW_VERSION reply on the same UART transport.
+    inner=bytes((COMM_FW_VERSION,))
+    routed=Link.standard_route(1,inner)
+    print("TX payload:"," ".join(f"{b:02x}" for b in routed))
+    print("TX frame  :"," ".join(f"{b:02x}" for b in frame(routed)))
+    # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
+    fw=link.request(routed,lambda x: bool(x) and x[0]==COMM_FW_VERSION,1.5)
+    print("RX payload:"," ".join(f"{b:02x}" for b in fw))
+    d=parse_fw_version(fw)
+    if d.get("hw_name") != "MOTOR_RIGHT":
+        raise ValueError(f"motor-2 HW name {d.get('hw_name')!r}, expected MOTOR_RIGHT")
+    print("RIGHT FW via local COMM_FORWARD_CAN ID 2:",d)
+    print("PASS: VESC Tool motor-(2) FW_VERSION forwarding path")
+    return 0
+
+
+# Fungsi parse_config_status: mengurai parse config status dari data masukan menjadi representasi yang dapat divalidasi.
 def parse_config_status(p: bytes) -> dict:
     if len(p)<4 or p[:2]!=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)):
         raise ValueError("bukan config status")
@@ -1686,29 +3146,43 @@ def parse_config_status(p: bytes) -> dict:
     return {"valid":bool(r.u8()),"last_save_ok":bool(r.u8()),"sequence":r.u32(),"timeout_ms":r.u32()}
 
 
+# Fungsi cmd_config_status: menjalankan operasi cmd config status sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_config_status(link: Link, _args: argparse.Namespace) -> int:
     p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),
+                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                    lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),1.0)
-    print(parse_config_status(p)); return 0
+    print(parse_config_status(p))
+    return 0
 
 
+# Fungsi cmd_config_save: menjalankan operasi cmd config save sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def cmd_config_save(link: Link, _args: argparse.Namespace) -> int:
     p=link.request(bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_SAVE)),
+                   # Fungsi lambda: fungsi anonim singkat untuk callback, transformasi, atau predikat lokal tanpa menambah state global.
                    lambda x: len(x)>=2 and x[:2]==bytes((COMM_CUSTOM_APP_DATA,CUSTOM_CONFIG_STATUS)),2.0)
-    d=parse_config_status(p); print(d); return 0 if d['last_save_ok'] else 3
+    d=parse_config_status(p)
+    print(d)
+    if d['last_save_ok']:
+        print("EEPROM SAVE: PASS - firmware mengantrikan tepat 5 beep setelah motor idle.")
+    return 0 if d['last_save_ok'] else 3
 
 
+# Fungsi self_test: menguji self test dan memastikan hasilnya sesuai kontrak yang diharapkan.
 def self_test() -> int:
     payload=bytes((COMM_SET_CURRENT,))+be_i32(1234)
     fr=frame(payload)
-    parser=FrameParser(); out=[]
-    for chunk in (fr[:2],fr[2:5],fr[5:]): out.extend(parser.feed(chunk))
+    parser=FrameParser()
+    out=[]
+    for chunk in (fr[:2],fr[2:5],fr[5:]):
+        out.extend(parser.feed(chunk))
     assert out==[payload]
     assert crc16(b"123456789")==0x31C3
     assert Link.standard_route(0,payload)==payload
     assert Link.standard_route(1,payload)==bytes((COMM_FORWARD_CAN,2))+payload
     assert parse_ping_can(bytes((COMM_PING_CAN,2))) == [2]
     assert parse_ping_can(bytes((COMM_PING_CAN,))) == []
+    assert COMM_GET_DECODED_ADC == 32, "ABI VESC: COMM_GET_DECODED_ADC wajib 32"
+    assert COMM_GET_VALUES_SELECTIVE == 50, "ABI VESC: COMM_GET_VALUES_SELECTIVE wajib 50"
     assert abs(_measured_rate_hz([i * 0.02 for i in range(100)]) - 50.0) < 1e-9
     assert abs(_measured_rate_hz([i * 0.05 for i in range(40)]) - 20.0) < 1e-9
     fw=(bytes((COMM_FW_VERSION,6,0))+b"HOVERBOARD_DUAL_FOC\x00"+bytes(range(12))+
@@ -1739,10 +3213,39 @@ def self_test() -> int:
         "decoded2": 0.75, "voltage2": 2.475,
     }
 
+    # Uji parser RT selective standar VESC yang dipakai scheduler 50 Hz.
+    selective = bytearray((COMM_GET_VALUES_SELECTIVE,))
+    selective += be_u32(RT_SELECTIVE_MASK)
+    selective += be_i32(125)       # I_motor = 1.25 A
+    selective += be_i32(-50)       # I_in = -0.50 A
+    selective += be_i32(10)        # Id = 0.10 A
+    selective += be_i32(200)       # Iq = 2.00 A
+    selective += be_i16(125)       # duty = 0.125
+    selective += be_i32(900)       # ERPM
+    selective += be_i16(452)       # Vin = 45.2 V
+    selective += bytes((0,))       # fault NONE
+    selective += be_i32(12_500_000) # position = 12.5 deg
+    selective += bytes((2,))       # controller ID 2
+    selective += be_i32(1500)      # Vd = 1.5 V
+    selective += be_i32(3250)      # Vq = 3.25 V
+    selective += bytes((1,))       # status
+    rt = parse_values_selective(bytes(selective))
+    assert abs(rt["imotor"] - 1.25) < 1e-9
+    assert abs(rt["ibatt"] + 0.50) < 1e-9
+    assert abs(rt["id"] - 0.10) < 1e-9 and abs(rt["iq"] - 2.0) < 1e-9
+    assert abs(rt["duty"] - 0.125) < 1e-9 and rt["erpm"] == 900
+    assert abs(rt["vin"] - 45.2) < 1e-9 and rt["controller_id"] == 2
+    assert abs(rt["position"] - 12.5) < 1e-9
+    assert abs(rt["vd"] - 1.5) < 1e-9 and abs(rt["vq"] - 3.25) < 1e-9
+
+    # Uji topologi Hall enam-state; urutan sudut mengikuti Gray-code 2-3-1-5-4-6.
+    assert _hall_table_valid([255, 66, 0, 33, 133, 100, 166, 255])
+    assert not _hall_table_valid([255, 0, 33, 66, 100, 133, 166, 255])
+
     # Current-cal revision 17 remains exactly within the 512-byte firmware
     # payload and exposes robust-filter/MOE state without changing its prefix.
     cpay = bytearray((COMM_CUSTOM_APP_DATA, CUSTOM_CURRENT_CAL, 1, 1))
-    cpay += struct.pack(">II", 6096, 6096)
+    cpay += struct.pack(">II", 2000, 2000)
     for value in (2669, 2659, 1954, 2616, 2604, 1985):
         cpay += be_i32(value)
     cpay += struct.pack(">IHH", 1_659_009, 6, 0)
@@ -1803,10 +3306,12 @@ def self_test() -> int:
     spay=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_SENSOR_INFO,0,1,SENSOR_HALL,0,DETECT_FAILED,0,15,0))
     spay += be_u16(0)
     spay += bytes((255,0,133,166,66,33,100,255))
-    for a in (0,0,43688,54610,21844,10922,32766,0): spay += be_u16(a)
+    for a in (0,0,43688,54610,21844,10922,32766,0):
+        spay += be_u16(a)
     spay += bytes((15,))
     spay += be_i32(300)+be_i32(0)+be_i32(0)+be_i32(0)
-    for _ in range(8): spay += be_i32(0)
+    for _ in range(8):
+        spay += be_i32(0)
     spay += bytes((255,255,255,255,255,255,255,255))
     spay += be_u16(2773)+be_u16(2702)+be_u16(1948)
     spay += be_i32(0)+be_i32(0)+be_i32(0)
@@ -1817,16 +3322,36 @@ def self_test() -> int:
     assert sd['pwm_enable_pending_events']==2 and sd['pwm_enable_blank_cycles']==8
     assert sd['tim8_rcr']==1 and sd['adc_motor_phase_offset_ticks']==120
 
+    # Sensor-info revisi 17 membawa state startup sensorless/Hall agar test
+    # hardware dapat membedakan forced-openloop, observer lock, dan Hall valid.
+    spay17=bytearray(spay)
+    spay17[36]=17
+    spay17 += bytes((2,0))  # foc_sensor_mode=Hall, zero sensorless failures
+    spay17 += bytes((1,1)) + be_i32(180) + bytes((1,)) + be_i32(175)
+    spay17 += bytes((3,1,1)) + be_u16(0) + be_u16(0)
+    sd17=parse_sensor(bytes(spay17))
+    assert sd17['diag_revision']==17 and sd17['foc_sensor_mode']==2
+    assert sd17['openloop_started'] and sd17['phase_observer_override']
+    assert sd17['openloop_erpm_now']==180 and sd17['observer_valid']
+    assert sd17['observer_erpm']==175 and sd17['hall_raw_live']==3 and sd17['hall_valid']
+    assert sd17['hall_direction']==1 and sd17['hall_invalid_count']==0
+    assert sd17['hall_sequence_error_count']==0
+
     # Extended telemetry revision 6: phase currents are inserted before dq.
     epay=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_EXT_TELEMETRY,0,6,1,SENSOR_HALL,0,0,1,1,5,15,0))
-    for v in (1100,-2200,1100): epay += be_i32(v)
+    for v in (1100,-2200,1100):
+        epay += be_i32(v)
     core=(300,400,310,390,5000,6000,700,800,900,1000,1100,1200,48000,12345)
-    for v in core: epay += be_i32(v)
-    for v in (2000,2001,2002): epay += be_i32(v)
-    for v in (100,1000,7200,3): epay += struct.pack(">I",v)
+    for v in core:
+        epay += be_i32(v)
+    for v in (2000,2001,2002):
+        epay += be_i32(v)
+    for v in (100,1000,7200,3):
+        epay += struct.pack(">I",v)
     epay += be_i32(42)+be_u16(1234)
     epay += bytes((1,1,1))
-    for v in (45000,1234,99000,25000,50000,1000,35000,1800,2500,3000,600): epay += be_i32(v)
+    for v in (45000,1234,99000,25000,50000,1000,35000,1800,2500,3000,600):
+        epay += be_i32(v)
     epay += struct.pack(">II",16000,1000)
     ed=parse_extended(bytes(epay))
     assert ed['revision']==6 and abs(ed['phase_current_a']-1.1)<1e-9
@@ -1847,70 +3372,131 @@ def self_test() -> int:
 
     # COMM_DIAG revision 7: local motor-2 forwarding is distinct from physical CAN.
     dpay=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,7))
-    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): dpay += struct.pack(">I",v)
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200):
+        dpay += struct.pack(">I",v)
     dpay += bytes((2,1,1))
     dd=parse_comm_diag(bytes(dpay))
     assert dd['motor2_forwards']==20 and dd['unsupported_forward_ids']==21 and dd['baud']==115200
 
     d9=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,9))
-    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d9 += struct.pack(">I",v)
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200):
+        d9 += struct.pack(">I",v)
     d9 += bytes((2,1,1))
-    for v in (31,32,33,34,35): d9 += struct.pack(">I",v)
-    d9 += bytes((1,1,1,1)); d9 += struct.pack(">II",41,42); d9 += bytes((1,0))
-    for v in (51,52,53,54): d9 += struct.pack(">I",v)
+    for v in (31,32,33,34,35):
+        d9 += struct.pack(">I",v)
+    d9 += bytes((1,1,1,1))
+    d9 += struct.pack(">II",41,42)
+    d9 += bytes((1,0))
+    for v in (51,52,53,54):
+        d9 += struct.pack(">I",v)
     dd9=parse_comm_diag(bytes(d9))
     assert dd9['config_integrity_ok'] and dd9['config_integrity_checks']==41 and dd9['config_integrity_failures']==42
     assert dd9['power_hold'] and not dd9['shutdown_latched'] and dd9['heartbeat_comm']==54
 
     d10=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,10))
-    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d10 += struct.pack(">I",v)
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200):
+        d10 += struct.pack(">I",v)
     d10 += bytes((2,1,1))
-    for v in (31,32,33,34,35): d10 += struct.pack(">I",v)
-    d10 += bytes((1,1,1,1)); d10 += struct.pack(">II",41,42); d10 += bytes((1,0))
-    for v in (51,52,53,54): d10 += struct.pack(">I",v)
-    for v in (61,62,63,64,65,66): d10 += struct.pack(">I",v)
+    for v in (31,32,33,34,35):
+        d10 += struct.pack(">I",v)
+    d10 += bytes((1,1,1,1))
+    d10 += struct.pack(">II",41,42)
+    d10 += bytes((1,0))
+    for v in (51,52,53,54):
+        d10 += struct.pack(">I",v)
+    for v in (61,62,63,64,65,66):
+        d10 += struct.pack(">I",v)
     d10 += struct.pack(">HH",777,888)
     dd10=parse_comm_diag(bytes(d10))
     assert dd10['watchdog_unhealthy_mask']==61 and dd10['watchdog_miss_comm']==64
     assert dd10['sample_clamp_left']==65 and dd10['sample_clamp_right']==66
     assert dd10['sample_margin_left_q15']==777 and dd10['sample_margin_right_q15']==888
 
-    d14=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,14))
-    for v in (11,12,13,14,15,16,17,18,19,20,21,115200): d14 += struct.pack(">I",v)
+    d14=bytearray((COMM_CUSTOM_APP_DATA,CUSTOM_COMM_DIAG,15))
+    for v in (11,12,13,14,15,16,17,18,19,20,21,115200):
+        d14 += struct.pack(">I",v)
     d14 += bytes((2,1,1))
-    for v in (31,32,33,34,35): d14 += struct.pack(">I",v)
-    d14 += bytes((1,1,1,1)); d14 += struct.pack(">II",41,42); d14 += bytes((1,0))
-    for v in (51,52,53,54,55): d14 += struct.pack(">I",v)
-    for v in (61,62,63,64,65): d14 += struct.pack(">I",v)
+    for v in (31,32,33,34,35):
+        d14 += struct.pack(">I",v)
+    d14 += bytes((1,1,1,1))
+    d14 += struct.pack(">II",41,42)
+    d14 += bytes((1,0))
+    for v in (51,52,53,54,55):
+        d14 += struct.pack(">I",v)
+    for v in (61,62,63,64,65):
+        d14 += struct.pack(">I",v)
     d14 += bytes((2,))
     d14 += struct.pack(">IIHH",66,67,777,888)
     d14 += struct.pack(">HHHHhhh",1000,2000,1100,2200,100,-200,300)
     d14 += bytes((0,1,1,0,1,2))
-    for v in (0,1234,9,3990,4010,4096,3072): d14 += struct.pack(">I",v)
+    for v in (0,1234,9,3990,4010,4096,3072):
+        d14 += struct.pack(">I",v)
     d14 += struct.pack(">HHHHHHH",500,400,300,200,600,700,3)
-    d14 += struct.pack(">II",4,5)
+    d14 += struct.pack(">IIIII",4,5,6,100,0)
     dd14=parse_comm_diag(bytes(d14))
     assert dd14['sampling_contract_flags']==0 and dd14['isr_total_max_cycles']==1234
     assert dd14['heap_min_ever_bytes']==3072 and dd14['tx_queue_high_water']==3
     assert dd14['tx_queue_busy_drops']==4 and dd14['tx_low_priority_drops']==5
+    assert dd14['rx_restarts']==6 and dd14['boot_stage']==100 and dd14['boot_error']==0
+
+    d16=bytearray(d14)
+    d16[2]=16
+    d16 += bytes((4,2,4,2,4,1,1,1,7,0))
+    d16 += struct.pack(">IIIIHI", 11,12,13,14,1976,12345)
+    d16 += bytes((1,0,6,2))
+    d16 += struct.pack(">HHHiiiiiiii", 2050,2040,1980,2000,2010,1990,100,200,-50,1600,450)
+    dd16=parse_comm_diag(bytes(d16))
+    assert dd16['last_forward_target']==2 and dd16['last_forward_inner_cmd']==4
+    assert dd16['get_values_m2']==12 and dd16['forward_m2_reply_count']==14
+    assert dd16['buzzer_hz']==1976 and dd16['fault_snapshot_fault']==6
+
+    d17=bytearray(d16)
+    d17[2]=17
+    d17 += bytes((COMM_SET_CURRENT,1,1,0))
+    d17 += struct.pack(">iII", 2500, 77, 3)
+    dd17=parse_comm_diag(bytes(d17))
+    assert dd17['last_control_cmd']==COMM_SET_CURRENT and dd17['last_control_motor']==1
+    assert dd17['last_control_result']==1 and dd17['last_control_app_reject']==0
+    assert dd17['last_control_value_scaled']==2500 and dd17['control_accept_count']==77
+    assert dd17['control_reject_count']==3
+
+    d18=bytearray(d17)
+    d18[2]=18
+    d18 += bytes((1,1,0,1,1,0))
+    d18 += struct.pack(">III", 0, (1 << 20), 2)
+    dd18=parse_comm_diag(bytes(d18))
+    assert dd18['motor_ready'] and dd18['cal_valid_runtime']
+    assert dd18['sampling_drive_flags']==0 and dd18['sampling_boot_flags']==(1 << 20)
+    assert dd18['motor_ready_recovery_count']==2
+    assert decode_sampling_flags(1 << 20)==['TRIGGER_ROUTE']
+
+    bz=bytes((COMM_CUSTOM_APP_DATA,CUSTOM_BUZZER_TEST,1,1,1,1,3))+struct.pack(">HI",1319,1234)
+    bzd=parse_buzzer_status(bz)
+    assert bzd['accepted'] and bzd['melody_active'] and bzd['hz']==1319 and bzd['remaining']==1234
 
     print("SELF-TEST PASS: CRC/framing, VESC-6.00 FW/config, local-ID2 forwarding, "
-          "sample/ADC parser, current-cal-v17 robust/MOE ABI, EXT-v6 telemetry, "
-          "COMM_DIAG-v14 resources, sensor/observer diagnostics")
+          "sample/ADC parser, current-cal-v19 midpoint/MOE ABI, EXT-v6 telemetry, "
+          "COMM_DIAG-v18 readiness/recovery + command acceptance/reject + current/buzzer trace, resources/boot, sensor/observer diagnostics")
     return 0
 
+# Fungsi add_live_args: menjalankan operasi add live args sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
 def add_live_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--port",default="/dev/ttyUSB0")
     p.add_argument("--baud",type=int,default=115200)
 
 
+# Fungsi main: menjalankan alur utama tool dari validasi argumen sampai pelaporan hasil.
 def main() -> int:
     ap=argparse.ArgumentParser(description="STM32F103 dual VESC-like FOC debug/commissioning")
     ap.add_argument("--self-test",action="store_true",help="test Python protocol code without serial hardware")
     sub=ap.add_subparsers(dest="cmd")
 
+    # Fungsi sp: menjalankan operasi sp sesuai tanggung jawab tool dengan input yang diperiksa dan hasil yang konsisten.
     def sp(name,func,help):
-        p=sub.add_parser(name,help=help); add_live_args(p); p.set_defaults(func=func); return p
+        p=sub.add_parser(name,help=help)
+        add_live_args(p)
+        p.set_defaults(func=func)
+        return p
 
     sp("info",cmd_info,"read and fully parse VESC firmware version")
     p=sp("vesc-tool-check",cmd_vesc_tool_check,"verify VESC Tool 6.00 FW + MCCONF/APPCONF read path; optional byte-exact write-back")
@@ -1919,29 +3505,152 @@ def main() -> int:
     p.add_argument("--write-back",action="store_true",help="also SET the exact read config and require ACK/readback")
     p.add_argument("--write-timeout",type=float,default=5.0)
     p.add_argument("--yes",action="store_true",help="required with --write-back")
-    p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic"); p.add_argument("--timeout",type=float,default=0.5); p.add_argument("--attempts",type=int,default=5)
-    p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake"); p.add_argument("--bauds",default="115200,230400,250000,460800,921600"); p.add_argument("--timeout",type=float,default=0.6)
-    sp("comm-diag",cmd_comm_diag,"read firmware USART3 IRQ/ring diagnostics")
+    p=sp("handshake",cmd_handshake,"raw COMM_FW_VERSION TX/RX diagnostic")
+    p.add_argument("--timeout",type=float,default=0.5)
+    p.add_argument("--attempts",type=int,default=5)
+    p=sp("baud-scan",cmd_baud_scan,"scan common UART baud rates for VESC handshake")
+    p.add_argument("--bauds",default="115200,230400,250000,460800,921600")
+    p.add_argument("--timeout",type=float,default=0.6)
+    sp("comm-diag",cmd_comm_diag,"read firmware USART3 DMA/IRQ/RTOS diagnostics")
+    p=sp("fault-detail",cmd_fault_detail,"decode standard DRV fault into native ADC/ISR fault plus snapshot")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    sp("startup-check",cmd_startup_check,"passive readiness gate: boot/sampling/calibration/fault/melody before motor test")
+    p=sp("buzzer-test",cmd_buzzer_test,"read buzzer status or stop tone; power-on melody and fault-code buzzer are automatic only")
+    p.add_argument("--mode",choices=["status","stop"],default="status")
     sp("can-scan",cmd_can_scan,"VESC Tool-compatible COMM_PING_CAN scan; must discover local motor-2 ID 2")
     sp("vesc-tool-dual-basic",cmd_vesc_tool_dual_basic,"passive end-to-end VESC Tool dual-controller discovery/routing/config check")
+    p=sp("rt-data-abi",cmd_rt_data_abi,"verify VESC RT Data I_motor/I_in/Id/Iq/Vd/Vq full + selective ABI")
+    p.add_argument("--motor",type=int,choices=[0,1])
     sp("motor2-forward",cmd_motor2_forward,"verify local second-motor forwarding ID 2 with FW_VERSION")
     sp("config-status",cmd_config_status,"read flash-emulated persistent config status")
     sp("config-save",cmd_config_save,"save runtime Hall/encoder/PID/timeout config to flash")
-    p=sp("status",cmd_status,"standard VESC telemetry + extended telemetry"); p.add_argument("--motor",type=int,choices=[0,1])
-    p=sp("monitor",cmd_monitor,"monitor both motors"); p.add_argument("--hz",type=float,default=5); p.add_argument("--seconds",type=float,default=10)
-    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration and write TXT only"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default calibration_debug_TIMESTAMP.txt")
-    p=sp("diagnose",cmd_diagnose,"full passive diagnostic; writes one TXT report"); p.add_argument("--timeout",type=float,default=8); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--out",help="TXT output path; default vesc_f103_full_debug_TIMESTAMP.txt")
-    p=sp("sensor-info",cmd_sensor_info,"show runtime Hall/encoder state"); p.add_argument("--motor",type=int,choices=[0,1])
-    p=sp("sensor-select",cmd_sensor_select,"live switch Hall/encoder while stopped"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["hall","encoder"],required=True)
-    p=sp("detect-encoder",cmd_detect_encoder_standard,"ACTIVE standard VESC COMM_DETECT_ENCODER; does not auto-apply"); p.add_argument("--motor",type=int,choices=[0],default=0); p.add_argument("--current",type=float,default=0.5); p.add_argument("--timeout",type=float,default=35.0); p.add_argument("--yes",action="store_true")
-    p=sp("detect-hall",cmd_detect_hall_standard,"ACTIVE standard VESC COMM_DETECT_HALL_FOC; does not auto-apply"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--current",type=float,default=0.5); p.add_argument("--timeout",type=float,default=25.0); p.add_argument("--yes",action="store_true")
-    p=sp("sensor-detect",cmd_sensor_detect,"VESC-style blocking Hall/encoder detect; writes TXT"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto"); p.add_argument("--current",type=float,default=0.5,help="diagnostic detect current in A (0.2..2.0, default 0.5)"); p.add_argument("--timeout",type=float,default=25); p.add_argument("--out",help="TXT output path; default vesc_f103_sensor_detect_TIMESTAMP.txt"); p.add_argument("--yes",action="store_true")
-    p=sp("rotor",cmd_rotor,"stream COMM_ROTOR_POSITION"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=list(DISPLAY_MODES),default="encoder"); p.add_argument("--seconds",type=float,default=5)
-    p=sp("sample",cmd_sample,"capture fast FOC samples from ISR buffer"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--count",type=int,default=128); p.add_argument("--decimation",type=int,default=8); p.add_argument("--timeout",type=float,default=8); p.add_argument("--csv"); p.add_argument("--raw",action="store_true")
-    p=sp("detect-rl",cmd_detect_rl,"ACTIVE standard VESC FOC R/L detection"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--timeout",type=float,default=15.0); p.add_argument("--yes",action="store_true")
-    p=sp("detect-flux",cmd_detect_flux,"ACTIVE standard VESC flux-linkage detection"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--current",type=float,default=1.0); p.add_argument("--resistance",type=float,required=True); p.add_argument("--min-erpm",type=float,default=1800.0); p.add_argument("--duty",type=float,default=0.2); p.add_argument("--openloop",action="store_true"); p.add_argument("--erpm-per-sec",type=float,default=2000.0); p.add_argument("--inductance",type=float,default=0.00005); p.add_argument("--timeout",type=float,default=20.0); p.add_argument("--yes",action="store_true")
-    p=sp("detect-all-foc",cmd_detect_all_foc,"ACTIVE standard VESC Detect All FOC and persist result"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--max-power-loss",type=float,default=50.0); p.add_argument("--min-input-current",type=float,default=-20.0); p.add_argument("--max-input-current",type=float,default=20.0); p.add_argument("--openloop-erpm",type=float,default=3000.0); p.add_argument("--sl-erpm",type=float,default=2500.0); p.add_argument("--timeout",type=float,default=60.0); p.add_argument("--yes",action="store_true")
-    p=sp("motor-test",cmd_motor_test,"active current/brake/rpm/duty/position test at 50 Hz command refresh"); p.add_argument("--motor",type=int,choices=[0,1],required=True); p.add_argument("--mode",choices=["current","brake","rpm","duty","position"],required=True); p.add_argument("--value",type=float,required=True); p.add_argument("--seconds",type=float,default=2); p.add_argument("--yes",action="store_true"); p.add_argument("--force",action="store_true")
+    p=sp("status",cmd_status,"standard VESC telemetry + extended telemetry")
+    p.add_argument("--motor",type=int,choices=[0,1])
+    p=sp("monitor",cmd_monitor,"monitor standard GET_VALUES both motors")
+    p.add_argument("--hz",type=float,default=5)
+    p.add_argument("--seconds",type=float,default=10)
+    p=sp("stream-all",cmd_stream_all,"stream RT Data standar VESC 50 Hz + App ADC 20 Hz + diagnostik raw")
+    p.add_argument("--hz",type=float,default=50.0,help="RT Data COMM_GET_VALUES_SELECTIVE rate; default 50 Hz")
+    p.add_argument("--app-hz",type=float,default=20.0,help="App Data COMM_GET_DECODED_ADC rate; default 20 Hz")
+    p.add_argument("--slow-hz",type=float,default=0.5,help="round-robin diagnostic request rate; low default protects RT50/App20")
+    p.add_argument("--print-hz",type=float,default=10.0,help="console print rate; acquisition remains 50/20 Hz")
+    p.add_argument("--seconds",type=float,default=0.0,help="0 = continuous until Ctrl-C")
+    p.add_argument("--csv",help="optional CSV output path")
+    p.add_argument("--json",action="store_true",help="print each sample as JSON instead of text")
+    p=sp("calibrate",cmd_calibrate,"re-run zero-current calibration and write TXT only")
+    p.add_argument("--timeout",type=float,default=8)
+    p.add_argument("--zero-limit",type=float,default=0.30)
+    p.add_argument("--out",help="TXT output path; default calibration_debug_TIMESTAMP.txt")
+    p=sp("diagnose",cmd_diagnose,"full passive diagnostic; writes one TXT report")
+    p.add_argument("--timeout",type=float,default=8)
+    p.add_argument("--zero-limit",type=float,default=0.30)
+    p.add_argument("--out",help="TXT output path; default vesc_f103_full_debug_TIMESTAMP.txt")
+    p=sp("sensor-info",cmd_sensor_info,"show runtime Hall/encoder state")
+    p.add_argument("--motor",type=int,choices=[0,1])
+    p=sp("sensor-select",cmd_sensor_select,"live switch sensorless/Hall/encoder while stopped")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--mode",choices=["sensorless","hall","encoder"],required=True)
+    p=sp("detect-encoder",cmd_detect_encoder_standard,"ACTIVE standard VESC COMM_DETECT_ENCODER; does not auto-apply")
+    p.add_argument("--motor",type=int,choices=[0],default=0)
+    p.add_argument("--current",type=float,default=0.5)
+    p.add_argument("--timeout",type=float,default=35.0)
+    p.add_argument("--yes",action="store_true")
+    p=sp("detect-hall",cmd_detect_hall_standard,"ACTIVE standard VESC COMM_DETECT_HALL_FOC; does not auto-apply")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--current",type=float,default=1.5)
+    p.add_argument("--timeout",type=float,default=25.0)
+    p.add_argument("--yes",action="store_true")
+    p=sp("sensor-detect",cmd_sensor_detect,"VESC-style blocking Hall/encoder detect; writes TXT")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--mode",choices=["auto","hall","encoder"],default="auto")
+    p.add_argument("--current",type=float,default=1.5,help="Hall/encoder detect current in A (0.2..2.0, default 1.5)")
+    p.add_argument("--timeout",type=float,default=25)
+    p.add_argument("--out",help="TXT output path; default vesc_f103_sensor_detect_TIMESTAMP.txt")
+    p.add_argument("--yes",action="store_true")
+    p=sp("rotor",cmd_rotor,"stream COMM_ROTOR_POSITION")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--mode",choices=list(DISPLAY_MODES),default="encoder")
+    p.add_argument("--seconds",type=float,default=5)
+    p=sp("sample",cmd_sample,"capture fast FOC samples from ISR buffer")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--count",type=int,default=128)
+    p.add_argument("--decimation",type=int,default=8)
+    p.add_argument("--timeout",type=float,default=8)
+    p.add_argument("--csv")
+    p.add_argument("--raw",action="store_true")
+    p=sp("detect-rl",cmd_detect_rl,"ACTIVE standard VESC FOC R/L detection")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--timeout",type=float,default=15.0)
+    p.add_argument("--yes",action="store_true")
+    p=sp("detect-flux",cmd_detect_flux,"ACTIVE standard VESC flux-linkage detection")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--current",type=float,default=1.0)
+    p.add_argument("--resistance",type=float,required=True)
+    p.add_argument("--min-erpm",type=float,default=1800.0)
+    p.add_argument("--duty",type=float,default=0.2)
+    p.add_argument("--openloop",action="store_true")
+    p.add_argument("--erpm-per-sec",type=float,default=2000.0)
+    p.add_argument("--inductance",type=float,default=0.00005)
+    p.add_argument("--timeout",type=float,default=20.0)
+    p.add_argument("--yes",action="store_true")
+    p=sp("detect-all-foc",cmd_detect_all_foc,"ACTIVE standard VESC Detect All FOC and persist result")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--max-power-loss",type=float,default=50.0)
+    p.add_argument("--min-input-current",type=float,default=-20.0)
+    p.add_argument("--max-input-current",type=float,default=20.0)
+    p.add_argument("--openloop-erpm",type=float,default=3000.0)
+    p.add_argument("--sl-erpm",type=float,default=2500.0)
+    p.add_argument("--timeout",type=float,default=120.0)
+    p.add_argument("--both-local",action="store_true",help="M0 only: detect and atomically persist both local motors (ID1 + forwarded ID2)")
+    p.add_argument("--yes",action="store_true")
+    p=sp("motor-test",cmd_motor_test,"active current/brake/rpm/duty/position test at 50 Hz command refresh")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--mode",choices=["current","brake","rpm","duty","position","handbrake","current-rel"],required=True)
+    p.add_argument("--value",type=float,required=True)
+    p.add_argument("--seconds",type=float,default=2)
+    p.add_argument("--yes",action="store_true")
+    p.add_argument("--force",action="store_true")
+    p=sp("brake-test",cmd_brake_test,"ACTIVE pre-spin then SET_CURRENT_BRAKE with measured deceleration")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--erpm",type=float,default=300.0)
+    p.add_argument("--current",type=float,default=1.0)
+    p.add_argument("--spin-seconds",type=float,default=1.5)
+    p.add_argument("--brake-seconds",type=float,default=1.5)
+    p.add_argument("--min-spin-erpm",type=float,default=20.0)
+    p.add_argument("--stop-erpm",type=float,default=20.0)
+    p.add_argument("--direction",type=int,choices=[-1,1],default=1)
+    p.add_argument("--both-directions",action="store_true")
+    p.add_argument("--yes",action="store_true")
+    p.add_argument("--force",action="store_true")
+    p=sp("position-test",cmd_position_test,"ACTIVE relative SET_POS test; Hall step auto-sized to sensor resolution")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--step",type=float,default=5.0)
+    p.add_argument("--seconds",type=float,default=2.0)
+    p.add_argument("--reverse",action="store_true")
+    p.add_argument("--yes",action="store_true")
+    p.add_argument("--force",action="store_true")
+    p=sp("drive-acceptance",cmd_drive_acceptance,"FULL ACTIVE: sensorless + Hall autodetect + duty/current/RPM/brake/position/EEPROM")
+    p.add_argument("--yes",action="store_true")
+    p.add_argument("--skip-calibration",action="store_true")
+    p.add_argument("--current",type=float,default=1.0)
+    p.add_argument("--current-rel",type=float,default=0.03)
+    p.add_argument("--duty",type=float,default=0.05)
+    p.add_argument("--erpm",type=float,default=300.0)
+    p.add_argument("--brake-current",type=float,default=1.0)
+    p.add_argument("--handbrake-current",type=float,default=0.6)
+    p.add_argument("--hall-current",type=float,default=1.5)
+    p.add_argument("--position-step",type=float,default=5.0)
+    p.add_argument("--stage-seconds",type=float,default=1.5)
+    p.add_argument("--cal-timeout",type=float,default=8.0)
+    p.add_argument("--detect-timeout",type=float,default=30.0)
+    p.add_argument("--zero-limit",type=float,default=0.30)
+    p.add_argument("--min-erpm",type=float,default=20.0)
+    p.add_argument("--max-power-loss",type=float,default=30.0)
+    p.add_argument("--min-input-current",type=float,default=-10.0)
+    p.add_argument("--max-input-current",type=float,default=10.0)
+    p.add_argument("--detect-openloop-erpm",type=float,default=3000.0)
+    p.add_argument("--detect-sl-erpm",type=float,default=2500.0)
+    p.add_argument("--detect-all-timeout",type=float,default=150.0)
     p=sp("speed-test",cmd_speed_test,"ACTIVE ERPM test with measured RT 50 Hz and APP ADC 20 Hz")
     p.add_argument("--motor",type=int,choices=[0,1],required=True)
     p.add_argument("--erpm",type=float,default=300.0)
@@ -1951,20 +3660,55 @@ def main() -> int:
     p.add_argument("--csv",help="optional per-cycle CSV output")
     p.add_argument("--yes",action="store_true")
     p.add_argument("--force",action="store_true")
-    p=sp("test-all",cmd_test_all,"passive end-to-end firmware/telemetry test"); p.add_argument("--zero-limit",type=float,default=0.30)
-    p=sp("full-test",cmd_full_test,"ACTIVE commissioning: calibration, auto-detect, samples, current +/- and optional RPM/position"); p.add_argument("--yes",action="store_true"); p.add_argument("--current",type=float,default=0.5); p.add_argument("--erpm",type=float,default=300.0); p.add_argument("--stage-seconds",type=float,default=1.0); p.add_argument("--cal-timeout",type=float,default=5.0); p.add_argument("--detect-timeout",type=float,default=15.0); p.add_argument("--zero-limit",type=float,default=0.30); p.add_argument("--sample-decimation",type=int,default=8); p.add_argument("--skip-rpm",action="store_true"); p.add_argument("--position-step",type=float,default=5.0)
+    p=sp("test-all",cmd_test_all,"passive end-to-end firmware/telemetry test")
+    p.add_argument("--zero-limit",type=float,default=0.30)
+    p=sp("hall-commission",cmd_hall_commission,"ACTIVE Hall detect -> apply/persist -> current running verification LEFT/RIGHT")
+    p.add_argument("--motor",choices=["0","1","both"],default="both")
+    p.add_argument("--current",type=float,default=1.5,help="Hall lock/detect current A; default 1.5")
+    p.add_argument("--detect-timeout",type=float,default=30.0)
+    p.add_argument("--run-current",type=float,default=1.5)
+    p.add_argument("--run-seconds",type=float,default=3.0)
+    p.add_argument("--min-erpm",type=float,default=50.0)
+    motion=p.add_mutually_exclusive_group()
+    motion.add_argument("--require-motion",dest="require_motion",action="store_true",default=True,
+                        help="default: fail bila tiap arah tidak melewati --min-erpm")
+    motion.add_argument("--skip-motion-check",dest="require_motion",action="store_false",
+                        help="diagnostik meja saja; jangan dipakai untuk acceptance running")
+    p.add_argument("--yes",action="store_true")
+    p=sp("openloop-phase",cmd_openloop_phase,"DIAGNOSTIC SVPWM open-loop fixed phase without current PI (duty clamped <=2%%)")
+    p.add_argument("--motor",type=int,choices=[0,1],required=True)
+    p.add_argument("--duty",type=float,default=0.01,help="modulation 0..0.02")
+    p.add_argument("--phase",type=float,default=0.0,help="electrical phase deg")
+    p.add_argument("--ms",type=int,default=200,help="hold ms (<=500)")
+    p.add_argument("--repeat",type=int,default=1)
+    p.add_argument("--yes",action="store_true")
+    p=sp("full-test",cmd_full_test,"ACTIVE Run30 compatibility alias for full drive-acceptance")
+    p.add_argument("--yes",action="store_true")
+    p.add_argument("--current",type=float,default=0.5)
+    p.add_argument("--erpm",type=float,default=300.0)
+    p.add_argument("--stage-seconds",type=float,default=1.0)
+    p.add_argument("--cal-timeout",type=float,default=5.0)
+    p.add_argument("--detect-timeout",type=float,default=15.0)
+    p.add_argument("--zero-limit",type=float,default=0.30)
+    p.add_argument("--sample-decimation",type=int,default=8)
+    p.add_argument("--skip-rpm",action="store_true")
+    p.add_argument("--position-step",type=float,default=5.0)
 
     args=ap.parse_args()
     if args.self_test:
         return self_test()
     if not args.cmd:
-        ap.print_help(); return 1
+        ap.print_help()
+        return 1
     link=Link(args.port,args.baud)
     try:
         return int(args.func(link,args))
     except KeyboardInterrupt:
-        try: link.stop(0); link.stop(1)
-        except Exception: pass
+        try:
+            link.stop(0)
+            link.stop(1)
+        except Exception:
+            pass
         print("\nStopped")
         return 130
     except Exception as exc:

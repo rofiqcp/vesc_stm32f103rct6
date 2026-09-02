@@ -34,5 +34,11 @@
 #include "stm32f1xx_hal_pwr.h"
 
 #ifdef USE_FULL_ASSERT
+// Parameter file: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Parameter line: nilai kerja yang menyimpan state, parameter, atau hasil antara sesuai konteks algoritma pada
+// lingkup ini.
+// Fungsi assert_failed: menjalankan operasi assert failed sesuai tanggung jawab modul dengan input tervalidasi
+// dan state yang konsisten.
 void assert_failed(uint8_t *file, uint32_t line);
 #endif

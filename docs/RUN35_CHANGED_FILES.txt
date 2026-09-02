@@ -1,0 +1,8 @@
+src/applications/appconf_default.h
+src/comm/commands.c
+src/hwconf/hw.c
+src/hwconf/hw.h
+src/motor/mcpwm_foc.c
+src/motor/mcpwm_foc.h
+src/stm32f1xx_it.c
+tools/debug.py
